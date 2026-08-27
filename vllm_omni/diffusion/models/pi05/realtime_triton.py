@@ -766,6 +766,12 @@ if triton is not None and tl is not None:
     ):
         pid = tl.program_id(axis=0)
         psize = tl.num_programs(axis=0)
+        # axis 1 is the batch index; a 1-D launch leaves it 0, so single-sample
+        # callers keep their exact previous behaviour.
+        pid_b = tl.program_id(axis=1)
+        q_base = q_ptr + pid_b * rows_q * cols
+        k_base = k_ptr + pid_b * rows_k * cols
+        out_base = out_ptr + pid_b * rows_q * rows_k
         grid_m = tl.cdiv(rows_q, block_m)
         grid_n = tl.cdiv(rows_k, block_n)
         while pid < grid_m * grid_n:
@@ -776,12 +782,12 @@ if triton is not None and tl is not None:
             acc = tl.zeros((block_m, block_n), dtype=tl.float32)
             for k in range(0, cols, block_k):
                 offs_k = k + tl.arange(0, block_k)
-                q = tl.load(q_ptr + offs_i[:, None] * cols + offs_k[None, :], mask=offs_i[:, None] < rows_q, other=0)
-                key = tl.load(k_ptr + offs_j[:, None] * cols + offs_k[None, :], mask=offs_j[:, None] < rows_k, other=0)
+                q = tl.load(q_base + offs_i[:, None] * cols + offs_k[None, :], mask=offs_i[:, None] < rows_q, other=0)
+                key = tl.load(k_base + offs_j[:, None] * cols + offs_k[None, :], mask=offs_j[:, None] < rows_k, other=0)
                 acc = tl.dot(q, tl.trans(key), acc)
             acc = acc * scale_factor
             tl.store(
-                out_ptr + offs_i[:, None] * rows_k + offs_j[None, :],
+                out_base + offs_i[:, None] * rows_k + offs_j[None, :],
                 acc,
                 mask=(offs_i[:, None] < rows_q) & (offs_j[None, :] < rows_k),
             )
@@ -918,16 +924,21 @@ if triton is not None and tl is not None:
     ):
         pid = tl.program_id(axis=0)
         psize = tl.num_programs(axis=0)
+        # axis 1 is the batch index; a 1-D launch leaves it 0.
+        pid_b = tl.program_id(axis=1)
+        inp_base = inp_ptr + pid_b * queries * keys
+        out_base = out_ptr + pid_b * queries * keys
+        mask_base = key_mask_ptr + pid_b * keys
         big_neg = -2.3819763e38
         for i in range(pid * block_m, queries, psize * block_m):
             offs_i = i + tl.arange(0, block_m)[:, None]
             offs_j = tl.arange(0, block_size)[None, :]
-            key_ok = tl.load(key_mask_ptr + offs_j, mask=offs_j < keys, other=0).to(tl.int1)
+            key_ok = tl.load(mask_base + offs_j, mask=offs_j < keys, other=0).to(tl.int1)
             mask = (offs_i < queries) & (offs_j < keys) & key_ok
-            vals = tl.load(inp_ptr + offs_i * keys + offs_j, mask=mask, other=big_neg)
+            vals = tl.load(inp_base + offs_i * keys + offs_j, mask=mask, other=big_neg)
             vals = tl.exp(vals - tl.max(vals, axis=1, keep_dims=True))
             vals = vals / tl.sum(vals, axis=1, keep_dims=True, dtype=tl.float32)
-            tl.store(out_ptr + offs_i * keys + offs_j, vals.to(tl.bfloat16), mask=(offs_i < queries) & (offs_j < keys))
+            tl.store(out_base + offs_i * keys + offs_j, vals.to(tl.bfloat16), mask=(offs_i < queries) & (offs_j < keys))
 
     @triton.jit
     def _softmax_prefix_suffix_mask_vector(
@@ -997,6 +1008,57 @@ if triton is not None and tl is not None:
                 acc = tl.dot(x, w, acc)
             tl.store(
                 out_ptr + offs_i[:, None] * hidden + offs_j[None, :],
+                acc.to(tl.bfloat16),
+                mask=(offs_i[:, None] < seq_len) & (offs_j[None, :] < hidden),
+            )
+
+    @triton.jit
+    def _matmul_small_bmm(
+        inp_ptr,
+        weight_ptr,
+        out_ptr,
+        seq_len: tl.constexpr,
+        features: tl.constexpr,
+        hidden: tl.constexpr,
+        block_n: tl.constexpr,
+        block_m: tl.constexpr,
+        block_k: tl.constexpr,
+    ):
+        """``_matmul_small`` for the attention-times-V role.
+
+        Identical maths, but the right-hand operand is V -- per sample, not a
+        shared weight -- so it is offset by the batch index too.  A 1-D launch
+        leaves ``pid_b`` at 0 and reproduces ``_matmul_small`` exactly.
+        """
+        pid = tl.program_id(0)
+        psize = tl.num_programs(0)
+        pid_b = tl.program_id(1)
+        inp_base = inp_ptr + pid_b * seq_len * features
+        w_base = weight_ptr + pid_b * features * hidden
+        out_base = out_ptr + pid_b * seq_len * hidden
+        grid_i = tl.cdiv(seq_len, block_n)
+        grid_j = tl.cdiv(hidden, block_m)
+        for p in range(pid, grid_i * grid_j, psize):
+            i = (p // grid_j) * block_n
+            j = (p % grid_j) * block_m
+            offs_i = i + tl.arange(0, block_n)
+            offs_j = j + tl.arange(0, block_m)
+            acc = tl.zeros((block_n, block_m), dtype=tl.float32)
+            for k in range(0, features, block_k):
+                offs_k = k + tl.arange(0, block_k)
+                x = tl.load(
+                    inp_base + offs_i[:, None] * features + offs_k[None, :],
+                    mask=(offs_i[:, None] < seq_len) & (offs_k[None, :] < features),
+                    other=0.0,
+                )
+                w = tl.load(
+                    w_base + offs_k[:, None] * hidden + offs_j[None, :],
+                    mask=(offs_k[:, None] < features) & (offs_j[None, :] < hidden),
+                    other=0.0,
+                )
+                acc = tl.dot(x, w, acc)
+            tl.store(
+                out_base + offs_i[:, None] * hidden + offs_j[None, :],
                 acc.to(tl.bfloat16),
                 mask=(offs_i[:, None] < seq_len) & (offs_j[None, :] < hidden),
             )
@@ -1336,33 +1398,38 @@ class Pi05RealtimePrefixEncoder:
             weights["post_norm_w"][idx].copy_(_as_bf16_contig(layer.post_attention_layernorm.weight))
         return weights
 
-    def _build_rope(self, prefix_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _build_rope(self, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
         return (
-            torch.empty(prefix_len, self.head_dim, device="cuda", dtype=torch.bfloat16),
-            torch.empty(prefix_len, self.head_dim, device="cuda", dtype=torch.bfloat16),
+            torch.empty(rows, self.head_dim, device="cuda", dtype=torch.bfloat16),
+            torch.empty(rows, self.head_dim, device="cuda", dtype=torch.bfloat16),
         )
 
-    def _get_buffers(self, prefix_len: int, dtype: torch.dtype) -> _PrefixEncoderBuffers:
-        key = (int(prefix_len), dtype)
+    def _get_buffers(self, batch: int, prefix_len: int, dtype: torch.dtype) -> _PrefixEncoderBuffers:
+        key = (int(batch), int(prefix_len), dtype)
         cached = self.buffers_by_shape.get(key)
         if cached is not None:
             return cached
         _validate_prefix_suffix_softmax_window(prefix_len, 0)
-        rows_q = prefix_len * self.num_heads
-        rope_cos, rope_sin = self._build_rope(prefix_len)
+        # Batch is folded into the token dimension: row ``b * prefix_len + t``.
+        # Every weight-shared kernel (norms, o-proj, MLP, QKV+RoPE) then works
+        # unchanged on ``rows`` rows; only the three attention kernels, whose
+        # K/V operand is per-sample, need an explicit batch index.
+        rows = batch * prefix_len
+        rows_q = rows * self.num_heads
+        rope_cos, rope_sin = self._build_rope(rows)
         buffers = _PrefixEncoderBuffers(
-            x=torch.empty(prefix_len, self.hidden_size, device="cuda", dtype=torch.bfloat16),
-            x_normed=torch.empty(prefix_len, self.hidden_size, device="cuda", dtype=torch.bfloat16),
+            x=torch.empty(rows, self.hidden_size, device="cuda", dtype=torch.bfloat16),
+            x_normed=torch.empty(rows, self.hidden_size, device="cuda", dtype=torch.bfloat16),
             q_raw=torch.empty(rows_q, self.head_dim, device="cuda", dtype=torch.bfloat16),
             q=torch.empty(rows_q, self.head_dim, device="cuda", dtype=torch.bfloat16),
-            k_raw=torch.empty(prefix_len, self.head_dim, device="cuda", dtype=torch.bfloat16),
-            k=torch.empty(self.num_layers, prefix_len, self.head_dim, device="cuda", dtype=torch.bfloat16),
-            v=torch.empty(self.num_layers, prefix_len, self.head_dim, device="cuda", dtype=torch.bfloat16),
+            k_raw=torch.empty(rows, self.head_dim, device="cuda", dtype=torch.bfloat16),
+            k=torch.empty(self.num_layers, rows, self.head_dim, device="cuda", dtype=torch.bfloat16),
+            v=torch.empty(self.num_layers, rows, self.head_dim, device="cuda", dtype=torch.bfloat16),
             logits=torch.empty(rows_q, prefix_len, device="cuda", dtype=torch.float32),
             attn=torch.empty(rows_q, prefix_len, device="cuda", dtype=torch.bfloat16),
-            hidden=torch.empty(prefix_len, 16384, device="cuda", dtype=torch.bfloat16),
-            valid_prefix_len=torch.empty(1, device="cuda", dtype=torch.int32),
-            prefix_mask=torch.empty(prefix_len, device="cuda", dtype=torch.int32),
+            hidden=torch.empty(rows, 16384, device="cuda", dtype=torch.bfloat16),
+            valid_prefix_len=torch.empty(batch, device="cuda", dtype=torch.int32),
+            prefix_mask=torch.empty(rows, device="cuda", dtype=torch.int32),
             rope_cos=rope_cos,
             rope_sin=rope_sin,
         )
@@ -1370,10 +1437,9 @@ class Pi05RealtimePrefixEncoder:
         return buffers
 
     @staticmethod
-    def _valid_prefix_len(prefix_pad_masks: torch.Tensor) -> int:
-        if prefix_pad_masks.shape[0] != 1:
-            raise ValueError("realtime prefix encoder currently specializes batch=1")
-        return int(prefix_pad_masks.sum().item())
+    def _valid_prefix_len(prefix_pad_masks: torch.Tensor) -> torch.Tensor:
+        """Per-sample count of valid prefix tokens, shape ``[B]``."""
+        return prefix_pad_masks.reshape(prefix_pad_masks.shape[0], -1).sum(dim=1).to(torch.int32)
 
     def _get_prefix_mlp_fn(self):
         if self._prefix_mlp_fn is not None:
@@ -1461,51 +1527,65 @@ class Pi05RealtimePrefixEncoder:
         output_v: torch.Tensor | None = None,
         return_prefix_kv: bool = True,
     ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
-        if prefix_embs.shape[0] != 1 or prefix_embs.shape[-1] != self.hidden_size:
+        if prefix_embs.dim() != 3 or prefix_embs.shape[-1] != self.hidden_size:
             raise ValueError(f"unexpected prefix_embs shape for realtime prefix encoder: {tuple(prefix_embs.shape)}")
+        batch = int(prefix_embs.shape[0])
         prefix_len = int(prefix_embs.shape[1])
         if prefix_len > 1024:
             raise ValueError(f"realtime prefix encoder requires prefix_len <= 1024, got {prefix_len}")
         if valid_prefix_len is None:
             valid_prefix_len = self._valid_prefix_len(prefix_pad_masks)
-        buffers = self._get_buffers(prefix_len, prefix_embs.dtype)
-        target_k = buffers.k if output_k is None else output_k
-        target_v = buffers.v if output_v is None else output_v
-        if target_k.shape[0] != self.num_layers or target_k.shape[1] < prefix_len or target_k.shape[2] != self.head_dim:
+        buffers = self._get_buffers(batch, prefix_len, prefix_embs.dtype)
+        rows = batch * prefix_len
+        # B=1 keeps the direct-write path (the prefix encoder writes K/V straight
+        # into the decoder's buffers).  For B>1 the decoder lays K/V out per
+        # sample as prefix+suffix, which is not the contiguous [B*prefix_len]
+        # block this loop produces, so write locally and let the caller copy.
+        direct_write = batch == 1
+        target_k = buffers.k if (output_k is None or not direct_write) else output_k
+        target_v = buffers.v if (output_v is None or not direct_write) else output_v
+        if target_k.shape[0] != self.num_layers or target_k.shape[1] < rows or target_k.shape[2] != self.head_dim:
             raise ValueError(f"unexpected realtime prefix output_k shape: {tuple(target_k.shape)}")
-        if target_v.shape[0] != self.num_layers or target_v.shape[1] < prefix_len or target_v.shape[2] != self.head_dim:
+        if target_v.shape[0] != self.num_layers or target_v.shape[1] < rows or target_v.shape[2] != self.head_dim:
             raise ValueError(f"unexpected realtime prefix output_v shape: {tuple(target_v.shape)}")
-        buffers.x.copy_(prefix_embs[0].to(torch.bfloat16))
-        buffers.valid_prefix_len.fill_(int(valid_prefix_len))
-        buffers.prefix_mask.copy_(prefix_pad_masks[0].to(torch.int32))
+        buffers.x.copy_(prefix_embs.reshape(rows, self.hidden_size).to(torch.bfloat16))
+        buffers.valid_prefix_len.copy_(
+            valid_prefix_len.to(torch.int32)
+            if isinstance(valid_prefix_len, torch.Tensor)
+            else torch.full((batch,), int(valid_prefix_len), dtype=torch.int32, device=buffers.valid_prefix_len.device)
+        )
+        buffers.prefix_mask.copy_(prefix_pad_masks.reshape(rows).to(torch.int32))
         if prefix_position_ids is None:
             prefix_position_ids = torch.cumsum(prefix_pad_masks.to(torch.int64), dim=1) - 1
-        _build_gemma_rope_from_positions[((prefix_len + 15) // 16,)](
-            prefix_position_ids[0],
+        # Positions are indexed by the same folded row id, so per-sample RoPE
+        # falls out of the flattening without touching the kernel.
+        _build_gemma_rope_from_positions[((rows + 15) // 16,)](
+            prefix_position_ids.reshape(rows),
             self.rope_inv_freq,
             buffers.rope_cos,
             buffers.rope_sin,
-            prefix_len,
+            rows,
             self.head_dim,
             self.rope_attention_scaling,
             block_m=16,
             block_half=128,
         )
-        rows_q = prefix_len * self.num_heads
+        rows_q_per = prefix_len * self.num_heads
+        rows_q = rows * self.num_heads
         scale = 1.0 / math.sqrt(float(self.head_dim))
 
         for layer_idx in range(self.num_layers):
-            _rms_norm_kernel[(prefix_len,)](
+            _rms_norm_kernel[(rows,)](
                 buffers.x,
                 self.weights["input_norm_w"][layer_idx],
                 buffers.x_normed,
-                prefix_len,
+                rows,
                 self.hidden_size,
                 block_size=1024,
             )
-            _matmul_gemma_rope_qkv[((prefix_len + 31) // 32, self.num_heads + 2)](
+            _matmul_gemma_rope_qkv[((rows + 31) // 32, self.num_heads + 2)](
                 buffers.x_normed,
-                prefix_len,
+                rows,
                 self.hidden_size,
                 self.head_dim,
                 self.num_heads,
@@ -1513,19 +1593,21 @@ class Pi05RealtimePrefixEncoder:
                 buffers.rope_cos,
                 buffers.rope_sin,
                 buffers.q,
-                target_k[layer_idx, :prefix_len],
-                target_v[layer_idx, :prefix_len],
+                target_k[layer_idx, :rows],
+                target_v[layer_idx, :rows],
                 block_m=32,
                 block_half=128,
                 block_k=64,
             )
             if layer_idx == self.num_layers - 1:
                 continue
-            _matmul_abt_scale[((rows_q + 31) // 32) * ((prefix_len + 31) // 32),](
+            # Attention is the only place folding breaks down: sample b's queries
+            # must see only sample b's K/V, so these three carry a batch index.
+            _matmul_abt_scale[(((rows_q_per + 31) // 32) * ((prefix_len + 31) // 32), batch)](
                 buffers.q,
-                target_k[layer_idx, :prefix_len],
+                target_k[layer_idx, :rows],
                 buffers.logits,
-                rows_q,
+                rows_q_per,
                 prefix_len,
                 self.head_dim,
                 scale,
@@ -1533,54 +1615,54 @@ class Pi05RealtimePrefixEncoder:
                 block_n=32,
                 block_k=64,
             )
-            _softmax_mask_vector[((rows_q + 3) // 4,)](
+            _softmax_mask_vector[((rows_q_per + 3) // 4, batch)](
                 buffers.logits,
-                rows_q,
+                rows_q_per,
                 prefix_len,
                 buffers.prefix_mask,
                 buffers.attn,
                 block_m=4,
                 block_size=1024,
             )
-            _matmul_small[((rows_q + 31) // 32) * (self.head_dim // 32),](
+            _matmul_small_bmm[(((rows_q_per + 31) // 32) * (self.head_dim // 32), batch)](
                 buffers.attn,
-                target_v[layer_idx, :prefix_len],
+                target_v[layer_idx, :rows],
                 buffers.q_raw,
-                rows_q,
+                rows_q_per,
                 prefix_len,
                 self.head_dim,
                 block_n=32,
                 block_m=32,
                 block_k=64,
             )
-            _matmul_small_res[((prefix_len + 63) // 64) * (self.hidden_size // 64),](
+            _matmul_small_res[((rows + 63) // 64) * (self.hidden_size // 64),](
                 buffers.q_raw,
                 self.weights["attn_o_w"][layer_idx],
                 buffers.x,
                 buffers.x,
-                prefix_len,
+                rows,
                 self.hidden_size,
                 self.hidden_size,
                 block_n=64,
                 block_m=64,
                 block_k=64,
             )
-            _rms_norm_kernel[(prefix_len,)](
+            _rms_norm_kernel[(rows,)](
                 buffers.x,
                 self.weights["post_norm_w"][layer_idx],
                 buffers.x_normed,
-                prefix_len,
+                rows,
                 self.hidden_size,
                 block_size=1024,
             )
-            self._run_prefix_mlp(buffers, layer_idx, prefix_len)
+            self._run_prefix_mlp(buffers, layer_idx, rows)
 
         if not return_prefix_kv:
             return None
         return [
             (
-                target_k[layer_idx : layer_idx + 1, :prefix_len][None],
-                target_v[layer_idx : layer_idx + 1, :prefix_len][None],
+                target_k[layer_idx, :rows].view(batch, 1, prefix_len, self.head_dim),
+                target_v[layer_idx, :rows].view(batch, 1, prefix_len, self.head_dim),
             )
             for layer_idx in range(self.num_layers)
         ]
