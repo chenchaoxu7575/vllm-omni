@@ -72,6 +72,27 @@ def _sync_for_timing(device: torch.device) -> None:
         torch.accelerator.synchronize(device)
 
 
+def _per_sample_valid_prefix_len(
+    prefix_pad_masks: torch.Tensor,
+    valid_prefix_len=None,
+) -> torch.Tensor:
+    """Valid prefix length per sample, shape ``[B]``.
+
+    The realtime path used to collapse this to a single Python int, which is
+    only correct when the batch holds one sample: pi0.5 packs the discretised
+    state into the language prompt, so the number of valid prefix tokens varies
+    from sample to sample.
+    """
+    batch = int(prefix_pad_masks.shape[0])
+    if valid_prefix_len is None:
+        return prefix_pad_masks.reshape(batch, -1).sum(dim=1).to(torch.int32)
+    if isinstance(valid_prefix_len, torch.Tensor):
+        return valid_prefix_len.reshape(-1).to(torch.int32)
+    return torch.full(
+        (batch,), int(valid_prefix_len), dtype=torch.int32, device=prefix_pad_masks.device
+    )
+
+
 def _compile_call(fn, *, fullgraph: bool = False):
     return torch.compile(fn, mode="max-autotune-no-cudagraphs", fullgraph=fullgraph)
 
@@ -2815,14 +2836,10 @@ class Pi05ForActionPrediction(nn.Module):
             raise RuntimeError("use_realtime_triton_decoder requires precompute_adarms=True")
         with _TimingBlock(timing, "realtime_triton_decoder_ms", x_t.device):
             decoder = self._get_or_create_realtime_triton_decoder()
-            if prefix_pad_masks.shape[0] != 1:
-                raise RuntimeError("use_realtime_triton_decoder currently specializes batch=1")
             return decoder(
                 prefix_kv=past_key_values,
                 prefix_pad_masks=prefix_pad_masks,
-                valid_prefix_len=(
-                    int(prefix_pad_masks.sum().item()) if valid_prefix_len is None else int(valid_prefix_len)
-                ),
+                valid_prefix_len=_per_sample_valid_prefix_len(prefix_pad_masks, valid_prefix_len),
                 x_t=x_t,
                 adarms_modulations=static_context.adarms_modulations,
                 num_steps=num_steps,
@@ -3768,7 +3785,8 @@ class Pi05ForActionPrediction(nn.Module):
             prefix_position_ids.dtype,
             tuple(prefix_position_ids.shape),
             tuple(prefix_pad_masks.shape),
-            int(prefix_pad_masks.sum().item()) if valid_prefix_len is None else int(valid_prefix_len),
+            # Per sample, not summed: two different splits can share a total.
+            tuple(_per_sample_valid_prefix_len(prefix_pad_masks, valid_prefix_len).tolist()),
         )
 
     def _get_or_create_prefix_realtime_triton_cuda_graph(
@@ -3854,10 +3872,7 @@ class Pi05ForActionPrediction(nn.Module):
             x_t=x_t,
         )
         self._copy_static_context(cache.static_context, static_context, copy_time=True)
-        if valid_prefix_len is None:
-            valid_prefix_len = int(prefix_pad_masks.sum().item())
-        else:
-            valid_prefix_len = int(valid_prefix_len)
+        valid_prefix_len = _per_sample_valid_prefix_len(prefix_pad_masks, valid_prefix_len)
 
         def _run_graph_body():
             if use_realtime_triton_prefix_encoder:
