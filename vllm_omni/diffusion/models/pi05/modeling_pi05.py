@@ -75,22 +75,29 @@ def _sync_for_timing(device: torch.device) -> None:
 def _per_sample_valid_prefix_len(
     prefix_pad_masks: torch.Tensor,
     valid_prefix_len=None,
-) -> torch.Tensor:
-    """Valid prefix length per sample, shape ``[B]``.
+) -> list[int]:
+    """Valid prefix length per sample, as host ints.
 
     The realtime path used to collapse this to a single Python int, which is
     only correct when the batch holds one sample: pi0.5 packs the discretised
     state into the language prompt, so the number of valid prefix tokens varies
     from sample to sample.
+
+    Host ints, not a device tensor. These lengths feed the suffix rotary table,
+    which is built inside the prefix+denoise graph capture; a device-resident
+    length there leaves the captured kernels reading a freed temporary on
+    replay, and the result is a silently wrong table rather than a failure.
     """
     batch = int(prefix_pad_masks.shape[0])
     if valid_prefix_len is None:
-        return prefix_pad_masks.reshape(batch, -1).sum(dim=1).to(torch.int32)
+        return [int(v) for v in prefix_pad_masks.reshape(batch, -1).sum(dim=1).tolist()]
     if isinstance(valid_prefix_len, torch.Tensor):
-        return valid_prefix_len.reshape(-1).to(torch.int32)
-    return torch.full(
-        (batch,), int(valid_prefix_len), dtype=torch.int32, device=prefix_pad_masks.device
-    )
+        lens = [int(v) for v in valid_prefix_len.reshape(-1).tolist()]
+    elif isinstance(valid_prefix_len, (list, tuple)):
+        lens = [int(v) for v in valid_prefix_len]
+    else:
+        lens = [int(valid_prefix_len)]
+    return lens * batch if len(lens) == 1 and batch > 1 else lens
 
 
 def _compile_call(fn, *, fullgraph: bool = False):
@@ -3786,7 +3793,7 @@ class Pi05ForActionPrediction(nn.Module):
             tuple(prefix_position_ids.shape),
             tuple(prefix_pad_masks.shape),
             # Per sample, not summed: two different splits can share a total.
-            tuple(_per_sample_valid_prefix_len(prefix_pad_masks, valid_prefix_len).tolist()),
+            tuple(_per_sample_valid_prefix_len(prefix_pad_masks, valid_prefix_len)),
         )
 
     def _get_or_create_prefix_realtime_triton_cuda_graph(

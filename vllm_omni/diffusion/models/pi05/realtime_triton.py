@@ -1462,9 +1462,11 @@ class Pi05RealtimePrefixEncoder:
         return buffers
 
     @staticmethod
-    def _valid_prefix_len(prefix_pad_masks: torch.Tensor) -> torch.Tensor:
-        """Per-sample count of valid prefix tokens, shape ``[B]``."""
-        return prefix_pad_masks.reshape(prefix_pad_masks.shape[0], -1).sum(dim=1).to(torch.int32)
+    def _valid_prefix_len(prefix_pad_masks: torch.Tensor) -> list[int]:
+        """Per-sample count of valid prefix tokens, as host ints."""
+        return [
+            int(v) for v in prefix_pad_masks.reshape(prefix_pad_masks.shape[0], -1).sum(dim=1).tolist()
+        ]
 
     def _get_prefix_mlp_fn(self):
         if self._prefix_mlp_fn is not None:
@@ -1562,11 +1564,18 @@ class Pi05RealtimePrefixEncoder:
             valid_prefix_len = self._valid_prefix_len(prefix_pad_masks)
         buffers = self._get_buffers(batch, prefix_len, prefix_embs.dtype)
         rows = batch * prefix_len
+        # Callers may hand in a single shared mask/position row when every sample
+        # has the same prompt shape; widen it so the folded row indexing below
+        # does not have to special-case that.
+        if prefix_pad_masks.shape[0] != batch:
+            prefix_pad_masks = prefix_pad_masks.expand(batch, -1)
+        if prefix_position_ids is not None and prefix_position_ids.shape[0] != batch:
+            prefix_position_ids = prefix_position_ids.expand(batch, -1)
         # B=1 keeps the direct-write path (the prefix encoder writes K/V straight
         # into the decoder's buffers).  For B>1 the decoder lays K/V out per
         # sample as prefix+suffix, which is not the contiguous [B*prefix_len]
         # block this loop produces, so write locally and let the caller copy.
-        direct_write = batch == 1
+        direct_write = batch == 1 and os.environ.get("PI05_FORCE_KV_COPY", "0").lower() in {"0", "false", "no", ""}
         target_k = buffers.k if (output_k is None or not direct_write) else output_k
         target_v = buffers.v if (output_v is None or not direct_write) else output_v
         if target_k.shape[0] != self.num_layers or target_k.shape[1] < rows or target_k.shape[2] != self.head_dim:
@@ -1574,11 +1583,18 @@ class Pi05RealtimePrefixEncoder:
         if target_v.shape[0] != self.num_layers or target_v.shape[1] < rows or target_v.shape[2] != self.head_dim:
             raise ValueError(f"unexpected realtime prefix output_v shape: {tuple(target_v.shape)}")
         buffers.x.copy_(prefix_embs.reshape(rows, self.hidden_size).to(torch.bfloat16))
-        buffers.valid_prefix_len.copy_(
-            valid_prefix_len.to(torch.int32)
-            if isinstance(valid_prefix_len, torch.Tensor)
-            else torch.full((batch,), int(valid_prefix_len), dtype=torch.int32, device=buffers.valid_prefix_len.device)
-        )
+        if isinstance(valid_prefix_len, torch.Tensor):
+            _lens = [int(v) for v in valid_prefix_len.reshape(-1).tolist()]
+        elif isinstance(valid_prefix_len, (list, tuple)):
+            _lens = [int(v) for v in valid_prefix_len]
+        else:
+            _lens = [int(valid_prefix_len)]
+        if len(_lens) == 1 and batch > 1:
+            _lens = _lens * batch
+        # Host scalars, so the constant is baked into the capture rather than read
+        # from a tensor that may be freed before the graph replays.
+        for _b, _length in enumerate(_lens):
+            buffers.valid_prefix_len[_b].fill_(_length)
         buffers.prefix_mask.copy_(prefix_pad_masks.reshape(rows).to(torch.int32))
         if prefix_position_ids is None:
             prefix_position_ids = torch.cumsum(prefix_pad_masks.to(torch.int64), dim=1) - 1
@@ -1599,7 +1615,17 @@ class Pi05RealtimePrefixEncoder:
         rows_q = rows * self.num_heads
         scale = 1.0 / math.sqrt(float(self.head_dim))
 
+        debug_rows = os.environ.get("PI05_DEBUG_PREFIX_ROWS", "") not in {"", "0", "false", "no"}
+
+        def _dbg(tag: str, t: torch.Tensor, per_sample_rows: int) -> None:
+            if not debug_rows or batch < 2:
+                return
+            flat = t.reshape(batch, per_sample_rows, -1).float()
+            dev = (flat[1:] - flat[:1]).abs().max().item()
+            print(f"[prefix-dbg] {tag:38s} max|row_i - row_0| = {dev:.6e}", flush=True)
+
         for layer_idx in range(self.num_layers):
+            _dbg(f"L{layer_idx:02d} x (layer input)", buffers.x, prefix_len)
             _rms_norm_kernel[(rows,)](
                 buffers.x,
                 self.weights["input_norm_w"][layer_idx],
@@ -1608,6 +1634,7 @@ class Pi05RealtimePrefixEncoder:
                 self.hidden_size,
                 block_size=1024,
             )
+            _dbg(f"L{layer_idx:02d} x_normed", buffers.x_normed, prefix_len)
             _matmul_gemma_rope_qkv[((rows + 31) // 32, self.num_heads + 2)](
                 buffers.x_normed,
                 rows,
@@ -1624,6 +1651,8 @@ class Pi05RealtimePrefixEncoder:
                 block_half=128,
                 block_k=64,
             )
+            _dbg(f"L{layer_idx:02d} q (after QKV+RoPE)", buffers.q, rows_q_per)
+            _dbg(f"L{layer_idx:02d} k (after QKV+RoPE)", target_k[layer_idx, :rows], prefix_len)
             if layer_idx == self.num_layers - 1:
                 continue
             # Attention is the only place folding breaks down: sample b's queries
@@ -1849,28 +1878,47 @@ class Pi05RealtimeTritonDecoder:
         self.buffers_by_prefix[key] = buffers
         return buffers
 
-    def _fill_rope(self, rope: torch.Tensor, valid_prefix_lens: torch.Tensor) -> None:
+    def _fill_rope(self, rope: torch.Tensor, valid_prefix_lens: list[int]) -> None:
         """Write the suffix rotary table for each sample into ``rope``.
 
         Suffix positions continue from the sample's own *valid* prefix length,
         not the padded one, so a batch whose samples have different valid
         lengths needs one table per sample.
+
+        The starts must be host values. This runs inside the prefix+denoise
+        graph capture, and a device-resident length would leave the captured
+        kernels reading a temporary that has been freed by the time the graph
+        is replayed -- which silently produces a wrong rotary table rather than
+        an error.
         """
-        batch = int(valid_prefix_lens.numel())
-        starts = valid_prefix_lens.to(device="cuda", dtype=torch.float32)[:, None]
-        offsets = torch.arange(self.chunk_size, device="cuda", dtype=torch.float32)[None, :]
-        pos = (starts + offsets).reshape(batch * self.chunk_size)
+        batch = len(valid_prefix_lens)
+        pos = torch.cat(
+            [
+                torch.arange(int(L), int(L) + self.chunk_size, device="cuda", dtype=torch.float32)
+                for L in valid_prefix_lens
+            ]
+        )
         inv_freq = 1.0 / (10000 ** (torch.arange(0, 256, 2, dtype=torch.float32, device="cuda") / 256))
         phase = pos[:, None] * inv_freq[None, :]
         table = torch.cat([torch.cos(phase)[:, :, None], torch.sin(phase)[:, :, None]], dim=2)
         rope.copy_(table.reshape(batch * self.chunk_size, 256).to(torch.bfloat16))
 
     @staticmethod
-    def _as_valid_lens(valid_prefix_len, batch: int) -> torch.Tensor:
-        """Normalise a scalar-or-tensor valid length to an ``[B]`` int32 tensor."""
+    def _as_valid_lens(valid_prefix_len, batch: int) -> list[int]:
+        """Normalise a scalar-or-sequence valid length to ``batch`` host ints.
+
+        Host, not device: see ``_fill_rope``.
+        """
         if isinstance(valid_prefix_len, torch.Tensor):
-            return valid_prefix_len.reshape(-1).to(device="cuda", dtype=torch.int32)
-        return torch.full((batch,), int(valid_prefix_len), device="cuda", dtype=torch.int32)
+            lens = [int(v) for v in valid_prefix_len.reshape(-1).tolist()]
+        elif isinstance(valid_prefix_len, (list, tuple)):
+            lens = [int(v) for v in valid_prefix_len]
+        else:
+            lens = [int(valid_prefix_len)]
+        # A caller with one shared prompt shape may pass a single length.
+        if len(lens) == 1 and batch > 1:
+            lens = lens * batch
+        return lens
 
     def _copy_prefix_kv(
         self,
@@ -1902,14 +1950,19 @@ class Pi05RealtimeTritonDecoder:
         if batch is None:
             batch = int(buffers.valid_prefix_len.numel())
         valid_lens = self._as_valid_lens(valid_prefix_len, batch)
-        buffers.valid_prefix_len.copy_(valid_lens)
+        # fill_ with a host scalar, so the captured kernel carries the constant
+        # instead of dereferencing a tensor that may not outlive the capture.
+        for b, length in enumerate(valid_lens):
+            buffers.valid_prefix_len[b].fill_(length)
         if prefix_pad_masks is None:
             prefix_len = buffers.prefix_mask.numel() // batch
             mask = buffers.prefix_mask.view(batch, prefix_len)
             mask.zero_()
-            for b in range(batch):
-                mask[b, : int(valid_lens[b])] = 1
+            for b, length in enumerate(valid_lens):
+                mask[b, :length] = 1
         else:
+            if prefix_pad_masks.shape[0] != batch:
+                prefix_pad_masks = prefix_pad_masks.expand(batch, -1)
             buffers.prefix_mask.copy_(prefix_pad_masks.reshape(-1).to(torch.int32))
         # Must happen here, in setup, not inside the captured region: the table
         # depends on the per-sample valid lengths, which change between calls.
@@ -2035,6 +2088,7 @@ class Pi05RealtimeTritonDecoder:
                 kv_row_offset=prefix_len,
             )
             rows_q = seq_len * 8
+
             if self.decoder_fused_attention:
                 if batch != 1:
                     raise ValueError(
