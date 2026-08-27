@@ -397,11 +397,16 @@ if triton is not None and tl is not None:
         seq_len: tl.constexpr,
         features: tl.constexpr,
         block_size: tl.constexpr,
+        rows_per_sample: tl.constexpr,
     ):
         pid = tl.program_id(0)
         psize = tl.num_programs(0)
         for i in range(pid, seq_len, psize):
             row_x_offset = i * features
+            # The modulation is per sample, not per row, so rows belonging to
+            # sample b read style block b. With seq_len == rows_per_sample this
+            # is always block 0, i.e. the single-sample behaviour.
+            style_base = style_ptr + (i // rows_per_sample) * 3 * features
             sum_sq = tl.zeros((block_size,), dtype=tl.float32)
             for j in range(0, features, block_size):
                 cols = j + tl.arange(0, block_size)
@@ -413,9 +418,9 @@ if triton is not None and tl is not None:
                 cols = j + tl.arange(0, block_size)
                 mask = cols < features
                 x_val = tl.load(x_ptr + row_x_offset + cols, mask=mask, other=0.0).to(tl.float32)
-                scale = tl.load(style_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-                shift = tl.load(style_ptr + features + cols, mask=mask, other=0.0).to(tl.float32)
-                gate = tl.load(style_ptr + 2 * features + cols, mask=mask, other=0.0).to(tl.float32)
+                scale = tl.load(style_base + cols, mask=mask, other=0.0).to(tl.float32)
+                shift = tl.load(style_base + features + cols, mask=mask, other=0.0).to(tl.float32)
+                gate = tl.load(style_base + 2 * features + cols, mask=mask, other=0.0).to(tl.float32)
                 out = x_val * rms_factor * (1.0 + scale) + shift
                 tl.store(normed_x_ptr + row_x_offset + cols, out.to(tl.bfloat16), mask=mask)
                 tl.store(gate_ptr + row_x_offset + cols, gate.to(tl.bfloat16), mask=mask)
@@ -1791,76 +1796,117 @@ class Pi05RealtimeTritonDecoder:
             weights["ffn_down_w"][idx].copy_(_linear_weight_t(layer.mlp.down_proj))
         return weights
 
-    def _get_buffers(self, prefix_len: int, valid_prefix_len: int, dtype: torch.dtype) -> _DecoderBuffers:
-        key = (int(prefix_len), int(valid_prefix_len), dtype)
+    def _get_buffers(self, batch: int, prefix_len: int, dtype: torch.dtype) -> _DecoderBuffers:
+        # Batch is folded into the token dimension, as in the prefix encoder.
+        # K/V keep prefix and suffix adjacent per sample (row b*total_len + t)
+        # because the attention kernels walk them as one contiguous key range.
+        #
+        # The RoPE table is deliberately NOT part of the key: it depends on the
+        # per-sample valid prefix length, which would otherwise multiply the
+        # number of buffer sets the way it does for the CUDA graph cache. It is
+        # filled during setup instead, alongside the mask.
+        key = (int(batch), int(prefix_len), dtype)
         cached = self.buffers_by_prefix.get(key)
         if cached is not None:
             return cached
         total_len = prefix_len + self.chunk_size
+        rows = batch * self.chunk_size
         buffers = _DecoderBuffers(
-            noise=torch.empty(self.chunk_size, self.action_dim, device="cuda", dtype=torch.bfloat16),
-            x=torch.empty(self.chunk_size, self.hidden_size, device="cuda", dtype=torch.bfloat16),
-            x_normed=torch.empty(self.chunk_size, self.hidden_size, device="cuda", dtype=torch.bfloat16),
-            gate=torch.empty(self.chunk_size, self.hidden_size, device="cuda", dtype=torch.bfloat16),
-            q=torch.empty(self.chunk_size * 8, 256, device="cuda", dtype=torch.bfloat16),
-            k=torch.empty(self.num_layers, total_len, 256, device="cuda", dtype=torch.bfloat16),
-            v=torch.empty(self.num_layers, total_len, 256, device="cuda", dtype=torch.bfloat16),
-            logits=torch.empty(self.chunk_size * 8, total_len, device="cuda", dtype=torch.float32),
-            attn=torch.empty(self.chunk_size * 8, total_len, device="cuda", dtype=torch.bfloat16),
-            hidden=torch.empty(self.chunk_size, 4096, device="cuda", dtype=torch.bfloat16),
-            valid_prefix_len=torch.empty(1, device="cuda", dtype=torch.int32),
-            prefix_mask=torch.empty(prefix_len, device="cuda", dtype=torch.int32),
-            rope=self._build_rope(valid_prefix_len),
+            noise=torch.empty(rows, self.action_dim, device="cuda", dtype=torch.bfloat16),
+            x=torch.empty(rows, self.hidden_size, device="cuda", dtype=torch.bfloat16),
+            x_normed=torch.empty(rows, self.hidden_size, device="cuda", dtype=torch.bfloat16),
+            gate=torch.empty(rows, self.hidden_size, device="cuda", dtype=torch.bfloat16),
+            q=torch.empty(rows * 8, 256, device="cuda", dtype=torch.bfloat16),
+            k=torch.empty(self.num_layers, batch * total_len, 256, device="cuda", dtype=torch.bfloat16),
+            v=torch.empty(self.num_layers, batch * total_len, 256, device="cuda", dtype=torch.bfloat16),
+            logits=torch.empty(rows * 8, total_len, device="cuda", dtype=torch.float32),
+            attn=torch.empty(rows * 8, total_len, device="cuda", dtype=torch.bfloat16),
+            hidden=torch.empty(rows, 4096, device="cuda", dtype=torch.bfloat16),
+            valid_prefix_len=torch.empty(batch, device="cuda", dtype=torch.int32),
+            prefix_mask=torch.empty(batch * prefix_len, device="cuda", dtype=torch.int32),
+            rope=torch.empty(rows, 256, device="cuda", dtype=torch.bfloat16),
         )
         self.buffers_by_prefix[key] = buffers
         return buffers
 
-    def _build_rope(self, prefix_len: int) -> torch.Tensor:
-        start = prefix_len
-        pos = torch.arange(start, start + self.chunk_size, device="cuda", dtype=torch.float32)
+    def _fill_rope(self, rope: torch.Tensor, valid_prefix_lens: torch.Tensor) -> None:
+        """Write the suffix rotary table for each sample into ``rope``.
+
+        Suffix positions continue from the sample's own *valid* prefix length,
+        not the padded one, so a batch whose samples have different valid
+        lengths needs one table per sample.
+        """
+        batch = int(valid_prefix_lens.numel())
+        starts = valid_prefix_lens.to(device="cuda", dtype=torch.float32)[:, None]
+        offsets = torch.arange(self.chunk_size, device="cuda", dtype=torch.float32)[None, :]
+        pos = (starts + offsets).reshape(batch * self.chunk_size)
         inv_freq = 1.0 / (10000 ** (torch.arange(0, 256, 2, dtype=torch.float32, device="cuda") / 256))
         phase = pos[:, None] * inv_freq[None, :]
         table = torch.cat([torch.cos(phase)[:, :, None], torch.sin(phase)[:, :, None]], dim=2)
-        return table.reshape(self.chunk_size, 256).to(torch.bfloat16).contiguous()
+        rope.copy_(table.reshape(batch * self.chunk_size, 256).to(torch.bfloat16))
+
+    @staticmethod
+    def _as_valid_lens(valid_prefix_len, batch: int) -> torch.Tensor:
+        """Normalise a scalar-or-tensor valid length to an ``[B]`` int32 tensor."""
+        if isinstance(valid_prefix_len, torch.Tensor):
+            return valid_prefix_len.reshape(-1).to(device="cuda", dtype=torch.int32)
+        return torch.full((batch,), int(valid_prefix_len), device="cuda", dtype=torch.int32)
 
     def _copy_prefix_kv(
         self,
         prefix_kv: list[tuple[torch.Tensor, torch.Tensor]],
         prefix_pad_masks: torch.Tensor | None,
         buffers: _DecoderBuffers,
-        valid_prefix_len: int,
+        valid_prefix_len,
     ) -> int:
+        batch = int(prefix_kv[0][0].shape[0])
         prefix_len = int(prefix_kv[0][0].shape[2])
+        total_len = prefix_len + self.chunk_size
         for idx, (k_prefix, v_prefix) in enumerate(prefix_kv):
-            buffers.k[idx, :prefix_len].copy_(k_prefix[0, 0].to(torch.bfloat16))
-            buffers.v[idx, :prefix_len].copy_(v_prefix[0, 0].to(torch.bfloat16))
-        self._copy_prefix_metadata(prefix_pad_masks, buffers, valid_prefix_len)
+            # K/V are laid out [num_layers, B*total_len, D]; sample b owns rows
+            # [b*total_len, b*total_len + total_len), prefix first then suffix.
+            k_dst = buffers.k[idx].view(batch, total_len, 256)
+            v_dst = buffers.v[idx].view(batch, total_len, 256)
+            k_dst[:, :prefix_len].copy_(k_prefix[:, 0].to(torch.bfloat16))
+            v_dst[:, :prefix_len].copy_(v_prefix[:, 0].to(torch.bfloat16))
+        self._copy_prefix_metadata(prefix_pad_masks, buffers, valid_prefix_len, batch=batch)
         return prefix_len
 
     def _copy_prefix_metadata(
         self,
         prefix_pad_masks: torch.Tensor | None,
         buffers: _DecoderBuffers,
-        valid_prefix_len: int,
+        valid_prefix_len,
+        batch: int | None = None,
     ) -> None:
-        buffers.valid_prefix_len.fill_(valid_prefix_len)
+        if batch is None:
+            batch = int(buffers.valid_prefix_len.numel())
+        valid_lens = self._as_valid_lens(valid_prefix_len, batch)
+        buffers.valid_prefix_len.copy_(valid_lens)
         if prefix_pad_masks is None:
-            buffers.prefix_mask.zero_()
-            buffers.prefix_mask[:valid_prefix_len].fill_(1)
+            prefix_len = buffers.prefix_mask.numel() // batch
+            mask = buffers.prefix_mask.view(batch, prefix_len)
+            mask.zero_()
+            for b in range(batch):
+                mask[b, : int(valid_lens[b])] = 1
         else:
-            buffers.prefix_mask.copy_(prefix_pad_masks[0].to(torch.int32))
+            buffers.prefix_mask.copy_(prefix_pad_masks.reshape(-1).to(torch.int32))
+        # Must happen here, in setup, not inside the captured region: the table
+        # depends on the per-sample valid lengths, which change between calls.
+        self._fill_rope(buffers.rope, valid_lens)
 
     def prepare_prefix_buffers(
         self,
         *,
         prefix_len: int,
-        valid_prefix_len: int,
+        valid_prefix_len,
         dtype: torch.dtype,
         prefix_pad_masks: torch.Tensor | None,
+        batch: int = 1,
     ) -> _DecoderBuffers:
         _validate_prefix_suffix_softmax_window(prefix_len, self.chunk_size)
-        buffers = self._get_buffers(prefix_len, valid_prefix_len, dtype)
-        self._copy_prefix_metadata(prefix_pad_masks, buffers, valid_prefix_len)
+        buffers = self._get_buffers(batch, prefix_len, dtype)
+        self._copy_prefix_metadata(prefix_pad_masks, buffers, valid_prefix_len, batch=batch)
         return buffers
 
     def _get_final_weights(self, num_steps: int) -> tuple[torch.Tensor, torch.Tensor]:
