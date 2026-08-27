@@ -701,6 +701,9 @@ if triton is not None and tl is not None:
         block_m: tl.constexpr,
         block_n: tl.constexpr,
         block_k: tl.constexpr,
+        kv_rows_per_sample: tl.constexpr,
+        kv_sample_stride: tl.constexpr,
+        kv_row_offset: tl.constexpr,
     ):
         pid = tl.program_id(axis=0)
         psize = tl.num_programs(axis=0)
@@ -740,17 +743,29 @@ if triton is not None and tl is not None:
                 rot1 = x1 * x_cos + x0 * x_sin
                 acc = tl.interleave(rot0, rot1)
             acc = acc.to(tl.bfloat16)
+            # Q rows stay folded (sample b owns a contiguous block), but K/V go
+            # into the decoder's cache, where each sample's prefix and suffix sit
+            # together. Suffix row t of sample b therefore lands at
+            # b*kv_sample_stride + kv_row_offset + t.
+            kv_row = (
+                (offs_i // kv_rows_per_sample) * kv_sample_stride
+                + kv_row_offset
+                + (offs_i % kv_rows_per_sample)
+            )
             if start_j < num_heads * head_dim:
                 out_ptr = q_ptr
                 out_stride = num_heads * head_dim
+                out_row = offs_i
             elif start_j < (num_heads + 1) * head_dim:
                 out_ptr = k_ptr
                 out_stride = head_dim
+                out_row = kv_row
             else:
                 out_ptr = v_ptr
                 out_stride = head_dim
+                out_row = kv_row
             tl.store(
-                out_ptr + offs_i * out_stride + offs_j % out_stride,
+                out_ptr + out_row * out_stride + offs_j % out_stride,
                 acc,
                 mask=(offs_i < seq_len) & (offs_j < (num_heads + 2) * head_dim),
             )
@@ -958,20 +973,25 @@ if triton is not None and tl is not None:
     ):
         pid = tl.program_id(axis=0)
         psize = tl.num_programs(axis=0)
+        # axis 1 is the batch index; a 1-D launch leaves it 0.
+        pid_b = tl.program_id(axis=1)
         big_neg = -2.3819763e38
         total_keys: tl.constexpr = keys_prefix + keys_suffix
+        inp_base = inp_ptr + pid_b * queries * total_keys
+        out_base = out_ptr + pid_b * queries * total_keys
+        mask_base = prefix_mask_ptr + pid_b * keys_prefix
         for i in range(pid * block_m, queries, psize * block_m):
             offs_i = i + tl.arange(0, block_m)[:, None]
             offs_j = tl.arange(0, block_size)[None, :]
             is_prefix = offs_j < keys_prefix
-            prefix_ok = tl.load(prefix_mask_ptr + offs_j, mask=offs_j < keys_prefix, other=0).to(tl.int1)
+            prefix_ok = tl.load(mask_base + offs_j, mask=offs_j < keys_prefix, other=0).to(tl.int1)
             suffix_ok = ~is_prefix
             mask = (offs_i < queries) & (offs_j < total_keys) & ((is_prefix & prefix_ok) | suffix_ok)
-            vals = tl.load(inp_ptr + offs_i * total_keys + offs_j, mask=mask, other=big_neg)
+            vals = tl.load(inp_base + offs_i * total_keys + offs_j, mask=mask, other=big_neg)
             vals = tl.exp(vals - tl.max(vals, axis=1, keep_dims=True))
             vals = vals / tl.sum(vals, axis=1, keep_dims=True, dtype=tl.float32)
             tl.store(
-                out_ptr + offs_i * total_keys + offs_j,
+                out_base + offs_i * total_keys + offs_j,
                 vals.to(tl.bfloat16),
                 mask=(offs_i < queries) & (offs_j < total_keys),
             )
@@ -1931,8 +1951,9 @@ class Pi05RealtimeTritonDecoder:
         decoder_buffers: _DecoderBuffers | None = None,
         prefix_len: int | None = None,
     ) -> torch.Tensor:
-        if x_t.shape[0] != 1 or x_t.shape[1] != self.chunk_size or x_t.shape[2] != self.action_dim:
+        if x_t.dim() != 3 or x_t.shape[1] != self.chunk_size or x_t.shape[2] != self.action_dim:
             raise ValueError(f"unexpected action tensor shape for realtime Triton decoder: {tuple(x_t.shape)}")
+        batch = int(x_t.shape[0])
         if num_steps != len(adarms_modulations):
             raise ValueError("realtime Triton decoder requires precomputed AdaRMS for each denoise step")
         if prefix_len is None:
@@ -1943,16 +1964,18 @@ class Pi05RealtimeTritonDecoder:
         if decoder_buffers is None:
             if prefix_kv is None:
                 raise ValueError("prefix_kv is required when decoder_buffers is None")
-            buffers = self._get_buffers(prefix_len, valid_prefix_len, x_t.dtype)
+            buffers = self._get_buffers(batch, prefix_len, x_t.dtype)
             self._copy_prefix_kv(prefix_kv, prefix_pad_masks, buffers, valid_prefix_len)
         else:
             buffers = decoder_buffers
-            self._copy_prefix_metadata(prefix_pad_masks, buffers, valid_prefix_len)
-        buffers.noise.copy_(x_t[0].to(torch.bfloat16))
+            self._copy_prefix_metadata(prefix_pad_masks, buffers, valid_prefix_len, batch=batch)
+        buffers.noise.copy_(x_t.reshape(batch * self.chunk_size, self.action_dim).to(torch.bfloat16))
         final_w, final_b = self._get_final_weights(num_steps)
         for step in range(num_steps):
-            self._step(buffers, adarms_modulations[step], prefix_len, valid_prefix_len, final_w, final_b)
-        return buffers.noise[None].to(dtype=x_t.dtype)
+            self._step(
+                buffers, adarms_modulations[step], prefix_len, valid_prefix_len, final_w, final_b, batch=batch
+            )
+        return buffers.noise.view(batch, self.chunk_size, self.action_dim).to(dtype=x_t.dtype)
 
     def _step(
         self,
@@ -1962,14 +1985,18 @@ class Pi05RealtimeTritonDecoder:
         valid_prefix_len: int,
         final_w: torch.Tensor,
         final_b: torch.Tensor,
+        batch: int = 1,
     ) -> None:
         seq_len = self.chunk_size
-        _matmul_small_bias[((seq_len + 31) // 32) * (1024 // 32),](
+        # Rows carry the batch: row b*chunk_size + t. Weight-shared kernels are
+        # row-parallel and need nothing beyond the larger row count.
+        rows = batch * seq_len
+        _matmul_small_bias[((rows + 31) // 32) * (1024 // 32),](
             buffers.noise,
             self.weights["action_in_w"],
             buffers.x,
             self.weights["action_in_b"],
-            seq_len,
+            rows,
             32,
             1024,
             block_n=32,
@@ -1979,32 +2006,41 @@ class Pi05RealtimeTritonDecoder:
         total_keys = prefix_len + seq_len
         for layer_idx in range(self.num_layers):
             input_style, post_style = step_mods.layer_modulations[layer_idx]
-            _adarms_norm_kernel[(seq_len,)](
+            _adarms_norm_kernel[(rows,)](
                 buffers.x,
                 input_style.reshape(-1),
                 buffers.x_normed,
                 buffers.gate,
-                seq_len,
+                rows,
                 1024,
                 block_size=512,
+                rows_per_sample=seq_len,
             )
             _matmul_rope_qkv[(128,)](
                 buffers.x_normed,
-                seq_len,
+                rows,
                 1024,
                 256,
                 8,
                 self.weights["attn_qkv_w"][layer_idx],
                 buffers.rope,
                 buffers.q,
-                buffers.k[layer_idx, prefix_len : prefix_len + seq_len],
-                buffers.v[layer_idx, prefix_len : prefix_len + seq_len],
+                buffers.k[layer_idx],
+                buffers.v[layer_idx],
                 block_m=self.decoder_qkv_block_m,
                 block_n=self.decoder_qkv_block_n,
                 block_k=self.decoder_qkv_block_k,
+                kv_rows_per_sample=seq_len,
+                kv_sample_stride=total_keys,
+                kv_row_offset=prefix_len,
             )
             rows_q = seq_len * 8
             if self.decoder_fused_attention:
+                if batch != 1:
+                    raise ValueError(
+                        "PI05_REALTIME_DECODER_FUSED_ATTN is batch=1 only; it is off by "
+                        "default and measured slower than the split path"
+                    )
                 fused_attn_grid = (
                     (rows_q + self.decoder_fused_attention_block_m - 1) // self.decoder_fused_attention_block_m,
                 )
@@ -2024,9 +2060,12 @@ class Pi05RealtimeTritonDecoder:
                     block_d=256,
                 )
             else:
-                _matmul_abt_scale[((rows_q + 31) // 32) * ((total_keys + 31) // 32),](
+                # Sample b's queries must see only sample b's K/V, so these three
+                # take the batch on grid axis 1 and index their per-sample
+                # operands from it.
+                _matmul_abt_scale[(((rows_q + 31) // 32) * ((total_keys + 31) // 32), batch)](
                     buffers.q,
-                    buffers.k[layer_idx, :total_keys],
+                    buffers.k[layer_idx],
                     buffers.logits,
                     rows_q,
                     total_keys,
@@ -2036,7 +2075,7 @@ class Pi05RealtimeTritonDecoder:
                     block_n=32,
                     block_k=64,
                 )
-                _softmax_prefix_suffix_mask_vector[((rows_q + 3) // 4,)](
+                _softmax_prefix_suffix_mask_vector[((rows_q + 3) // 4, batch)](
                     buffers.logits,
                     rows_q,
                     prefix_len,
@@ -2046,9 +2085,9 @@ class Pi05RealtimeTritonDecoder:
                     block_m=4,
                     block_size=1024,
                 )
-                _matmul_small[((rows_q + 31) // 32) * (256 // 32),](
+                _matmul_small_bmm[(((rows_q + 31) // 32) * (256 // 32), batch)](
                     buffers.attn,
-                    buffers.v[layer_idx, :total_keys],
+                    buffers.v[layer_idx],
                     buffers.q,
                     rows_q,
                     total_keys,
@@ -2063,25 +2102,26 @@ class Pi05RealtimeTritonDecoder:
                 buffers.x,
                 buffers.x,
                 buffers.gate,
-                seq_len,
+                rows,
                 2048,
                 1024,
                 block_n=self.decoder_oproj_block_n,
                 block_m=self.decoder_oproj_block_m,
                 block_k=self.decoder_oproj_block_k,
             )
-            _adarms_norm_kernel[(seq_len,)](
+            _adarms_norm_kernel[(rows,)](
                 buffers.x,
                 post_style.reshape(-1),
                 buffers.x_normed,
                 buffers.gate,
-                seq_len,
+                rows,
                 1024,
                 block_size=512,
+                rows_per_sample=seq_len,
             )
             _matmul_small_gate[
                 (
-                    (seq_len + self.decoder_ffn_gate_block_n - 1) // self.decoder_ffn_gate_block_n,
+                    (rows + self.decoder_ffn_gate_block_n - 1) // self.decoder_ffn_gate_block_n,
                     (4096 + self.decoder_ffn_gate_block_m - 1) // self.decoder_ffn_gate_block_m,
                 )
             ](
@@ -2089,7 +2129,7 @@ class Pi05RealtimeTritonDecoder:
                 self.weights["ffn_gate_w"][layer_idx],
                 self.weights["ffn_up_w"][layer_idx],
                 buffers.hidden,
-                seq_len,
+                rows,
                 1024,
                 4096,
                 block_n=self.decoder_ffn_gate_block_n,
@@ -2098,7 +2138,7 @@ class Pi05RealtimeTritonDecoder:
             )
             _matmul_small_res_gate_ffn_down[
                 (
-                    ((seq_len + self.decoder_ffn_down_block_n - 1) // self.decoder_ffn_down_block_n)
+                    ((rows + self.decoder_ffn_down_block_n - 1) // self.decoder_ffn_down_block_n)
                     * (1024 // self.decoder_ffn_down_block_m),
                 )
             ](
@@ -2107,29 +2147,30 @@ class Pi05RealtimeTritonDecoder:
                 buffers.x,
                 buffers.x,
                 buffers.gate,
-                seq_len,
+                rows,
                 4096,
                 1024,
                 block_n=self.decoder_ffn_down_block_n,
                 block_m=self.decoder_ffn_down_block_m,
                 block_k=self.decoder_ffn_down_block_k,
             )
-        _adarms_norm_kernel[(seq_len,)](
+        _adarms_norm_kernel[(rows,)](
             buffers.x,
             step_mods.final_modulation.reshape(-1),
             buffers.x_normed,
             buffers.gate,
-            seq_len,
+            rows,
             1024,
             block_size=512,
+            rows_per_sample=seq_len,
         )
-        _matmul_small_bias_res[((seq_len + 15) // 16) * (32 // 16),](
+        _matmul_small_bias_res[((rows + 15) // 16) * (32 // 16),](
             buffers.x_normed,
             final_w,
             buffers.noise,
             final_b,
             buffers.noise,
-            seq_len,
+            rows,
             1024,
             32,
             block_n=16,
@@ -2162,22 +2203,39 @@ class Pi05RealtimeExecutor:
         adarms_modulations: list[Any],
         num_steps: int,
     ) -> torch.Tensor:
+        batch = int(prefix_embs.shape[0])
         prefix_len = int(prefix_embs.shape[1])
         buffers = self.decoder.prepare_prefix_buffers(
             prefix_len=prefix_len,
             valid_prefix_len=valid_prefix_len,
             dtype=x_t.dtype,
             prefix_pad_masks=prefix_pad_masks,
+            batch=batch,
         )
-        self.prefix_encoder(
-            prefix_embs=prefix_embs,
-            prefix_pad_masks=prefix_pad_masks,
-            prefix_position_ids=prefix_position_ids,
-            valid_prefix_len=valid_prefix_len,
-            output_k=buffers.k[:, :prefix_len],
-            output_v=buffers.v[:, :prefix_len],
-            return_prefix_kv=False,
-        )
+        if batch == 1:
+            # Prefix rows are the leading block of the K/V cache, so the encoder
+            # can still write straight into it.
+            self.prefix_encoder(
+                prefix_embs=prefix_embs,
+                prefix_pad_masks=prefix_pad_masks,
+                prefix_position_ids=prefix_position_ids,
+                valid_prefix_len=valid_prefix_len,
+                output_k=buffers.k[:, :prefix_len],
+                output_v=buffers.v[:, :prefix_len],
+                return_prefix_kv=False,
+            )
+        else:
+            # With B>1 the decoder interleaves each sample's prefix and suffix,
+            # so the encoder's contiguous [B*prefix_len] block has to be copied
+            # into place rather than written in situ.
+            prefix_kv = self.prefix_encoder(
+                prefix_embs=prefix_embs,
+                prefix_pad_masks=prefix_pad_masks,
+                prefix_position_ids=prefix_position_ids,
+                valid_prefix_len=valid_prefix_len,
+                return_prefix_kv=True,
+            )
+            self.decoder._copy_prefix_kv(prefix_kv, prefix_pad_masks, buffers, valid_prefix_len)
         return self.decoder(
             prefix_kv=None,
             prefix_pad_masks=prefix_pad_masks,
