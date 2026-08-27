@@ -1615,14 +1615,21 @@ class Pi05RealtimePrefixEncoder:
         rows_q = rows * self.num_heads
         scale = 1.0 / math.sqrt(float(self.head_dim))
 
+        # Per-layer row probe. It synchronises, so it invalidates an enclosing
+        # CUDA graph capture: run it with the prefix+denoise graph disabled.
         debug_rows = os.environ.get("PI05_DEBUG_PREFIX_ROWS", "") not in {"", "0", "false", "no"}
 
         def _dbg(tag: str, t: torch.Tensor, per_sample_rows: int) -> None:
             if not debug_rows or batch < 2:
                 return
             flat = t.reshape(batch, per_sample_rows, -1).float()
+            # row0's own value is what matters: comparing it between a run whose
+            # other rows are copies and a run whose other rows differ is what
+            # exposes one sample leaking into another. The row-to-row spread
+            # cannot show that, because identical samples hide any mixing.
+            row0 = flat[0].sum().item()
             dev = (flat[1:] - flat[:1]).abs().max().item()
-            print(f"[prefix-dbg] {tag:38s} max|row_i - row_0| = {dev:.6e}", flush=True)
+            print(f"[prefix-dbg] {tag:38s} row0_sum={row0:+.6f}  spread={dev:.3e}", flush=True)
 
         for layer_idx in range(self.num_layers):
             _dbg(f"L{layer_idx:02d} x (layer input)", buffers.x, prefix_len)
