@@ -1,0 +1,563 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""CPU unit tests for the π0.5 VLA model.
+
+Deliberately lightweight: config plumbing and the checkpoint-boundary rule, the
+state discretization path, relative actions, and the weight-load remap. Runs on
+CPU with no weights and no lerobot. The full LeRobot parity check lives in
+``tests/diffusion/models/pi05/test_pi05_parity.py``.
+
+Most assertions here guard *silent* failure modes — cases where the wrong
+behaviour still produces a well-shaped, finite action chunk:
+
+  * normalization must run before state discretization;
+  * quantile (``q01``/``q99``) norm stats must be recognized, since π0.5 defaults
+    to them where π0 defaults to ``mean_std``;
+  * relative-action checkpoints must be honoured, and an unresolvable
+    ``relative_exclude_joints`` must raise rather than silently make every
+    dimension relative;
+  * MEM / RTC checkpoints must be rejected rather than served incorrectly.
+
+    pytest tests/diffusion/models/pi05/test_pi05_units.py -v
+"""
+
+from __future__ import annotations
+
+import logging
+
+import numpy as np
+import pytest
+import torch
+
+from vllm_omni.diffusion.models.pi05.config import (
+    Pi05Config,
+    UnsupportedCheckpointCapabilityError,
+    resolve_excluded_action_indices,
+)
+from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
+    OPENPI_ATTENTION_MASK_VALUE,
+    Pi05AdaRMSNorm,
+    Pi05ForActionPrediction,
+    _apply_norm,
+    _build_norm_buffers,
+    create_sinusoidal_pos_embedding,
+    get_gemma_config,
+    make_att_2d_masks,
+    prepare_attention_masks_4d,
+)
+from vllm_omni.diffusion.models.pi05.processor_pi05 import (
+    PI05_MAX_TOKEN_LEN,
+    PI05_NUM_IMAGE_TOKENS,
+    Pi05ImageProcessor,
+    Pi05RelativeActions,
+    build_pi05_prompt,
+    discretize_state,
+    normalize_state,
+    prefix_token_budget,
+    resize_with_pad,
+)
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+# ----------------------------------------------------------------------------
+# Pi05Config dataclass + checkpoint resolver
+# ----------------------------------------------------------------------------
+_LEROBOT_CFG = {
+    "type": "pi05",
+    "paligemma_variant": "gemma_2b",
+    "action_expert_variant": "gemma_300m",
+    "chunk_size": 50,
+    "max_action_dim": 32,
+    "max_state_dim": 32,
+    "num_inference_steps": 10,
+    "image_resolution": [224, 224],
+    "tokenizer_max_length": 200,
+    "dtype": "float32",
+    "use_visual_memory": False,
+    "use_proprioceptive_memory": False,
+    "memory_frames": 6,
+    "rtc_config": None,
+    "rtc_training_max_delay": 0,
+    "use_relative_actions": False,
+    "relative_exclude_joints": ["gripper"],
+    # Training-only keys that must be filtered out of the dataclass.
+    "optimizer_lr": 2.5e-5,
+    "scheduler_warmup_steps": 1000,
+    "freeze_vision_encoder": False,
+    "input_features": {
+        "observation.images.base_0_rgb": {"type": "VISUAL", "shape": [3, 224, 224]},
+        "observation.images.left_wrist_0_rgb": {"type": "VISUAL", "shape": [3, 224, 224]},
+        "observation.images.right_wrist_0_rgb": {"type": "VISUAL", "shape": [3, 224, 224]},
+        "observation.state": {"type": "STATE", "shape": [32]},
+    },
+}
+
+_EXPECTED_CAMERA_ORDER = [
+    "observation.images.base_0_rgb",
+    "observation.images.left_wrist_0_rgb",
+    "observation.images.right_wrist_0_rgb",
+]
+
+_ACTION_NAMES = ["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "gripper"]
+
+
+def test_config_parses_lerobot_pi05_json():
+    c = Pi05Config.from_model_config(_LEROBOT_CFG)
+    assert c.tokenizer_max_length == 200
+    assert c.state_num_bins == 256
+    assert c.image_feature_keys == _EXPECTED_CAMERA_ORDER
+
+
+def test_config_tokenizer_length_differs_from_pi0():
+    """π0 pads text to 48 tokens; π0.5 pads to 200 because the prompt also
+    carries the serialized state."""
+    assert Pi05Config().tokenizer_max_length == 200
+    assert PI05_MAX_TOKEN_LEN == 200
+
+
+def test_config_filters_training_only_keys():
+    c = Pi05Config.from_model_config(_LEROBOT_CFG)
+    assert not hasattr(c, "optimizer_lr")
+    assert not hasattr(c, "scheduler_warmup_steps")
+
+
+def test_config_coerces_image_resolution_to_tuple():
+    c = Pi05Config.from_model_config(_LEROBOT_CFG)
+    assert c.image_resolution == (224, 224)
+
+
+def test_config_non_square_resolution_raises():
+    with pytest.raises(ValueError):
+        Pi05Config(image_resolution=(224, 256))
+
+
+def test_config_state_norm_stats_view_derived_from_norm_stats():
+    c = Pi05Config(norm_stats={"state": {"q01": [0.0], "q99": [1.0]}})
+    assert c.state_norm_stats == {"q01": [0.0], "q99": [1.0]}
+
+
+# ----------------------------------------------------------------------------
+# Checkpoint boundary: declared-but-unconsumed capabilities must raise
+# ----------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("use_visual_memory", True),
+        ("use_proprioceptive_memory", True),
+        ("rtc_config", {"mode": "trained", "inference_delay": 2}),
+        ("n_obs_steps", 6),
+    ],
+)
+def test_config_rejects_unsupported_capability(key, value):
+    """MEM and RTC change what a correct action chunk looks like and are not
+    visible in the weights. Serving such a checkpoint must fail loudly."""
+    with pytest.raises(UnsupportedCheckpointCapabilityError, match=key):
+        Pi05Config.from_model_config(dict(_LEROBOT_CFG, **{key: value}))
+
+
+@pytest.mark.parametrize("key", ["use_visual_memory", "use_proprioceptive_memory"])
+def test_config_accepts_disabled_capability(key):
+    """Carrying the field at its default is fine — only *enabling* it trips."""
+    assert Pi05Config.from_model_config(dict(_LEROBOT_CFG, **{key: False}))
+
+
+def test_config_accepts_rtc_training_max_delay():
+    """``rtc_training_max_delay`` describes how the checkpoint was *trained*
+    (clean action prefixes were sampled), not a request to run RTC at inference.
+    Such a checkpoint is still correct to serve without RTC, so it must not be
+    rejected — unlike a populated ``rtc_config``."""
+    c = Pi05Config.from_model_config(dict(_LEROBOT_CFG, rtc_training_max_delay=10))
+    assert c.tokenizer_max_length == 200
+
+
+# ----------------------------------------------------------------------------
+# Relative actions
+# ----------------------------------------------------------------------------
+def test_relative_actions_without_action_names_raises():
+    """``action_feature_names`` is populated from dataset metadata at training
+    time. There is no dataset at serving time, so a relative-action checkpoint
+    that omits it cannot resolve ``relative_exclude_joints`` and must fail."""
+    with pytest.raises(UnsupportedCheckpointCapabilityError, match="action_feature_names"):
+        Pi05Config.from_model_config(dict(_LEROBOT_CFG, use_relative_actions=True, action_feature_names=None))
+
+
+def test_relative_actions_with_action_names_accepted():
+    c = Pi05Config.from_model_config(dict(_LEROBOT_CFG, use_relative_actions=True, action_feature_names=_ACTION_NAMES))
+    assert c.use_relative_actions
+    assert c.relative_exclude_joints == ["gripper"]
+
+
+def test_relative_actions_empty_exclude_list_needs_no_action_names():
+    c = Pi05Config.from_model_config(dict(_LEROBOT_CFG, use_relative_actions=True, relative_exclude_joints=[]))
+    assert c.use_relative_actions
+
+
+def test_resolve_excluded_action_indices_exact_match():
+    assert resolve_excluded_action_indices(["gripper"], _ACTION_NAMES) == [6]
+
+
+def test_resolve_excluded_action_indices_substring_match():
+    """A checkpoint may spell the dimension ``gripper_position`` while the
+    config just says ``gripper``."""
+    assert resolve_excluded_action_indices(["gripper"], ["joint_0", "gripper_position"]) == [1]
+
+
+def test_resolve_excluded_action_indices_unresolvable_raises():
+    with pytest.raises(UnsupportedCheckpointCapabilityError):
+        resolve_excluded_action_indices(["no_such_joint"], _ACTION_NAMES)
+
+
+def _relative_step(enabled=True):
+    return Pi05RelativeActions(
+        enabled=enabled,
+        exclude_joints=["gripper"],
+        action_names=_ACTION_NAMES,
+        max_action_dim=32,
+    )
+
+
+def test_relative_mask_excludes_gripper_and_padding():
+    rel = _relative_step()
+    assert rel.relative_mask[0]
+    assert not rel.relative_mask[6], "gripper must stay absolute"
+    assert not rel.relative_mask[len(_ACTION_NAMES) :].any(), "padded dims carry no signal"
+    assert rel.num_relative_dims == 6
+
+
+def test_relative_absolute_round_trip_is_exact():
+    """The two directions are one object precisely so they cannot disagree."""
+    rel = _relative_step()
+    g = torch.Generator().manual_seed(0)
+    actions = torch.randn(1, 50, 32, generator=g)
+    state = torch.randn(32, generator=g)
+    assert torch.allclose(rel.to_absolute(rel.to_relative(actions, state), state), actions, atol=1e-6)
+
+
+def test_relative_transform_shifts_only_included_dims():
+    rel = _relative_step()
+    actions = torch.zeros(1, 4, 32)
+    state = torch.arange(32, dtype=torch.float32)
+    out = rel.to_absolute(actions, state)
+    assert torch.allclose(out[..., 0], state[0].expand(1, 4))
+    assert torch.allclose(out[..., 6], torch.zeros(1, 4)), "gripper must not be shifted"
+
+
+def test_relative_disabled_is_identity():
+    rel = _relative_step(enabled=False)
+    actions = torch.randn(1, 4, 32)
+    assert torch.equal(rel.to_absolute(actions, torch.randn(32)), actions)
+
+
+def test_relative_rejects_mismatched_action_dim():
+    rel = _relative_step()
+    with pytest.raises(ValueError, match="max_action_dim"):
+        rel.to_absolute(torch.zeros(1, 4, 8), torch.zeros(32))
+
+
+# ----------------------------------------------------------------------------
+# State discretization — π0.5's defining input path
+# ----------------------------------------------------------------------------
+def test_discretize_spans_the_full_bin_range():
+    out = discretize_state(np.array([-1.0, 0.0, 1.0], dtype=np.float32), num_bins=256)
+    assert out.tolist() == [0, 128, 255]
+
+
+def test_discretize_clips_out_of_range_input():
+    out = discretize_state(np.array([-9.0, 9.0], dtype=np.float32), num_bins=256)
+    assert out.tolist() == [0, 255]
+
+
+def test_discretize_respects_num_bins():
+    out = discretize_state(np.array([-1.0, 1.0], dtype=np.float32), num_bins=16)
+    assert out.tolist() == [0, 15]
+
+
+@pytest.mark.parametrize(
+    "stats",
+    [
+        {"mean": [5.0] * 32, "std": [1.0] * 32},
+        {"min": [0.0] * 32, "max": [10.0] * 32},
+        {"q01": [0.0] * 32, "q99": [10.0] * 32},
+    ],
+)
+def test_normalize_state_supports_every_mode(stats):
+    """π0.5 defaults STATE/ACTION to QUANTILES where π0 uses MEAN_STD, so the
+    ``q01``/``q99`` schema must be recognized. An unrecognized entry would fall
+    back to identity and mis-bin every state dimension without raising."""
+    out = normalize_state([5.0] * 32, max_state_dim=32, state_norm_stats=stats)
+    assert np.allclose(out, 0.0, atol=1e-6)
+
+
+def test_normalize_state_without_stats_only_clips():
+    out = normalize_state([5.0, -5.0] + [0.0] * 30, max_state_dim=32, state_norm_stats=None)
+    assert out[0] == 1.0 and out[1] == -1.0
+
+
+def test_normalize_state_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="Unsupported"):
+        normalize_state([0.0] * 32, max_state_dim=32, state_norm_stats={"mode": "bogus"})
+
+
+def test_normalization_must_precede_discretization():
+    """The ordering constraint from LeRobot's pipeline, as an executable check.
+
+    ``Pi05PrepareStateTokenizerProcessorStep`` bins over [-1, 1] and assumes the
+    normalizer already ran. Reversed, every bin index is wrong and nothing
+    raises — so assert the two orders actually differ.
+    """
+    stats = {"q01": [0.0] * 32, "q99": [10.0] * 32}
+    raw = [5.0] * 32
+    correct = discretize_state(normalize_state(raw, max_state_dim=32, state_norm_stats=stats))
+    skipped = discretize_state(np.asarray(raw, dtype=np.float32))
+    assert correct.tolist() != skipped.tolist()
+    assert correct[0] == 128, "mid-range state should land mid-range"
+    assert skipped[0] == 255, "unnormalized state saturates the top bin"
+
+
+def test_state_is_padded_to_max_state_dim():
+    prompt = build_pi05_prompt(task="x", state=[0.0, 0.0], max_state_dim=32, state_norm_stats=None)
+    bins = prompt.split("State: ")[1].split(";")[0].split()
+    assert len(bins) == 32
+
+
+def test_prompt_template_matches_lerobot():
+    prompt = build_pi05_prompt(
+        task="  pick_up the red\nblock ",
+        state=[0.0] * 4,
+        max_state_dim=4,
+        state_norm_stats=None,
+    )
+    assert prompt.startswith("Task: pick up the red block, State: ")
+    assert prompt.endswith(";\nAction: ")
+
+
+# ----------------------------------------------------------------------------
+# Input contract: 1..3 views x 256 tokens + a constant 200 text tokens
+# ----------------------------------------------------------------------------
+@pytest.mark.parametrize("views,expected", [(1, 456), (2, 712), (3, 968)])
+def test_prefix_token_budget(views, expected):
+    cfg = Pi05Config(max_cameras=views, tokenizer_max_length=200)
+    budget = prefix_token_budget(cfg, num_real_cameras=views)
+    assert budget["image_tokens"] == 256 * views
+    assert budget["text_tokens"] == 200
+    assert budget["total_prefix_len"] == expected
+
+
+def test_image_tokens_per_view_matches_siglip():
+    """SigLIP So400m/14 at 224x224 → (224/14)**2 = 256 tokens per view."""
+    assert PI05_NUM_IMAGE_TOKENS == (224 // 14) ** 2
+
+
+# ----------------------------------------------------------------------------
+# Shared math helpers (same contracts as π0)
+# ----------------------------------------------------------------------------
+def test_gemma_variant_dims():
+    vlm = get_gemma_config("gemma_2b")
+    assert (vlm.width, vlm.depth, vlm.mlp_dim, vlm.num_kv_heads, vlm.head_dim) == (2048, 18, 16384, 1, 256)
+    expert = get_gemma_config("gemma_300m")
+    assert (expert.width, expert.depth, expert.mlp_dim) == (1024, 18, 4096)
+
+
+def test_gemma_unknown_variant_raises():
+    with pytest.raises(ValueError):
+        get_gemma_config("gemma_7b")
+
+
+def test_sinusoidal_embedding_shape_and_oddity():
+    out = create_sinusoidal_pos_embedding(torch.tensor([0.0, 1.0]), 64)
+    assert out.shape == (2, 64)
+    with pytest.raises(ValueError):
+        create_sinusoidal_pos_embedding(torch.tensor([0.0]), 63)
+
+
+def test_prepare_attention_masks_4d():
+    mask = torch.tensor([[[True, False]]])
+    out = prepare_attention_masks_4d(mask)
+    assert out.shape == (1, 1, 1, 2)
+    assert out[0, 0, 0, 0] == 0.0
+    assert out[0, 0, 0, 1] == OPENPI_ATTENTION_MASK_VALUE
+
+
+def test_make_att_2d_masks_respects_padding():
+    pad = torch.tensor([[True, True, False]])
+    att = torch.tensor([[0, 0, 0]])
+    out = make_att_2d_masks(pad, att)
+    assert not out[0, :, 2].any()
+
+
+def test_build_norm_buffers_recognizes_quantile_stats():
+    """A π0.5 checkpoint typically ships q01/q99. Returning None here would
+    silently leave actions in normalized space."""
+    stats = _build_norm_buffers({"action": {"q01": [0.0], "q99": [2.0]}}, "action")
+    assert stats is not None
+    assert torch.allclose(stats["min"], torch.tensor([0.0]))
+    assert torch.allclose(stats["max"], torch.tensor([2.0]))
+
+
+def test_apply_norm_quantile_round_trip_and_padded_tail():
+    stats = _build_norm_buffers({"action": {"q01": [0.0, 0.0], "q99": [2.0, 4.0]}}, "action")
+    x = torch.tensor([[0.5, -0.5, 7.0]])  # third entry is padding beyond the stats
+    back = _apply_norm(_apply_norm(x, stats, inverse=False), stats, inverse=True)
+    assert torch.allclose(back, x, atol=1e-5)
+    assert back[0, 2] == 7.0, "padded tail must pass through untouched"
+
+
+# ----------------------------------------------------------------------------
+# Image processor
+# ----------------------------------------------------------------------------
+def test_resize_with_pad_pads_with_minus_one():
+    out = resize_with_pad(torch.zeros(1, 3, 100, 200), 224, 224)
+    assert out.shape == (1, 3, 224, 224)
+    assert out[0, 0, 0, 0] == -1.0
+
+
+def test_empty_camera_slot_is_all_minus_one():
+    empty = Pi05ImageProcessor().make_empty_image()
+    assert empty.shape == (1, 3, 224, 224)
+    assert torch.all(empty == -1.0)
+
+
+# ----------------------------------------------------------------------------
+# Model structure + weight-load remap (tiny action dims; full Gemma backbone)
+# ----------------------------------------------------------------------------
+def _tiny_pi05_model():
+    """Small action/state dims — the PaliGemma backbone is always full-size."""
+    return Pi05ForActionPrediction(Pi05Config(max_action_dim=8, max_state_dim=8, chunk_size=4))
+
+
+@pytest.fixture(autouse=True)
+def _silence_pi05_loader():
+    logging.getLogger("vllm_omni.diffusion.models.pi05.modeling_pi05").setLevel(logging.CRITICAL)
+    yield
+
+
+@pytest.mark.slow
+def test_model_has_no_state_proj():
+    """The π0.5 difference: state reaches the model as prompt tokens, so there
+    is no continuous state projection."""
+    model = _tiny_pi05_model()
+    assert not hasattr(model, "state_proj")
+    assert hasattr(model, "time_mlp_in") and hasattr(model, "time_mlp_out")
+
+
+@pytest.mark.slow
+def test_time_mlp_is_width_to_width():
+    """π0's ``action_time_mlp_in`` is ``2W → W`` because it concatenates time
+    onto the action embedding. π0.5's ``time_mlp_in`` is ``W → W`` and feeds
+    AdaRMS instead."""
+    model = _tiny_pi05_model()
+    assert model.time_mlp_in.in_features == model.expert_width
+    assert model.time_mlp_out.out_features == model.expert_width
+
+
+@pytest.mark.slow
+def test_action_expert_norms_are_adarms_and_prefix_norms_are_not():
+    model = _tiny_pi05_model()
+    expert = model.paligemma_with_expert.gemma_expert.model
+    for layer in expert.layers:
+        assert isinstance(layer.input_layernorm, Pi05AdaRMSNorm)
+        assert isinstance(layer.post_attention_layernorm, Pi05AdaRMSNorm)
+    assert isinstance(expert.norm, Pi05AdaRMSNorm)
+    # The prefix sees no timestep, so it keeps stock Gemma norms.
+    prefix_norm = model.paligemma_with_expert.paligemma.model.language_model.norm
+    assert not isinstance(prefix_norm, Pi05AdaRMSNorm)
+
+
+@pytest.mark.slow
+def test_adarms_dense_is_zero_initialized():
+    """OpenPI's zero-init means an untrained AdaRMS is the identity modulation
+    with a closed gate."""
+    model = _tiny_pi05_model()
+    dense = model.paligemma_with_expert.gemma_expert.model.layers[0].input_layernorm.dense
+    assert torch.count_nonzero(dense.weight) == 0
+    assert torch.count_nonzero(dense.bias) == 0
+
+
+@pytest.mark.slow
+def test_suffix_has_no_state_token():
+    """π0's suffix is ``[state, actions...]`` with AR mask ``[1, 1, 0...]``;
+    π0.5's is actions only with ``[1, 0...]``."""
+    model = _tiny_pi05_model()
+    embs, pad, att, cond = model.embed_suffix(torch.randn(1, 4, 8), torch.tensor([1.0]))
+    assert embs.shape[1] == 4
+    assert att[0].tolist() == [1, 0, 0, 0]
+    assert cond.shape == (1, model.expert_width)
+
+
+@pytest.mark.slow
+def test_adarms_norm_returns_gate_only_when_conditioned():
+    norm = Pi05AdaRMSNorm(8, cond_dim=4)
+    out, gate = norm(torch.randn(1, 3, 8), torch.randn(1, 4))
+    assert gate is not None and gate.shape == (1, 1, 8)
+
+    plain = Pi05AdaRMSNorm(8, cond_dim=None)
+    out, gate = plain(torch.randn(1, 3, 8))
+    assert gate is None
+
+
+@pytest.mark.slow
+def test_lm_head_remap_to_embed_tokens():
+    model = _tiny_pi05_model()
+    target = "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+    payload = torch.full(dict(model.named_parameters())[target].shape, 0.5)
+    model.load_weights([("model.paligemma_with_expert.paligemma.lm_head.weight", payload)])
+    assert torch.allclose(dict(model.named_parameters())[target], payload)
+
+
+@pytest.mark.slow
+def test_action_time_mlp_remapped_to_time_mlp():
+    """Some exports carry the π0 parameter names for the timestep MLP."""
+    model = _tiny_pi05_model()
+    payload = torch.full(dict(model.named_parameters())["time_mlp_in.weight"].shape, 0.25)
+    model.load_weights([("model.action_time_mlp_in.weight", payload)])
+    assert torch.allclose(dict(model.named_parameters())["time_mlp_in.weight"], payload)
+
+
+@pytest.mark.slow
+def test_pi0_shaped_keys_are_not_silently_loaded():
+    """A π0 checkpoint pointed at the π0.5 class would leave the AdaRMS expert
+    randomly initialized. ``state_proj`` is the tell."""
+    model = _tiny_pi05_model()
+    filled = model.load_weights([("model.state_proj.weight", torch.zeros(1024, 8))])
+    assert "state_proj.weight" not in filled
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("num_views", [1, 2, 3])
+def test_prefix_length_and_valid_len_for_each_view_count(num_views):
+    """The input contract: ``256 * views + 200`` total, with only the *valid*
+    length varying per request."""
+    model = _tiny_pi05_model()
+    live_text = 120
+    images = [torch.zeros(1, 3, 224, 224) for _ in range(num_views)]
+    masks = [torch.tensor([True]) for _ in range(num_views)]
+    lang = torch.zeros(1, 200, dtype=torch.long)
+    lang_mask = torch.zeros(1, 200, dtype=torch.bool)
+    lang_mask[:, :live_text] = True
+
+    embs, pad_masks, _ = model.embed_prefix(images, masks, lang, lang_mask)
+    assert embs.shape[1] == 256 * num_views + 200
+    assert int(pad_masks.sum()) == 256 * num_views + live_text
+
+
+@pytest.mark.slow
+def test_sample_actions_shape_and_determinism():
+    """Flow matching is an ODE: fixed noise must give a bit-identical chunk."""
+    model = _tiny_pi05_model().eval()
+    images = [torch.zeros(1, 3, 224, 224)]
+    masks = [torch.tensor([True])]
+    lang = torch.zeros(1, 200, dtype=torch.long)
+    lang_mask = torch.ones(1, 200, dtype=torch.bool)
+    noise = torch.randn(1, 4, 8, generator=torch.Generator().manual_seed(42))
+
+    with torch.no_grad():
+        a1 = model.sample_actions(
+            images=images, image_masks=masks, lang_tokens=lang, lang_masks=lang_mask, noise=noise, num_steps=2
+        )
+        a2 = model.sample_actions(
+            images=images, image_masks=masks, lang_tokens=lang, lang_masks=lang_mask, noise=noise, num_steps=2
+        )
+    assert a1.shape == (1, 4, 8)
+    assert torch.isfinite(a1).all()
+    assert torch.equal(a1, a2)

@@ -1,0 +1,70 @@
+# π0.5 VLA deploy: single diffusion stage.
+#
+# Topology (PI05_PIPELINE) is declared in
+# vllm_omni/diffusion/models/pi05_pipeline_config.py. π0.5 takes multi-camera
+# images + a language instruction + robot state and emits a continuous action
+# chunk [chunk_size, max_action_dim] via flow matching. Actions are exposed
+# through the OpenPI realtime serving API (/v1/realtime/robot/openpi); they ride
+# in multimodal_output["actions"].
+#
+# Default: one GPU, TP=1, eager (this first functional PR carries no CUDA Graph,
+# no Triton kernels and no caching), bsz 1 (OpenPI policy serving is one
+# observation -> one action reply). float32 to match the LeRobot reference
+# numerics.
+#
+# π0.5 vs π0 in this file: tokenizer_max_length is 200 rather than 48, and the
+# state is discretized into state_num_bins prompt tokens instead of going
+# through a state_proj layer.
+
+pipeline: pi05
+async_chunk: false
+distributed_executor_backend: mp
+dtype: float32
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: Pi05Pipeline
+    model_config:
+      paligemma_variant: gemma_2b
+      action_expert_variant: gemma_300m
+      chunk_size: 50
+      max_action_dim: 32
+      max_state_dim: 32
+      num_inference_steps: 10
+      image_resolution: [224, 224]
+      # π0.5 pads text to 200 tokens; the prompt also carries the state.
+      tokenizer_max_length: 200
+      # Number of bins the normalized state is discretized into before it is
+      # serialized into the prompt (openpi PaliGemmaTokenizer.tokenize).
+      state_num_bins: 256
+      max_cameras: 3
+      # Camera identities (the order the model attends to). Serving maps raw obs
+      # keys onto these via image_key_map; leave image_key_map empty to match
+      # incoming keys verbatim.
+      image_feature_keys:
+        - observation.images.base_0_rgb
+        - observation.images.left_wrist_0_rgb
+        - observation.images.right_wrist_0_rgb
+      image_key_map: {}
+      # Relative actions. Leave false unless the checkpoint was trained that way;
+      # if the checkpoint's config.json says true, the pipeline honours the
+      # checkpoint and logs a warning (its norm_stats live in relative space).
+      # When enabled, action_feature_names must be present so that
+      # relative_exclude_joints can be resolved to action indices.
+      use_relative_actions: false
+      relative_exclude_joints:
+        - gripper
+      # OpenPI handshake metadata advertised to the robot client.
+      policy_server_config:
+        image_resolution: [224, 224]
+        n_external_cameras: 1
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: false
+        action_space: joint_position
+        action_horizon: 50
+        action_dim: 32
+        max_cameras: 3
