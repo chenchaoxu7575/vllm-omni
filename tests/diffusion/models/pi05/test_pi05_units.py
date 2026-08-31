@@ -263,9 +263,17 @@ def test_discretize_spans_the_full_bin_range():
     assert out.tolist() == [0, 128, 255]
 
 
-def test_discretize_clips_out_of_range_input():
+def test_discretize_underflows_to_minus_one_and_saturates_at_the_top():
+    """Out-of-range input is asymmetric, and that asymmetry is LeRobot's.
+
+    ``np.digitize`` returns 0 for anything below the first bin edge, so the
+    ``- 1`` makes a below-range state land in bin ``-1``; above-range input
+    saturates at ``num_bins - 1`` on its own. The checkpoint was trained with
+    ``" -1"`` in the state prompt for under-range dims, so clipping that to 0
+    would change the tokens the model sees — LeRobot parity catches it.
+    """
     out = discretize_state(np.array([-9.0, 9.0], dtype=np.float32), num_bins=256)
-    assert out.tolist() == [0, 255]
+    assert out.tolist() == [-1, 255]
 
 
 def test_discretize_respects_num_bins():
@@ -289,9 +297,27 @@ def test_normalize_state_supports_every_mode(stats):
     assert np.allclose(out, 0.0, atol=1e-6)
 
 
-def test_normalize_state_without_stats_only_clips():
+def test_normalize_state_without_stats_passes_through():
+    """LeRobot's NormalizeProcessor returns the tensor unchanged when stats are
+    missing, so a client that normalizes its own state must not be re-scaled."""
     out = normalize_state([5.0, -5.0] + [0.0] * 30, max_state_dim=32, state_norm_stats=None)
-    assert out[0] == 1.0 and out[1] == -1.0
+    assert out[0] == 5.0 and out[1] == -5.0
+
+
+def test_normalize_state_does_not_clip_out_of_range():
+    """The parity-critical contract: normalization is affine and nothing else.
+
+    Clamping to [-1, 1] here would hide an under-range dimension from
+    ``discretize_state``, turning LeRobot's ``-1`` bin into ``0`` and changing
+    the state tokens in the prompt. LeRobot applies
+    ``2.0 * (x - q01) / (q99 - q01) - 1.0`` with no clip.
+    """
+    stats = {"q01": [0.0] * 32, "q99": [10.0] * 32}
+    out = normalize_state([-10.0, 20.0] + [5.0] * 30, max_state_dim=32, state_norm_stats=stats)
+    assert out[0] == pytest.approx(-3.0)  # would be -1.0 if clipped
+    assert out[1] == pytest.approx(3.0)  # would be 1.0 if clipped
+    # and the under-range dim must reach the -1 bin end to end
+    assert discretize_state(out, num_bins=256)[0] == -1
 
 
 def test_normalize_state_rejects_unknown_mode():

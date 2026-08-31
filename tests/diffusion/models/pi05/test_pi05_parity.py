@@ -120,7 +120,7 @@ def _create_dummy_batch(batch_size: int = BATCH_SIZE, num_views: int = 3, device
 
 
 # ─── Instantiation ────────────────────────────────────────────────────
-def _instantiate_lerobot(use_relative_actions: bool = False):
+def _instantiate_lerobot(use_relative_actions: bool = False, action_feature_names=None):
     from lerobot.policies.pi05 import PI05Policy
     from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
 
@@ -128,6 +128,15 @@ def _instantiate_lerobot(use_relative_actions: bool = False):
     policy.to(DEVICE)
     policy.config.device = DEVICE
     policy.config.use_relative_actions = use_relative_actions
+    if action_feature_names is not None:
+        # Must land on the config *before* the processors are built:
+        # make_pi05_pre_post_processors captures action_feature_names into
+        # RelativeActionsProcessorStep at construction time, and its _build_mask
+        # treats ``action_names is None`` as "shift every dim" — including the
+        # gripper that relative_exclude_joints is supposed to hold back. Setting
+        # it afterwards leaves the step with the all-True mask and silently
+        # compares two different transforms.
+        policy.config.action_feature_names = action_feature_names
     policy.eval()
 
     pre, post = make_pi05_pre_post_processors(config=policy.config, dataset_stats=_dummy_dataset_stats())
@@ -271,8 +280,9 @@ def test_pi05_relative_actions_parity():
     from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05RelativeActions
 
     action_names = [f"joint_{i}" for i in range(ACTION_DIM - 1)] + ["gripper"]
-    lerobot_policy, lerobot_pre, lerobot_post = _instantiate_lerobot(use_relative_actions=True)
-    lerobot_policy.config.action_feature_names = action_names
+    lerobot_policy, lerobot_pre, lerobot_post = _instantiate_lerobot(
+        use_relative_actions=True, action_feature_names=action_names
+    )
     omni_model, cfg = _instantiate_vllm_omni(use_relative_actions=True, action_feature_names=action_names)
 
     raw_batch = _create_dummy_batch()
@@ -304,7 +314,11 @@ def test_pi05_relative_actions_parity():
         max_action_dim=ACTION_DIM,
     )
     omni_actions = omni_model._unnormalize_actions(omni_raw)
-    omni_actions = rel.to_absolute(omni_actions, raw_batch["observation.state"][0])
+    # Per-sample reference state, matching LeRobot: its
+    # RelativeActionsProcessorStep caches the whole (B, D) state on the input
+    # side and shifts each sample by its own row. Passing a single row here
+    # would shift every sample by sample 0's state, which only agrees for B=1.
+    omni_actions = rel.to_absolute(omni_actions, raw_batch["observation.state"])
 
     lerobot_actions = torch.as_tensor(lerobot_actions).float()
     assert torch.allclose(lerobot_actions, omni_actions.float(), atol=ATOL), (

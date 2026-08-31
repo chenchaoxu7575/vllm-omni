@@ -198,14 +198,23 @@ def normalize_state(
     max_state_dim: int,
     state_norm_stats: dict[str, Any] | None,
 ) -> np.ndarray:
-    """Normalize the state into ``[-1, 1]`` ready for discretization.
+    """Normalize the state to the ``[-1, 1]`` scale ready for discretization.
 
-    With no stats this only clips: a client that already normalizes its state
-    (a supported deployment mode) then passes through unchanged.
+    **Deliberately does not clip.** LeRobot's ``NormalizeProcessor`` applies the
+    affine map and nothing else (``normalize_processor.py``: ``2.0 * (tensor -
+    q01) / denom - 1.0``), and returns the tensor unchanged when stats are
+    missing. A state outside the quantile range therefore leaves this function
+    outside ``[-1, 1]`` and lands in :func:`discretize_state`'s ``-1`` bin —
+    which is what the checkpoint was trained with. Clamping here would silently
+    rewrite those dimensions to bin ``0`` and change the prompt the model sees;
+    LeRobot parity catches it.
+
+    With no stats the state passes through untouched: a client that already
+    normalizes its own state is a supported deployment mode.
     """
     state = pad_or_truncate_state(raw_state, max_state_dim)
     if not state_norm_stats:
-        return np.clip(state, -1.0, 1.0)
+        return state
 
     stats = state_norm_stats
     mode = _infer_norm_mode(stats)
@@ -214,13 +223,13 @@ def normalize_state(
         mean = _stat_vector(stats.get("mean"), max_state_dim, 0.0)
         std = _stat_vector(stats.get("std"), max_state_dim, 1.0)
         std = np.where(np.abs(std) < 1e-6, 1.0, std)
-        return np.clip((state - mean) / std, -1.0, 1.0)
+        return (state - mean) / std
 
     if mode == "min_max":
         vmin = _stat_vector(stats.get("min"), max_state_dim, -1.0)
         vmax = _stat_vector(stats.get("max"), max_state_dim, 1.0)
         denom = np.where(np.abs(vmax - vmin) < 1e-6, 1.0, vmax - vmin)
-        return np.clip(2.0 * (state - vmin) / denom - 1.0, -1.0, 1.0)
+        return 2.0 * (state - vmin) / denom - 1.0
 
     if mode == "quantile":
         low_key = "q01" if "q01" in stats else "low"
@@ -228,7 +237,7 @@ def normalize_state(
         low = _stat_vector(stats.get(low_key), max_state_dim, -1.0)
         high = _stat_vector(stats.get(high_key), max_state_dim, 1.0)
         denom = np.where(np.abs(high - low) < 1e-6, 1.0, high - low)
-        return np.clip(2.0 * (state - low) / denom - 1.0, -1.0, 1.0)
+        return 2.0 * (state - low) / denom - 1.0
 
     raise ValueError(
         f"Unsupported π0.5 state_norm_stats mode: {mode!r}. Expected one of mean_std / min_max / quantile."
@@ -238,16 +247,23 @@ def normalize_state(
 def discretize_state(state: np.ndarray, *, num_bins: int = PI05_NUM_BINS) -> np.ndarray:
     """Discretize a ``[-1, 1]`` state into ``num_bins`` integer bins.
 
-    Mirrors LeRobot's
-    ``np.digitize(state, bins=np.linspace(-1, 1, num_bins + 1)[:-1]) - 1``.
-    The extra clip guards a state that arrives slightly outside ``[-1, 1]``;
-    without it ``digitize`` would emit an out-of-range bin.
+    Byte-for-byte LeRobot's ``processor_pi05.py``::
+
+        np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+
+    A state below ``-1`` lands in bin ``-1``, and that negative bin is part of
+    the contract: the checkpoint was trained with ``" -1"`` in the state prompt
+    for those dimensions. Clipping it to ``0`` changes the tokens the model
+    sees, so this must not clip — parity caught exactly that (7 of 32 state
+    dims differed, every one of them ``-1`` vs ``0``).
+
+    ``bins`` stays float64, matching LeRobot's default ``linspace`` dtype, so
+    boundary values fall on the same side.
 
     **Assumes the state is already normalized** — see the module docstring.
     """
-    clipped = np.clip(np.asarray(state, dtype=np.float32), -1.0, 1.0)
-    bins = np.linspace(-1.0, 1.0, num_bins + 1, dtype=np.float32)[:-1]
-    return np.clip(np.digitize(clipped, bins=bins) - 1, 0, num_bins - 1).astype(np.int64)
+    bins = np.linspace(-1.0, 1.0, num_bins + 1)[:-1]
+    return (np.digitize(np.asarray(state, dtype=np.float32), bins=bins) - 1).astype(np.int64)
 
 
 def build_pi05_prompt(
@@ -347,7 +363,25 @@ class Pi05RelativeActions:
         return int(self.relative_mask.sum())
 
     def _state_row(self, state: Any, device, dtype) -> torch.Tensor:
-        """Raw state → ``(1, max_action_dim)`` aligned with the action dims."""
+        """Raw state → ``(B, max_action_dim)`` aligned with the action dims.
+
+        Accepts one state for the whole batch (``(D,)``, the serving path,
+        where the pipeline runs B=1) or one state per sample (``(B, D)``).
+        LeRobot caches the batched state and shifts each sample by its own row,
+        so the per-sample form has to be honoured: ``pad_or_truncate_state``
+        flattens, which would silently reduce ``(B, D)`` to sample 0's state and
+        apply it to every sample — wrong answers, no error.
+        """
+        if isinstance(state, torch.Tensor):
+            arr = state.detach().cpu().numpy()
+        else:
+            arr = state
+        arr = np.asarray(arr if arr is not None else 0.0, dtype=np.float32)
+        if arr.ndim >= 2:
+            if arr.ndim > 2:
+                raise ValueError(f"Expected state shaped (D,) or (B, D), got {tuple(arr.shape)}")
+            rows = np.stack([pad_or_truncate_state(row, self.max_action_dim) for row in arr])
+            return torch.as_tensor(rows, device=device, dtype=dtype)
         padded = pad_or_truncate_state(state, self.max_action_dim)
         return torch.as_tensor(padded, device=device, dtype=dtype)[None, :]
 
