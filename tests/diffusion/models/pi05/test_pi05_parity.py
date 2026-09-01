@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """π0.5 LeRobot parity (in-process): the bit-for-bit correctness oracle.
 
 Verifies that vllm-omni's ``Pi05ForActionPrediction`` produces matching action
@@ -42,7 +42,9 @@ import torch
 # than in the ready-CI. Additionally gated on lerobot being importable.
 _HAS_LEROBOT = importlib.util.find_spec("lerobot") is not None
 
-pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
+# cpu: the comparison runs on CPU in float32 so both implementations see
+# identical numerics; local_model: it needs a lerobot venv that CI does not have.
+pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 # ─── Config (fixed; matches LeRobot defaults for a π0.5 checkpoint) ────

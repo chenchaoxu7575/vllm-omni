@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Inference-only π0.5 VLA math kernel for vllm-omni.
 
 A self-contained inference kernel: only the math that turns a robot observation
@@ -156,7 +156,7 @@ def _build_norm_buffers(norm_stats: dict | None, key: str) -> dict[str, torch.Te
     ``quantile`` matters for π0.5 specifically: LeRobot's ``PI05Config`` defaults
     ``STATE``/``ACTION`` to ``NormalizationMode.QUANTILES`` where ``PI0Config``
     uses ``MEAN_STD``. A π0.5 checkpoint therefore usually ships ``q01``/``q99``,
-    and treating that entry as unparseable would silently fall back to identity —
+    and treating that entry as unparsable would silently fall back to identity —
     i.e. return actions in normalized space and look merely "badly tuned".
     """
     if not norm_stats or not isinstance(norm_stats, dict):

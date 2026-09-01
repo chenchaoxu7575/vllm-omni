@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 r"""Preprocessing for the π0.5 VLA model.
 
 Converts a raw robot observation (multi-camera images + language instruction +

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Config surface for the π0.5 VLA model in vllm-omni.
 
 Deliberately shaped exactly like ``pi0/config.py``: a small dataclass that
