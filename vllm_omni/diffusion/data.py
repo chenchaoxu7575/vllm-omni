@@ -1484,6 +1484,14 @@ class OmniDiffusionConfig:
                         self.model_class_name = "Pi0Pipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
+                elif cfg.get("type") == "pi05":
+                    # π0.5 VLA — the LeRobot config.json uses ``type: "pi05"`` and
+                    # carries no ``architectures``, so this branch is the only way
+                    # the pipeline is resolved from a bare checkpoint path.
+                    if self.model_class_name is None:
+                        self.model_class_name = "Pi05Pipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
                     architecture = architectures[0]
                     from vllm_omni.diffusion.registry import DiffusionModelRegistry
