@@ -108,14 +108,15 @@ lives in `tests/e2e/online_serving/test_pi05_expansion.py::test_pi05_openpi_onli
 
 ## Limitations
 
-- **Normalization stats**: `lerobot/pi05_base` ships `features: {}` in its
-  `policy_preprocessor.json`, i.e. identity normalization, which is fully supported
-  (state passes through, actions are returned in the model's space). Per-dataset
-  `norm_stats` declared in a checkpoint's `config.json` are honored — `mean_std`,
-  `min_max` and π0.5's default `quantile` (`q01`/`q99`) — but stats stored only in
-  the `policy_preprocessor.json` companion are not yet loaded, so a fine-tuned
-  checkpoint that relies on those would need that bridge added before its actions
-  are in real-world units.
+- **Normalization stats**: loaded from the checkpoint automatically. LeRobot keeps
+  them out of `config.json` — `policy_preprocessor.json` holds the structure and a
+  companion `policy_preprocessor_step_*.safetensors` holds the numbers — and both are
+  read here, with the mode (`mean_std` / `min_max` / π0.5's default `quantile`) taken
+  from the sidecar's `norm_map`. A `norm_stats` block in `config.json` or in the deploy
+  yaml overrides the sidecar. `lerobot/pi05_base` declares no state file at all, i.e.
+  identity normalization: the state passes through and the client is expected to send
+  an already-normalized state. A normalization mode this implementation cannot
+  reproduce raises at load time rather than being served with the wrong transform.
 - **MEM and RTC are rejected, not silently ignored**: a checkpoint declaring
   short-horizon observation memory (`use_visual_memory`, `use_proprioceptive_memory`)
   or real-time chunking (`rtc_config`) fails at load time, because this stateless

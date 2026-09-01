@@ -214,14 +214,27 @@ class Pi05Config:
     # ------------------------------------------------------------------
     @classmethod
     def from_pretrained(cls, checkpoint_dir: str | Path) -> Pi05Config:
-        """Build from a checkpoint directory's ``config.json``."""
+        """Build from a checkpoint directory's ``config.json``.
+
+        Normalization stats are *not* in ``config.json``. LeRobot keeps them in
+        the processor sidecar, so they are loaded separately and backfilled
+        here — see :func:`load_lerobot_norm_stats`.
+        """
         checkpoint_dir = Path(checkpoint_dir)
         config_path = checkpoint_dir / "config.json"
         if not config_path.exists():
-            return cls()
-        with open(config_path, encoding="utf-8") as f:
-            raw = json.load(f)
-        return cls.from_model_config(raw)
+            config = cls()
+        else:
+            with open(config_path, encoding="utf-8") as f:
+                raw = json.load(f)
+            config = cls.from_model_config(raw)
+
+        if config.norm_stats is None:
+            stats = load_lerobot_norm_stats(checkpoint_dir)
+            if stats:
+                config.norm_stats = stats
+                config.state_norm_stats = stats.get("state")
+        return config
 
     @classmethod
     def from_model_config(cls, model_config: dict[str, Any] | None) -> Pi05Config:
@@ -249,6 +262,113 @@ class Pi05Config:
             # change inference behaviour is handled above instead.
             logger.debug("π0.5 config: ignoring %d non-runtime key(s): %s", len(dropped), dropped)
         return cls(**filtered)
+
+
+# ----------------------------------------------------------------------
+# LeRobot normalization-stats sidecar
+# ----------------------------------------------------------------------
+# LeRobot keeps normalization stats out of ``config.json``. It serializes the
+# processor pipeline as ``policy_preprocessor.json`` (structure only) plus one
+# safetensors file per *stateful* step, named in that step's ``state_file``
+# entry. ``NormalizerProcessorStep.state_dict`` flattens the stats to
+# ``"<feature_name>.<stat_name>"`` keys.
+_PREPROCESSOR_JSON = "policy_preprocessor.json"
+
+# LeRobot ``NormalizationMode`` → (our mode name, the two stat tensors it uses).
+# ``IDENTITY`` maps to None: the feature is deliberately left untransformed.
+#
+# The mode has to come from ``norm_map``. A LeRobot state_dict carries *all* of
+# mean/std/min/max/q01/q99 — ``compute_stats`` emits the full set regardless of
+# norm_map — so inferring it from which keys are present would read a QUANTILES
+# checkpoint as ``mean_std`` and apply a wrong affine map.
+_NORM_MODE_FROM_LEROBOT: dict[str, tuple[str, str, str] | None] = {
+    "IDENTITY": None,
+    "MEAN_STD": ("mean_std", "mean", "std"),
+    "MIN_MAX": ("min_max", "min", "max"),
+    "QUANTILES": ("quantile", "q01", "q99"),
+}
+# The two features we consume, as (LeRobot FeatureType, our norm_stats key).
+# Feature renaming happens in an earlier processor step, so these names are
+# canonical by the time the normalizer runs. VISUAL is absent by design: π0.5
+# normalizes images in the image processor, not from these stats.
+_NORM_STATS_FEATURES = {OBS_STATE: ("STATE", "state"), ACTION: ("ACTION", "action")}
+
+
+def load_lerobot_norm_stats(checkpoint_dir: str | Path) -> dict[str, dict[str, Any]] | None:
+    """Load normalization stats from a LeRobot checkpoint's processor sidecar.
+
+    Returns a ``norm_stats``-shaped dict (``{"state": {...}, "action": {...}}``)
+    carrying an **explicit** ``mode``, or ``None`` when the checkpoint ships no
+    stats. ``lerobot/pi05_base`` is the latter case: its normalizer step has no
+    ``state_file``, i.e. normalization is identity and the client is expected to
+    send an already-normalized state.
+
+    Raises on a mode we cannot reproduce rather than serving the checkpoint with
+    the wrong transform, which fails silently — a wrongly normalized state still
+    yields a plausible-looking action chunk.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    preprocessor_path = checkpoint_dir / _PREPROCESSOR_JSON
+    if not preprocessor_path.exists():
+        return None
+    with open(preprocessor_path, encoding="utf-8") as f:
+        steps = json.load(f).get("steps", [])
+
+    step = next((s for s in steps if s.get("registry_name") == "normalizer_processor"), {})
+    state_file = step.get("state_file")
+    if not state_file:
+        logger.info(
+            "π0.5 config: %s declares no normalizer state file — the checkpoint ships no "
+            "normalization stats and the state passes through unchanged.",
+            _PREPROCESSOR_JSON,
+        )
+        return None
+    state_path = checkpoint_dir / state_file
+    if not state_path.exists():
+        logger.warning(
+            "π0.5 config: %s references normalizer state %r, which is missing from the "
+            "checkpoint. Serving without normalization stats.",
+            _PREPROCESSOR_JSON,
+            state_file,
+        )
+        return None
+
+    norm_map = {str(k).upper(): str(v).upper() for k, v in ((step.get("config") or {}).get("norm_map") or {}).items()}
+
+    import safetensors.torch
+
+    flat = safetensors.torch.load_file(str(state_path))
+
+    stats: dict[str, dict[str, Any]] = {}
+    for feature_name, (feature_type, stats_key) in _NORM_STATS_FEATURES.items():
+        lerobot_mode = norm_map.get(feature_type, "IDENTITY")
+        if lerobot_mode not in _NORM_MODE_FROM_LEROBOT:
+            raise ValueError(
+                f"π0.5 checkpoint declares normalization mode {lerobot_mode!r} for {feature_type}, "
+                f"which this implementation cannot reproduce. Expected one of "
+                f"{sorted(_NORM_MODE_FROM_LEROBOT)}."
+            )
+        selected = _NORM_MODE_FROM_LEROBOT[lerobot_mode]
+        if selected is None:
+            continue
+
+        mode, *stat_names = selected
+        missing = [name for name in stat_names if f"{feature_name}.{name}" not in flat]
+        if missing:
+            raise ValueError(
+                f"π0.5 checkpoint declares {lerobot_mode} normalization for {feature_type} but its "
+                f"normalizer state is missing {missing} for feature {feature_name!r}."
+            )
+        stats[stats_key] = {"mode": mode} | {name: flat[f"{feature_name}.{name}"].tolist() for name in stat_names}
+
+    if not stats:
+        return None
+    logger.info(
+        "π0.5 config: loaded normalization stats from %s — %s.",
+        state_file,
+        ", ".join(f"{key}={value['mode']}" for key, value in sorted(stats.items())),
+    )
+    return stats
 
 
 # ----------------------------------------------------------------------

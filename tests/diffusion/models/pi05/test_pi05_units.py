@@ -32,6 +32,7 @@ import torch
 from vllm_omni.diffusion.models.pi05.config import (
     Pi05Config,
     UnsupportedCheckpointCapabilityError,
+    load_lerobot_norm_stats,
     resolve_excluded_action_indices,
 )
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
@@ -135,6 +136,194 @@ def test_config_non_square_resolution_raises():
 def test_config_state_norm_stats_view_derived_from_norm_stats():
     c = Pi05Config(norm_stats={"state": {"q01": [0.0], "q99": [1.0]}})
     assert c.state_norm_stats == {"q01": [0.0], "q99": [1.0]}
+
+
+# ----------------------------------------------------------------------------
+# LeRobot normalization-stats sidecar
+# ----------------------------------------------------------------------------
+# LeRobot keeps stats out of config.json: policy_preprocessor.json holds the
+# structure and one safetensors file per stateful step holds the numbers.
+def _write_lerobot_checkpoint(
+    tmp_path,
+    *,
+    norm_map: dict[str, str] | None = None,
+    stats: dict[str, dict[str, list[float]]] | None = None,
+    write_state_file: bool = True,
+) -> str:
+    """Write a minimal LeRobot-shaped checkpoint dir; return its path."""
+    import json as _json
+
+    import safetensors.torch as _st
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    state_file = "policy_preprocessor_step_3_normalizer_processor.safetensors"
+    step: dict = {
+        "registry_name": "normalizer_processor",
+        "config": {
+            "eps": 1e-08,
+            "features": {},
+            "norm_map": norm_map if norm_map is not None else {"STATE": "QUANTILES", "ACTION": "QUANTILES"},
+        },
+    }
+    if write_state_file:
+        step["state_file"] = state_file
+        flat = {
+            f"{feature}.{stat}": torch.tensor(values, dtype=torch.float32)
+            for feature, entry in (stats or {}).items()
+            for stat, values in entry.items()
+        }
+        _st.save_file(flat, str(tmp_path / state_file))
+
+    (tmp_path / "policy_preprocessor.json").write_text(
+        _json.dumps({"name": "policy_preprocessor", "steps": [step]}), encoding="utf-8"
+    )
+    (tmp_path / "config.json").write_text(_json.dumps(_LEROBOT_CFG), encoding="utf-8")
+    return str(tmp_path)
+
+
+# A LeRobot state_dict carries every stat compute_stats emits, not just the two
+# the norm_map selects.
+_FULL_DATASET_STATS = {
+    "observation.state": {
+        "mean": [10.0, 20.0],
+        "std": [1.0, 2.0],
+        "min": [-5.0, -5.0],
+        "max": [5.0, 5.0],
+        "q01": [-1.0, -2.0],
+        "q99": [1.0, 2.0],
+    },
+    "action": {
+        "mean": [0.5, 0.5],
+        "std": [0.1, 0.1],
+        "min": [-1.0, -1.0],
+        "max": [1.0, 1.0],
+        "q01": [-0.25, -0.5],
+        "q99": [0.25, 0.5],
+    },
+}
+
+
+def test_load_lerobot_norm_stats_picks_mode_from_norm_map_not_from_keys(tmp_path):
+    """The regression guard: all six stats are present, so a key-sniffing
+    implementation would infer mean_std. norm_map says QUANTILES."""
+    path = _write_lerobot_checkpoint(tmp_path, stats=_FULL_DATASET_STATS)
+    stats = load_lerobot_norm_stats(path)
+
+    assert stats is not None
+    assert stats["state"]["mode"] == "quantile"
+    assert stats["state"]["q01"] == [-1.0, -2.0]
+    assert stats["state"]["q99"] == [1.0, 2.0]
+    assert "mean" not in stats["state"], "mean/std must not leak into a quantile entry"
+    assert stats["action"]["mode"] == "quantile"
+    assert stats["action"]["q01"] == [-0.25, -0.5]
+
+
+def test_load_lerobot_norm_stats_honours_mean_std_norm_map(tmp_path):
+    path = _write_lerobot_checkpoint(
+        tmp_path, norm_map={"STATE": "MEAN_STD", "ACTION": "MEAN_STD"}, stats=_FULL_DATASET_STATS
+    )
+    stats = load_lerobot_norm_stats(path)
+
+    assert stats["state"] == {"mode": "mean_std", "mean": [10.0, 20.0], "std": [1.0, 2.0]}
+
+
+def test_load_lerobot_norm_stats_skips_identity_features(tmp_path):
+    path = _write_lerobot_checkpoint(
+        tmp_path, norm_map={"STATE": "IDENTITY", "ACTION": "QUANTILES"}, stats=_FULL_DATASET_STATS
+    )
+    stats = load_lerobot_norm_stats(path)
+
+    assert "state" not in stats
+    assert stats["action"]["mode"] == "quantile"
+
+
+def test_load_lerobot_norm_stats_ignores_visual_features(tmp_path):
+    path = _write_lerobot_checkpoint(
+        tmp_path,
+        norm_map={"STATE": "QUANTILES", "ACTION": "QUANTILES", "VISUAL": "IDENTITY"},
+        stats={**_FULL_DATASET_STATS, "observation.images.base_0_rgb": {"q01": [0.0], "q99": [1.0]}},
+    )
+    stats = load_lerobot_norm_stats(path)
+
+    assert set(stats) == {"state", "action"}
+
+
+def test_load_lerobot_norm_stats_without_state_file_is_none(tmp_path):
+    """The lerobot/pi05_base shape: a normalizer step carrying no stats."""
+    path = _write_lerobot_checkpoint(tmp_path, write_state_file=False)
+    assert load_lerobot_norm_stats(path) is None
+
+
+def test_load_lerobot_norm_stats_without_sidecar_is_none(tmp_path):
+    assert load_lerobot_norm_stats(tmp_path) is None
+
+
+def test_load_lerobot_norm_stats_unknown_mode_raises(tmp_path):
+    """Fail loud: an unreproducible mode served anyway is silently wrong."""
+    path = _write_lerobot_checkpoint(
+        tmp_path, norm_map={"STATE": "SOMETHING_NEW", "ACTION": "QUANTILES"}, stats=_FULL_DATASET_STATS
+    )
+    with pytest.raises(ValueError, match="SOMETHING_NEW"):
+        load_lerobot_norm_stats(path)
+
+
+def test_load_lerobot_norm_stats_missing_declared_stat_raises(tmp_path):
+    """norm_map promises QUANTILES but the state_dict has no q01/q99."""
+    path = _write_lerobot_checkpoint(
+        tmp_path, stats={"observation.state": {"mean": [0.0], "std": [1.0]}, "action": {"q01": [0.0], "q99": [1.0]}}
+    )
+    with pytest.raises(ValueError, match="q01"):
+        load_lerobot_norm_stats(path)
+
+
+def test_from_pretrained_backfills_sidecar_stats(tmp_path):
+    """End to end: the stats reach state_norm_stats without any deploy yaml."""
+    path = _write_lerobot_checkpoint(tmp_path, stats=_FULL_DATASET_STATS)
+    config = Pi05Config.from_pretrained(path)
+
+    assert config.norm_stats["state"]["mode"] == "quantile"
+    assert config.state_norm_stats == config.norm_stats["state"]
+
+
+def test_from_pretrained_does_not_override_explicit_norm_stats(tmp_path):
+    """config.json wins over the sidecar, matching LeRobot's override rule."""
+    import json as _json
+
+    path = _write_lerobot_checkpoint(tmp_path, stats=_FULL_DATASET_STATS)
+    explicit = {"state": {"mode": "min_max", "min": [0.0], "max": [1.0]}}
+    (tmp_path / "config.json").write_text(_json.dumps({**_LEROBOT_CFG, "norm_stats": explicit}), encoding="utf-8")
+
+    assert Pi05Config.from_pretrained(path).norm_stats == explicit
+
+
+def test_sidecar_quantile_stats_reach_the_prompt(tmp_path):
+    """The whole point: sidecar stats must change the discretized prompt bins."""
+    path = _write_lerobot_checkpoint(
+        tmp_path,
+        stats={"observation.state": {"q01": [-1.0, -1.0], "q99": [1.0, 1.0]}, "action": _FULL_DATASET_STATS["action"]},
+    )
+    config = Pi05Config.from_pretrained(path)
+    raw = np.array([1.0, -1.0], dtype=np.float32)
+
+    with_stats = discretize_state(normalize_state(raw, max_state_dim=2, state_norm_stats=config.state_norm_stats))
+    without = discretize_state(normalize_state(raw, max_state_dim=2, state_norm_stats=None))
+
+    # q01=-1/q99=1 maps [-1, 1] onto itself, so this is identical to the
+    # pass-through path: the top saturates at 255 and -1.0 sits exactly on the
+    # first bin edge (underflow to -1 needs a value strictly below q01).
+    assert with_stats.tolist() == without.tolist() == [255, 0]
+
+    shifted = Pi05Config.from_pretrained(
+        _write_lerobot_checkpoint(
+            tmp_path / "shifted",
+            stats={
+                "observation.state": {"q01": [0.0, 0.0], "q99": [4.0, 4.0]},
+                "action": _FULL_DATASET_STATS["action"],
+            },
+        )
+    )
+    moved = discretize_state(normalize_state(raw, max_state_dim=2, state_norm_stats=shifted.state_norm_stats))
+    assert moved.tolist() != without.tolist(), "different quantiles must move the prompt bins"
 
 
 # ----------------------------------------------------------------------------
@@ -292,7 +481,7 @@ def test_discretize_respects_num_bins():
 def test_normalize_state_supports_every_mode(stats):
     """π0.5 defaults STATE/ACTION to QUANTILES where π0 uses MEAN_STD, so the
     ``q01``/``q99`` schema must be recognized. An unrecognized entry would fall
-    back to identity and mis-bin every state dimension without raising."""
+    back to identity and wrongly bin every state dimension without raising."""
     out = normalize_state([5.0] * 32, max_state_dim=32, state_norm_stats=stats)
     assert np.allclose(out, 0.0, atol=1e-6)
 
