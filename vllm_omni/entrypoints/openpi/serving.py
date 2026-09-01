@@ -22,6 +22,22 @@ logger = init_logger(__name__)
 
 ActionOutput = np.ndarray | dict[str, np.ndarray]
 
+# Inference parameters a client may override per observation. The π0 / π0.5
+# pipelines already read these from ``sampling_params.extra_args``; without this
+# forwarding they can only ever take their deploy-config defaults.
+#
+# Whitelisted rather than blanket-forwarded: an observation is mostly camera
+# frames and robot state, and copying every key would turn any stray or
+# misspelled one into an engine parameter.
+_FORWARDED_INFERENCE_PARAMS = (
+    # Flow-matching denoising steps. Fewer steps trades accuracy for latency,
+    # which a robot may want to vary with its control budget.
+    "num_inference_steps",
+    # Initial noise for the denoising ODE. Pinning it makes a request
+    # reproducible, which is what the parity tests compare against.
+    "noise",
+)
+
 
 def _to_builtin_container(value: Any) -> Any:
     if OmegaConf.is_config(value):
@@ -31,6 +47,29 @@ def _to_builtin_container(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_to_builtin_container(item) for item in value]
     return value
+
+
+def _extract_inference_params(obs: Mapping[str, Any]) -> dict[str, Any]:
+    """Pull the whitelisted per-request inference params out of an observation.
+
+    Raises on a value the pipeline cannot honour instead of letting it through.
+    ``num_inference_steps=0`` would return the initial noise unchanged — a
+    well-shaped, finite, and completely wrong action chunk.
+    """
+    params: dict[str, Any] = {}
+    for key in _FORWARDED_INFERENCE_PARAMS:
+        if key not in obs:
+            continue
+        value = obs[key]
+        if value is None:
+            continue
+        if key == "num_inference_steps":
+            # bool is an int subclass, and msgpack round-trips numpy scalars.
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or int(value) < 1:
+                raise ValueError(f"num_inference_steps must be a positive integer, got {value!r}.")
+            value = int(value)
+        params[key] = value
+    return params
 
 
 @dataclass(frozen=True)
@@ -155,6 +194,7 @@ class ServingRealtimeRobotOpenPI:
             "session_id": session_id,
             "robot_obs": obs,
         }
+        extra_args.update(_extract_inference_params(obs))
 
         prompt = obs.get("prompt", "")
         sampling_params = OmniDiffusionSamplingParams(extra_args=extra_args)
