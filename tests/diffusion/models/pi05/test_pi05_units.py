@@ -29,6 +29,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.pi05 import modeling_pi05
 from vllm_omni.diffusion.models.pi05.config import (
     Pi05Config,
     UnsupportedCheckpointCapabilityError,
@@ -37,6 +38,7 @@ from vllm_omni.diffusion.models.pi05.config import (
 )
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
     OPENPI_ATTENTION_MASK_VALUE,
+    GemmaVariantConfig,
     Pi05AdaRMSNorm,
     Pi05ForActionPrediction,
     _apply_norm,
@@ -764,9 +766,49 @@ def test_build_model_inputs_requires_configured_camera():
 # unmatched or π0-shaped key, so a structural drift fails loudly at load time
 # rather than silently. ``test_pi0_shaped_keys_are_not_silently_loaded`` guards
 # that audit, and ``test_pi05_parity.py`` is the numerical oracle.
+# Both Gemma towers keep their real widths but drop from 18 layers to 2 for
+# every test in this section. Nothing here depends on depth: the weight remap
+# matches by name, and the AR mask, prefix length and ODE determinism are
+# shape-driven. Full-scale numerical correctness is ``test_pi05_parity.py``'s
+# job, against the real checkpoint.
+#
+# Two dimensions must NOT be shrunk, both because something outside these
+# configs is sized against them:
+#
+# * ``width`` — the vision tower's ``multi_modal_projector`` projects image
+#   embeddings to the PaliGemma text width so the two can be concatenated.
+#   Narrowing the text tower alone makes that concat fail.
+# * the vision tower itself — So400m/14 on 224x224 is what yields exactly 256
+#   tokens per view, which ``test_prefix_length_and_valid_len_for_each_view_count``
+#   exists to verify.
+#
+# Depths are equal across the two towers on purpose: the action expert runs
+# layer-by-layer alongside the VLM, so a mismatch would not be a valid model.
+_SHRUNK_GEMMA = {
+    "gemma_2b": GemmaVariantConfig(2048, 2, 1024, 8, 1, 256),
+    "gemma_300m": GemmaVariantConfig(1024, 2, 512, 8, 1, 256),
+}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _shrink_gemma_backbones():
+    """Patch the module-level lookup ``Pi05ForActionPrediction.__init__`` calls."""
+    patch = pytest.MonkeyPatch()
+    patch.setattr(modeling_pi05, "get_gemma_config", lambda variant: _SHRUNK_GEMMA[variant])
+    yield
+    patch.undo()
+
+
 def _tiny_pi05_model():
-    """Small action/state dims — the PaliGemma backbone is always full-size."""
+    """A fresh model. Use for tests that load weights or otherwise mutate it."""
     return Pi05ForActionPrediction(Pi05Config(max_action_dim=8, max_state_dim=8, chunk_size=4, n_action_steps=4))
+
+
+@pytest.fixture(scope="module")
+def tiny_model():
+    """Shared read-only model, so the tests that only inspect it pay for one
+    construction between them rather than one each."""
+    return _tiny_pi05_model()
 
 
 @pytest.fixture(autouse=True)
@@ -776,17 +818,16 @@ def _silence_pi05_loader():
 
 
 @pytest.mark.slow
-def test_suffix_has_no_state_token():
+def test_suffix_has_no_state_token(tiny_model):
     """π0's suffix is ``[state, actions...]`` with AR mask ``[1, 1, 0...]``;
     π0.5's is actions only with ``[1, 0...]``."""
-    model = _tiny_pi05_model()
-    embs, pad, att, cond = model.embed_suffix(torch.randn(1, 4, 8), torch.tensor([1.0]))
+    embs, pad, att, cond = tiny_model.embed_suffix(torch.randn(1, 4, 8), torch.tensor([1.0]))
     assert embs.shape[1] == 4
     assert att[0].tolist() == [1, 0, 0, 0]
-    assert cond.shape == (1, model.expert_width)
+    assert cond.shape == (1, tiny_model.expert_width)
 
 
-@pytest.mark.slow
+# Not marked slow: constructs one small norm layer, no backbone.
 def test_adarms_norm_returns_gate_only_when_conditioned():
     norm = Pi05AdaRMSNorm(8, cond_dim=4)
     out, gate = norm(torch.randn(1, 3, 8), torch.randn(1, 4))
@@ -826,10 +867,9 @@ def test_pi0_shaped_keys_are_not_silently_loaded():
 
 @pytest.mark.slow
 @pytest.mark.parametrize("num_views", [1, 2, 3])
-def test_prefix_length_and_valid_len_for_each_view_count(num_views):
+def test_prefix_length_and_valid_len_for_each_view_count(num_views, tiny_model):
     """The input contract: ``256 * views + 200`` total, with only the *valid*
     length varying per request."""
-    model = _tiny_pi05_model()
     live_text = 120
     images = [torch.zeros(1, 3, 224, 224) for _ in range(num_views)]
     masks = [torch.tensor([True]) for _ in range(num_views)]
@@ -837,15 +877,15 @@ def test_prefix_length_and_valid_len_for_each_view_count(num_views):
     lang_mask = torch.zeros(1, 200, dtype=torch.bool)
     lang_mask[:, :live_text] = True
 
-    embs, pad_masks, _ = model.embed_prefix(images, masks, lang, lang_mask)
+    embs, pad_masks, _ = tiny_model.embed_prefix(images, masks, lang, lang_mask)
     assert embs.shape[1] == 256 * num_views + 200
     assert int(pad_masks.sum()) == 256 * num_views + live_text
 
 
 @pytest.mark.slow
-def test_sample_actions_shape_and_determinism():
+def test_sample_actions_shape_and_determinism(tiny_model):
     """Flow matching is an ODE: fixed noise must give a bit-identical chunk."""
-    model = _tiny_pi05_model().eval()
+    model = tiny_model.eval()
     images = [torch.zeros(1, 3, 224, 224)]
     masks = [torch.tensor([True])]
     lang = torch.zeros(1, 200, dtype=torch.long)
