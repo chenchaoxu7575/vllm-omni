@@ -902,3 +902,86 @@ def test_sample_actions_shape_and_determinism(tiny_model):
     assert a1.shape == (1, 4, 8)
     assert torch.isfinite(a1).all()
     assert torch.equal(a1, a2)
+
+
+# ----------------------------------------------------------------------------
+# Serving dtype
+# ----------------------------------------------------------------------------
+# The check that decides what runs lives on the pipeline, not on Pi05Config:
+# Pi05Config.dtype records what the checkpoint declares and never reaches a
+# cast, while _initialize_model casts using the top-level OmniDiffusionConfig.
+@pytest.mark.parametrize(
+    "declared,expected",
+    [
+        ("float32", torch.float32),
+        ("bfloat16", torch.bfloat16),
+        (torch.float32, torch.float32),
+        (torch.bfloat16, torch.bfloat16),
+    ],
+)
+def test_resolve_dtype_accepts_supported_serving_dtypes(declared, expected):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    assert Pi05Pipeline._resolve_dtype(OmniDiffusionConfig(dtype=declared)) is expected
+
+
+@pytest.mark.parametrize("declared", ["float16", "fp16", torch.float16])
+def test_resolve_dtype_rejects_unvalidated_dtypes(declared):
+    """float16 resolves to a real torch dtype, so a permissive lookup would run
+    the model in a precision nothing here has been checked in.
+
+    Only dtypes that survive ``OmniDiffusionConfig`` normalization are worth
+    asserting on: it maps a string it does not recognize onto bfloat16 with a
+    warning, so e.g. ``"float64"`` never reaches this guard as float64.
+    """
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    with pytest.raises(ValueError, match="Unsupported π0.5 dtype"):
+        Pi05Pipeline._resolve_dtype(OmniDiffusionConfig(dtype=declared))
+
+
+@pytest.mark.slow
+def test_bfloat16_runs_and_tracks_float32(tiny_model):
+    """bfloat16 is a supported serving dtype, so it has to produce a usable
+    chunk — and one that still resembles float32.
+
+    The bound is deliberately loose. This is not a parity check (bfloat16
+    deviates from float32 by ~1-2% of the action range on the real checkpoint,
+    which is why recipes/lerobot/Pi05.md tells operators to validate it on their
+    own task). What it catches is gross breakage: a cast that silently did not
+    happen, activations overflowing to inf, or a dtype mismatch that would make
+    the two outputs unrelated.
+    """
+    import copy
+
+    images = [torch.zeros(1, 3, 224, 224)]
+    masks = [torch.tensor([True])]
+    lang = torch.zeros(1, 200, dtype=torch.long)
+    lang_mask = torch.ones(1, 200, dtype=torch.bool)
+    noise = torch.randn(1, 4, 8, generator=torch.Generator().manual_seed(7))
+
+    def run(model, dtype):
+        with torch.no_grad():
+            return model.sample_actions(
+                images=[img.to(dtype) for img in images],
+                image_masks=masks,
+                lang_tokens=lang,
+                lang_masks=lang_mask,
+                noise=noise.to(dtype),
+                num_steps=2,
+            ).float()
+
+    reference = run(tiny_model.eval(), torch.float32)
+    bf16_model = copy.deepcopy(tiny_model).to(torch.bfloat16).eval()
+
+    # The cast actually happened — otherwise everything below passes trivially.
+    assert next(bf16_model.parameters()).dtype is torch.bfloat16
+
+    actual = run(bf16_model, torch.bfloat16)
+    assert actual.shape == reference.shape
+    assert torch.isfinite(actual).all()
+
+    scale = float(reference.abs().max())
+    assert float((actual - reference).abs().max()) < max(0.5 * scale, 1e-2)
