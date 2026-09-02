@@ -23,6 +23,7 @@ relative-action checkpoint's ``norm_stats`` are computed in relative space.
 from __future__ import annotations
 
 import os
+from dataclasses import fields as dataclass_fields
 
 import numpy as np
 import torch
@@ -119,38 +120,36 @@ class Pi05Pipeline(nn.Module):
         """Build Pi05Config from deploy-yaml model_config, falling back to the
         checkpoint's config.json (raw LeRobot format).
 
-        The deploy yaml is authoritative but must not silently drop
-        checkpoint-derived fields it omits, so camera order, normalization stats
-        and the relative-action contract are backfilled from the checkpoint.
+        Explicit deploy values override checkpoint defaults, while omitted
+        fields retain the checkpoint's complete runtime schema. Relative-action
+        semantics remain checkpoint-owned because changing them would reinterpret
+        the trained output distribution.
         """
+        checkpoint_config = Pi05Config.from_pretrained(self.model_dir) if self.model_dir else None
         if od_config.model_config:
-            config = Pi05Config.from_model_config(dict(od_config.model_config))
-            if self.model_dir:
-                ckpt = Pi05Config.from_pretrained(self.model_dir)
-                if not config.image_feature_keys:
-                    config.image_feature_keys = ckpt.image_feature_keys
-                    if not config.input_features:
-                        config.input_features = ckpt.input_features
-                if config.norm_stats is None:
-                    config.norm_stats = ckpt.norm_stats
-                    config.state_norm_stats = ckpt.state_norm_stats
-                # A relative-action checkpoint served without the transform is
-                # silently wrong, so the checkpoint's setting wins if the yaml
-                # is silent about it.
-                if not config.use_relative_actions and ckpt.use_relative_actions:
-                    logger.warning(
-                        "Pi05Pipeline: checkpoint declares use_relative_actions=True but the "
-                        "deploy yaml did not; honouring the checkpoint. Its norm_stats are in "
-                        "relative action space."
-                    )
-                    config.use_relative_actions = True
-                    config.relative_exclude_joints = ckpt.relative_exclude_joints
-                    if config.action_feature_names is None:
-                        config.action_feature_names = ckpt.action_feature_names
-                    config._validate_relative_actions()
-            return config
-        if self.model_dir:
-            return Pi05Config.from_pretrained(self.model_dir)
+            deploy_raw = dict(od_config.model_config)
+            if checkpoint_config is None:
+                return Pi05Config.from_model_config(deploy_raw)
+
+            merged = {
+                item.name: getattr(checkpoint_config, item.name) for item in dataclass_fields(Pi05Config) if item.init
+            }
+            merged.update(deploy_raw)
+            for schema_key in ("input_features", "output_features", "norm_stats", "state_norm_stats"):
+                if not deploy_raw.get(schema_key):
+                    merged[schema_key] = getattr(checkpoint_config, schema_key)
+
+            if checkpoint_config.use_relative_actions and not deploy_raw.get("use_relative_actions"):
+                logger.warning(
+                    "Pi05Pipeline: checkpoint declares use_relative_actions=True; honouring the "
+                    "checkpoint because its normalization statistics are in relative action space."
+                )
+                merged["use_relative_actions"] = True
+                merged["relative_exclude_joints"] = checkpoint_config.relative_exclude_joints
+                merged["action_feature_names"] = checkpoint_config.action_feature_names
+            return Pi05Config.from_model_config(merged)
+        if checkpoint_config is not None:
+            return checkpoint_config
         return Pi05Config()
 
     def _resolve_tokenizer_source(self) -> str:
@@ -165,7 +164,11 @@ class Pi05Pipeline(nn.Module):
         dt = od_config.dtype
         if isinstance(dt, torch.dtype):
             return dt
-        return getattr(torch, str(dt).split(".")[-1], torch.float32)
+        name = str(dt).split(".")[-1]
+        resolved = getattr(torch, name, None)
+        if not isinstance(resolved, torch.dtype):
+            raise ValueError(f"Unsupported π0.5 dtype: {dt!r}.")
+        return resolved
 
     @staticmethod
     def _resolve_device(od_config: OmniDiffusionConfig) -> torch.device:
@@ -187,11 +190,11 @@ class Pi05Pipeline(nn.Module):
         return bool(self.model_dir) and os.path.exists(os.path.join(self.model_dir, "model.safetensors"))
 
     def _initialize_model(self) -> Pi05ForActionPrediction:
+        if not self.has_real_checkpoint():
+            expected = os.path.join(self.model_dir or "<missing-model-dir>", "model.safetensors")
+            raise FileNotFoundError(f"π0.5 serving requires checkpoint weights at {expected}.")
         model = Pi05ForActionPrediction(self.config)
-        if self.has_real_checkpoint():
-            self._load_checkpoint(model)
-        else:
-            logger.info("Pi05Pipeline: no model.safetensors under %s; using random init.", self.model_dir)
+        self._load_checkpoint(model)
         model.to(device=self._device, dtype=self._torch_dtype)
         model.eval()
         return model
@@ -201,8 +204,11 @@ class Pi05Pipeline(nn.Module):
 
         path = os.path.join(self.model_dir, "model.safetensors")
         logger.info("Pi05Pipeline: loading π0.5 weights from %s", path)
-        state = safetensors.torch.load_file(path)
-        model.load_weights(list(state.items()))
+        try:
+            state = safetensors.torch.load_file(path)
+            model.load_weights(state.items())
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load complete π0.5 checkpoint {path}: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Framework weight-loading hook
@@ -232,7 +238,7 @@ class Pi05Pipeline(nn.Module):
                 return DiffusionOutput(
                     output={
                         "actions": np.zeros(
-                            (self.config.chunk_size, self.config.max_action_dim),
+                            (self.config.chunk_size, self.config.action_dim),
                             dtype=np.float32,
                         )
                     },
@@ -241,7 +247,7 @@ class Pi05Pipeline(nn.Module):
                 error="Pi05Pipeline.forward requires sampling_params.extra_args['robot_obs'].",
             )
 
-        # Input steps 1-7. Note: no state tensor comes back — π0.5 serializes
+        # Serving input steps. Note: no state tensor comes back — π0.5 serializes
         # the (normalized, discretized) state into lang_tokens.
         images, image_masks, lang_tokens, lang_masks = build_model_inputs(
             robot_obs, self.config, self.tokenizer, self._device
@@ -252,8 +258,20 @@ class Pi05Pipeline(nn.Module):
             noise = torch.as_tensor(noise, dtype=torch.float32, device=self._device)
         elif isinstance(noise, torch.Tensor):
             noise = noise.to(device=self._device, dtype=torch.float32)
+        if noise is not None:
+            expected_noise_shape = (1, self.config.chunk_size, self.config.max_action_dim)
+            if tuple(noise.shape) != expected_noise_shape:
+                raise ValueError(f"noise must have shape {expected_noise_shape}, got {tuple(noise.shape)}.")
+            if not torch.isfinite(noise).all():
+                raise ValueError("noise must contain only finite values.")
 
-        num_steps = extra_args.get("num_inference_steps")
+        num_steps = getattr(req.sampling_params, "num_inference_steps", None)
+        if num_steps is not None and (
+            isinstance(num_steps, bool) or not isinstance(num_steps, (int, np.integer)) or int(num_steps) < 1
+        ):
+            raise ValueError(f"num_inference_steps must be a positive integer, got {num_steps!r}.")
+        if num_steps is not None:
+            num_steps = int(num_steps)
 
         actions = self.model.sample_actions(
             images=images,
@@ -272,6 +290,6 @@ class Pi05Pipeline(nn.Module):
             actions = self.relative_actions.to_absolute(actions, robot_obs.get("state"))
 
         # Output step 3: to_cpu. (B=1, horizon, action_dim) → (horizon, action_dim).
-        actions_np = actions.squeeze(0).float().cpu().numpy()
+        actions_np = actions.squeeze(0)[..., : self.config.action_dim].float().cpu().numpy()
 
         return DiffusionOutput(output={"actions": actions_np})

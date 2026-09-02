@@ -51,6 +51,7 @@ from vllm_omni.diffusion.models.pi05.processor_pi05 import (
     PI05_NUM_IMAGE_TOKENS,
     Pi05ImageProcessor,
     Pi05RelativeActions,
+    build_model_inputs,
     build_pi05_prompt,
     discretize_state,
     normalize_state,
@@ -92,6 +93,7 @@ _LEROBOT_CFG = {
         "observation.images.right_wrist_0_rgb": {"type": "VISUAL", "shape": [3, 224, 224]},
         "observation.state": {"type": "STATE", "shape": [32]},
     },
+    "output_features": {"action": {"type": "ACTION", "shape": [32]}},
 }
 
 _EXPECTED_CAMERA_ORDER = [
@@ -121,6 +123,45 @@ def test_config_filters_training_only_keys():
     c = Pi05Config.from_model_config(_LEROBOT_CFG)
     assert not hasattr(c, "optimizer_lr")
     assert not hasattr(c, "scheduler_warmup_steps")
+
+
+def test_config_rejects_unknown_key():
+    with pytest.raises(ValueError, match="mystery_option"):
+        Pi05Config.from_model_config(dict(_LEROBOT_CFG, mystery_option=42))
+
+
+def test_config_rejects_wrong_model_type():
+    with pytest.raises(ValueError, match="type='pi05'"):
+        Pi05Config.from_model_config(dict(_LEROBOT_CFG, type="pi0"))
+
+
+def test_config_rejects_unsupported_partial_action_chunk():
+    with pytest.raises(UnsupportedCheckpointCapabilityError, match="n_action_steps"):
+        Pi05Config.from_model_config(dict(_LEROBOT_CFG, n_action_steps=10))
+
+
+def test_config_derives_real_action_dim_from_output_features():
+    config = Pi05Config.from_model_config(
+        dict(_LEROBOT_CFG, output_features={"action": {"type": "ACTION", "shape": [7]}})
+    )
+    assert config.action_dim == 7
+    assert config.max_action_dim == 32
+
+
+def test_config_rejects_action_schema_wider_than_model():
+    with pytest.raises(ValueError, match="exceeds max_action_dim"):
+        Pi05Config.from_model_config(dict(_LEROBOT_CFG, output_features={"action": {"type": "ACTION", "shape": [33]}}))
+
+
+def test_config_rejects_inconsistent_openpi_metadata():
+    with pytest.raises(ValueError, match="policy_server_config.action_dim"):
+        Pi05Config.from_model_config(
+            dict(
+                _LEROBOT_CFG,
+                output_features={"action": {"type": "ACTION", "shape": [7]}},
+                policy_server_config={"action_dim": 32},
+            )
+        )
 
 
 def test_config_coerces_image_resolution_to_tuple():
@@ -252,6 +293,58 @@ def test_load_lerobot_norm_stats_without_state_file_is_none(tmp_path):
     """The lerobot/pi05_base shape: a normalizer step carrying no stats."""
     path = _write_lerobot_checkpoint(tmp_path, write_state_file=False)
     assert load_lerobot_norm_stats(path) is None
+
+
+def test_load_lerobot_norm_stats_missing_declared_state_file_raises(tmp_path):
+    path = _write_lerobot_checkpoint(tmp_path, stats=_FULL_DATASET_STATS)
+    (tmp_path / "policy_preprocessor_step_3_normalizer_processor.safetensors").unlink()
+
+    with pytest.raises(FileNotFoundError, match="normalizer state"):
+        load_lerobot_norm_stats(path)
+
+
+def test_pipeline_rejects_missing_model_weights_before_initialization(tmp_path):
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    pipeline = object.__new__(Pi05Pipeline)
+    pipeline.model_dir = str(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="model.safetensors"):
+        pipeline._initialize_model()
+
+
+def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.pi05 import pipeline_pi05
+
+    config = Pi05Config.from_model_config(
+        dict(_LEROBOT_CFG, output_features={"action": {"type": "ACTION", "shape": [7]}})
+    )
+    pipeline = object.__new__(pipeline_pi05.Pi05Pipeline)
+    pipeline.config = config
+    pipeline.tokenizer = object()
+    pipeline._device = torch.device("cpu")
+    pipeline.relative_actions = SimpleNamespace(enabled=False)
+    pipeline.model = SimpleNamespace(
+        sample_actions=lambda **kwargs: torch.ones(1, config.chunk_size, config.max_action_dim),
+        _unnormalize_actions=lambda actions: actions,
+    )
+    monkeypatch.setattr(
+        pipeline_pi05,
+        "build_model_inputs",
+        lambda *args: ([torch.empty(0)], [torch.empty(0)], torch.empty(0), torch.empty(0)),
+    )
+    request = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            num_inference_steps=2,
+            extra_args={"robot_obs": {"state": np.zeros(config.max_state_dim)}},
+        )
+    )
+
+    result = pipeline.forward(request)
+
+    assert result.output["actions"].shape == (config.chunk_size, 7)
 
 
 def test_load_lerobot_norm_stats_without_sidecar_is_none(tmp_path):
@@ -621,6 +714,38 @@ def test_apply_norm_quantile_round_trip_and_padded_tail():
 # ----------------------------------------------------------------------------
 # Image processor
 # ----------------------------------------------------------------------------
+@pytest.mark.parametrize("value,expected", [(0.0, -1.0), (0.25, -0.5), (1.0, 1.0)])
+@pytest.mark.parametrize("container", ["numpy", "torch"])
+def test_float_image_uses_lerobot_zero_one_domain(value, expected, container):
+    if container == "numpy":
+        image = np.full((4, 4, 3), value, dtype=np.float32)
+    else:
+        image = torch.full((3, 4, 4), value, dtype=torch.float32)
+
+    out = Pi05ImageProcessor(image_size=4).preprocess_single(image)
+
+    assert out.shape == (1, 3, 4, 4)
+    assert torch.allclose(out, torch.full_like(out, expected))
+
+
+@pytest.mark.parametrize("bad", [-0.01, 1.01, np.nan, np.inf])
+@pytest.mark.parametrize("container", ["numpy", "torch"])
+def test_float_image_rejects_values_outside_lerobot_domain(bad, container):
+    if container == "numpy":
+        image = np.full((4, 4, 3), bad, dtype=np.float32)
+    else:
+        image = torch.full((3, 4, 4), bad, dtype=torch.float32)
+
+    with pytest.raises(ValueError):
+        Pi05ImageProcessor(image_size=4).preprocess_single(image)
+
+
+def test_uint8_image_uses_zero_to_255_domain():
+    image = np.full((4, 4, 3), 64, dtype=np.uint8)
+    out = Pi05ImageProcessor(image_size=4).preprocess_single(image)
+    assert torch.allclose(out, torch.full_like(out, 64.0 / 255.0 * 2.0 - 1.0))
+
+
 def test_resize_with_pad_pads_with_minus_one():
     out = resize_with_pad(torch.zeros(1, 3, 100, 200), 224, 224)
     assert out.shape == (1, 3, 224, 224)
@@ -633,12 +758,52 @@ def test_empty_camera_slot_is_all_minus_one():
     assert torch.all(empty == -1.0)
 
 
+class _FakeTokenizer:
+    def __call__(self, text, **kwargs):
+        del text
+        length = kwargs["max_length"]
+        return {"input_ids": [0] * length, "attention_mask": [1] * length}
+
+
+def test_build_model_inputs_compacts_missing_middle_camera():
+    config = Pi05Config(image_feature_keys=_EXPECTED_CAMERA_ORDER, max_cameras=3)
+    observation = {
+        _EXPECTED_CAMERA_ORDER[0]: np.zeros((4, 4, 3), dtype=np.uint8),
+        _EXPECTED_CAMERA_ORDER[2]: np.full((4, 4, 3), 255, dtype=np.uint8),
+        "state": np.zeros(32, dtype=np.float32),
+    }
+
+    images, masks, _, _ = build_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"))
+
+    assert [bool(mask.item()) for mask in masks] == [True, True, False]
+    assert torch.all(images[0] == -1.0)
+    assert torch.all(images[1] == 1.0), "right camera must compact into slot 1"
+    assert torch.all(images[2] == -1.0), "empty graph padding belongs at the tail"
+
+
+def test_build_model_inputs_requires_state():
+    config = Pi05Config(image_feature_keys=_EXPECTED_CAMERA_ORDER)
+    observation = {_EXPECTED_CAMERA_ORDER[0]: np.zeros((4, 4, 3), dtype=np.uint8)}
+    with pytest.raises(ValueError, match="state"):
+        build_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"))
+
+
+def test_build_model_inputs_requires_configured_camera():
+    config = Pi05Config(image_feature_keys=_EXPECTED_CAMERA_ORDER)
+    observation = {
+        "unknown_camera": np.zeros((4, 4, 3), dtype=np.uint8),
+        "state": np.zeros(32, dtype=np.float32),
+    }
+    with pytest.raises(ValueError, match="configured camera"):
+        build_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"))
+
+
 # ----------------------------------------------------------------------------
 # Model structure + weight-load remap (tiny action dims; full Gemma backbone)
 # ----------------------------------------------------------------------------
 def _tiny_pi05_model():
     """Small action/state dims — the PaliGemma backbone is always full-size."""
-    return Pi05ForActionPrediction(Pi05Config(max_action_dim=8, max_state_dim=8, chunk_size=4))
+    return Pi05ForActionPrediction(Pi05Config(max_action_dim=8, max_state_dim=8, chunk_size=4, n_action_steps=4))
 
 
 @pytest.fixture(autouse=True)
@@ -716,7 +881,7 @@ def test_lm_head_remap_to_embed_tokens():
     model = _tiny_pi05_model()
     target = "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
     payload = torch.full(dict(model.named_parameters())[target].shape, 0.5)
-    model.load_weights([("model.paligemma_with_expert.paligemma.lm_head.weight", payload)])
+    model.load_weights([("model.paligemma_with_expert.paligemma.lm_head.weight", payload)], strict=False)
     assert torch.allclose(dict(model.named_parameters())[target], payload)
 
 
@@ -725,7 +890,7 @@ def test_action_time_mlp_remapped_to_time_mlp():
     """Some exports carry the π0 parameter names for the timestep MLP."""
     model = _tiny_pi05_model()
     payload = torch.full(dict(model.named_parameters())["time_mlp_in.weight"].shape, 0.25)
-    model.load_weights([("model.action_time_mlp_in.weight", payload)])
+    model.load_weights([("model.action_time_mlp_in.weight", payload)], strict=False)
     assert torch.allclose(dict(model.named_parameters())["time_mlp_in.weight"], payload)
 
 
@@ -734,8 +899,8 @@ def test_pi0_shaped_keys_are_not_silently_loaded():
     """A π0 checkpoint pointed at the π0.5 class would leave the AdaRMS expert
     randomly initialized. ``state_proj`` is the tell."""
     model = _tiny_pi05_model()
-    filled = model.load_weights([("model.state_proj.weight", torch.zeros(1024, 8))])
-    assert "state_proj.weight" not in filled
+    with pytest.raises(RuntimeError, match="π0-shaped"):
+        model.load_weights([("model.state_proj.weight", torch.zeros(1024, 8))])
 
 
 @pytest.mark.slow

@@ -6,12 +6,13 @@
 Boots ``vllm serve --omni --deploy-config pi05.yaml`` and drives the real OpenPI
 websocket (``/v1/realtime/robot/openpi``) — the same wire path a robot uses
 (handshake metadata → send observation → receive action chunk). Mirrors
-``tests/e2e/online_serving/test_pi0_expansion.py``. Needs a GPU + a π0.5
-checkpoint; skipped in CI unless explicitly run.
+``tests/e2e/online_serving/test_pi0_expansion.py``. Needs one H100 and the full
+π0.5 checkpoint.
 
 The ``pi0_openpi_*`` helpers are protocol-level (handshake, send obs, receive
 chunk) and not π0-specific, so π0.5 reuses them; only the deploy config and the
-expected metadata differ.
+expected metadata differ. This file is selected explicitly by the nightly H100
+robot-policy job.
 
 The in-process LeRobot parity oracle lives separately in
 ``tests/diffusion/models/pi05/test_pi05_parity.py``.
@@ -62,18 +63,13 @@ test_params = [
 
 @pytest.mark.full_model
 @pytest.mark.diffusion
-# L4 rather than H100: this serving path peaks at 14.7 GiB of the 22.5 GiB
-# usable on an RTX 4090 — same Ada architecture and the same 24 GB class as an
-# L4 (23028 vs 23034 MiB) — leaving ~7.4 GiB of headroom. Measured on a real
-# 4090 running this test, not extrapolated from the model-level footprint,
-# which excludes engine overhead.
-@hardware_test(res={"cuda": "L4"})
+# H100 is the long-term optimization and regression target for this serving
+# path; the nightly job names this file directly rather than relying on a broad
+# diffusion marker sweep.
+@hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_pi05_openpi_online(omni_server):
-    try:
-        pi0_openpi_require_dependencies()
-    except ModuleNotFoundError as exc:
-        pytest.skip(str(exc))
+    pi0_openpi_require_dependencies()
 
     result = pi0_openpi_run_policy_session(
         host=omni_server.host,
@@ -81,6 +77,8 @@ def test_pi05_openpi_online(omni_server):
         prompt="pick up the red block and place it in the bin",
         session_id="pi05-online-e2e",
         num_steps=2,
+        num_inference_steps=2,
+        float_images=True,
     )
 
     # Asserts every returned chunk is [50, 32] + finite, and the handshake

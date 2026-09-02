@@ -25,6 +25,9 @@ TEST_POLICY_SERVER_CONFIG = {
     "needs_stereo_camera": False,
     "needs_session_id": True,
     "action_space": "joint_position",
+    "action_horizon": 50,
+    "action_dim": 32,
+    "max_action_dim": 32,
 }
 
 
@@ -221,21 +224,24 @@ def test_build_request_uses_unique_engine_request_id_per_inference():
     assert request_a.request_id != request_b.request_id
 
 
-# Per-request inference parameters. The π0 / π0.5 pipelines read these from
-# extra_args; the whole point of forwarding them is that a client can override
-# the deploy-config defaults per control step.
+# Per-request inference parameters live in a strict namespace so robot feature
+# names remain open-ended without making engine option typos silent.
 def test_build_request_forwards_per_request_inference_params():
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
     noise = np.zeros((1, 50, 32), dtype=np.float32)
 
     request = serving._build_request(
-        {"prompt": "pick up the object", "num_inference_steps": 4, "noise": noise},
+        {
+            "prompt": "pick up the object",
+            "sampling_params": {"num_inference_steps": 4, "noise": noise},
+        },
         session_id="session-a",
         reset=True,
     )
 
-    assert request.sampling_params.extra_args["num_inference_steps"] == 4
+    assert request.sampling_params.num_inference_steps == 4
     assert request.sampling_params.extra_args["noise"] is noise
+    assert "sampling_params" not in request.sampling_params.extra_args["robot_obs"]
 
 
 def test_build_request_omits_inference_params_that_were_not_sent():
@@ -245,21 +251,20 @@ def test_build_request_omits_inference_params_that_were_not_sent():
 
     request = serving._build_request({"prompt": "x"}, session_id="s", reset=True)
 
-    assert "num_inference_steps" not in request.sampling_params.extra_args
+    assert request.sampling_params.num_inference_steps is None
     assert "noise" not in request.sampling_params.extra_args
 
 
-def test_build_request_ignores_explicitly_null_inference_params():
+@pytest.mark.parametrize("key", ["num_inference_steps", "noise"])
+def test_build_request_rejects_explicitly_null_inference_params(key):
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
 
-    request = serving._build_request(
-        {"prompt": "x", "num_inference_steps": None, "noise": None},
-        session_id="s",
-        reset=True,
-    )
-
-    assert "num_inference_steps" not in request.sampling_params.extra_args
-    assert "noise" not in request.sampling_params.extra_args
+    with pytest.raises(ValueError, match=key):
+        serving._build_request(
+            {"prompt": "x", "sampling_params": {key: None}},
+            session_id="s",
+            reset=True,
+        )
 
 
 def test_build_request_accepts_numpy_integer_step_count():
@@ -267,12 +272,12 @@ def test_build_request_accepts_numpy_integer_step_count():
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
 
     request = serving._build_request(
-        {"prompt": "x", "num_inference_steps": np.int64(6)},
+        {"prompt": "x", "sampling_params": {"num_inference_steps": np.int64(6)}},
         session_id="s",
         reset=True,
     )
 
-    steps = request.sampling_params.extra_args["num_inference_steps"]
+    steps = request.sampling_params.num_inference_steps
     assert steps == 6
     assert isinstance(steps, int)
 
@@ -285,27 +290,61 @@ def test_build_request_rejects_unusable_step_count(bad):
 
     with pytest.raises(ValueError, match="num_inference_steps"):
         serving._build_request(
-            {"prompt": "x", "num_inference_steps": bad},
+            {"prompt": "x", "sampling_params": {"num_inference_steps": bad}},
             session_id="s",
             reset=True,
         )
 
 
+def test_build_request_rejects_unknown_sampling_param_with_suggestion():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    with pytest.raises(ValueError, match="did you mean 'num_inference_steps'"):
+        serving._build_request(
+            {"prompt": "x", "sampling_params": {"num_infrence_steps": 4}},
+            session_id="s",
+            reset=True,
+        )
+
+
+@pytest.mark.parametrize("key,value", [("num_inference_steps", 4), ("noise", np.zeros((1, 50, 32)))])
+def test_build_request_rejects_legacy_top_level_inference_params(key, value):
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    with pytest.raises(ValueError, match="nested"):
+        serving._build_request({"prompt": "x", key: value}, session_id="s", reset=True)
+
+
 def test_build_request_does_not_forward_arbitrary_observation_keys():
-    """The forwarding list is a whitelist. An observation is mostly camera
-    frames and state; a stray key must not become an engine parameter."""
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
 
     request = serving._build_request(
-        {"prompt": "x", "state": np.zeros(32), "guidance_scale": 7.5, "num_infrence_steps": 4},
-        session_id="s",
-        reset=True,
+        {"prompt": "x", "state": np.zeros(32), "guidance_scale": 7.5}, session_id="s", reset=True
     )
 
     extra_args = request.sampling_params.extra_args
     assert set(extra_args) == {"reset", "session_id", "robot_obs"}
-    # Still reachable by the pipeline through the raw observation.
     assert extra_args["robot_obs"]["guidance_scale"] == 7.5
+
+
+@pytest.mark.parametrize(
+    "bad_noise",
+    [
+        np.zeros((50, 32), dtype=np.float32),
+        np.zeros((1, 49, 32), dtype=np.float32),
+        np.full((1, 50, 32), np.nan, dtype=np.float32),
+        "not-an-array",
+    ],
+)
+def test_build_request_rejects_invalid_noise(bad_noise):
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    with pytest.raises(ValueError, match="noise"):
+        serving._build_request(
+            {"prompt": "x", "sampling_params": {"noise": bad_noise}},
+            session_id="s",
+            reset=True,
+        )
 
 
 def test_infer_keeps_session_state_but_uses_unique_engine_request_ids():

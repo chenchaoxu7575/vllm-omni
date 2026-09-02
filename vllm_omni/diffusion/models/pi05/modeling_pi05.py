@@ -846,8 +846,13 @@ class Pi05ForActionPrediction(nn.Module):
         return x_t
 
     # ── Weight loading ───────────────────────────────────────────────
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        """Load weights from a LeRobot π0.5 safetensors checkpoint.
+    def load_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        strict: bool = True,
+    ):
+        """Load and audit a LeRobot π0.5 safetensors checkpoint.
 
         Same remap rules as π0 (strip the ``model.`` prefix, flatten→nested
         PaliGemma submodules, tied ``lm_head`` → ``embed_tokens``, version-robust
@@ -863,7 +868,9 @@ class Pi05ForActionPrediction(nn.Module):
         The action-expert norms are AdaRMS here, so they expose ``dense.weight``
         / ``dense.bias`` and no plain ``weight``. A checkpoint that carries a
         plain expert-norm ``weight`` is a π0-shaped checkpoint; that too is
-        surfaced rather than skipped.
+        rejected rather than skipped. ``strict=False`` exists only for focused
+        remapping unit tests that intentionally provide a partial state dict;
+        the serving path always uses the strict default.
         """
         params_dict = dict(self.named_parameters())
         buffers_dict = dict(self.named_buffers())
@@ -958,22 +965,20 @@ class Pi05ForActionPrediction(nn.Module):
                 continue
             missing_params.append(pname)
 
+        parts: list[str] = []
         if pi0_shaped:
-            logger.error(
-                "π0.5 load_weights: %d checkpoint key(s) look like π0, not π0.5 "
-                "(e.g. %s). A π0 checkpoint loaded into the π0.5 model class leaves "
-                "the AdaRMS action expert randomly initialized.",
-                len(pi0_shaped),
-                pi0_shaped[:5],
+            parts.append(
+                f"{len(pi0_shaped)} checkpoint key(s) are π0-shaped, not π0.5-shaped (first 5: {pi0_shaped[:5]})"
             )
+        if skipped:
+            parts.append(f"{len(skipped)} checkpoint key(s) had no model target (first 5: {skipped[:5]})")
+        if missing_params:
+            parts.append(f"{len(missing_params)} model param(s) received no weight (first 5: {missing_params[:5]})")
 
-        if missing_params or skipped:
-            parts: list[str] = []
-            if skipped:
-                parts.append(f"{len(skipped)} checkpoint key(s) had no home in the model (first 5: {skipped[:5]})")
-            if missing_params:
-                parts.append(f"{len(missing_params)} model param(s) received NO weight (first 5: {missing_params[:5]})")
-            logger.warning("π0.5 load_weights: %d tensors loaded — %s.", loaded, "; ".join(parts))
+        if parts and strict:
+            raise RuntimeError("Incomplete or incompatible π0.5 checkpoint: " + "; ".join(parts))
+        if parts:
+            logger.debug("π0.5 partial test load: %d tensors loaded — %s.", loaded, "; ".join(parts))
         else:
             logger.info("π0.5 load_weights: %d tensors loaded, 0 skipped, 0 missing.", loaded)
         return filled_params

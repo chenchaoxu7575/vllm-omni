@@ -16,19 +16,18 @@ bins, and serialized into the language prompt::
 
 so ``sample_actions`` receives no state tensor at all.
 
-Functional spec — LeRobot ``make_pi05_pre_post_processors``. Input side, 7 steps,
-order is load-bearing:
+Functional spec — LeRobot ``make_pi05_pre_post_processors``. The serving input
+path applies the observation-only subset in this order:
 
 ===  =========================================  ==========================================
   #  LeRobot step                               here
 ===  =========================================  ==========================================
   1  ``rename_observations``                    ``_extract_images`` via ``image_key_map``
   2  ``add_batch_dim``                          tensors built with a leading batch dim of 1
-  3  ``RelativeActionsProcessorStep``           :class:`Pi05RelativeActions` (input side)
-  4  ``normalize``                              :func:`normalize_state`
-  5  ``Pi05PrepareStateTokenizerProcessorStep`` :func:`discretize_state` + :func:`build_pi05_prompt`
-  6  ``TokenizerProcessorStep``                 :func:`tokenize_prompt`
-  7  ``to_device``                              ``device=`` on every tensor built below
+  3  ``normalize``                              :func:`normalize_state`
+  4  ``Pi05PrepareStateTokenizerProcessorStep`` :func:`discretize_state` + :func:`build_pi05_prompt`
+  5  ``TokenizerProcessorStep``                 :func:`tokenize_prompt`
+  6  ``to_device``                              ``device=`` on every tensor built below
 ===  =========================================  ==========================================
 
 Output side, 3 steps: ``unnormalize`` (model-side ``_unnormalize_actions``) →
@@ -36,12 +35,13 @@ Output side, 3 steps: ``unnormalize`` (model-side ``_unnormalize_actions``) →
 
 Two ordering constraints that fail *silently* if broken:
 
-* **Step 4 must precede step 5.** The discretizer bins over ``[-1, 1]`` and
+* **Normalization must precede discretization.** The discretizer bins over ``[-1, 1]`` and
   assumes the state is already normalized into that range. Reversed, every bin
   index is wrong and nothing raises.
-* **Step 3 uses the raw state, before step 4.** Relative actions live in the raw
-  action space (``relative = action - state``); the output side adds the same
-  raw state back after unnormalization.
+* LeRobot also applies ``RelativeActionsProcessorStep`` to training batches
+  that contain actions. Online observations contain no input action, so serving
+  only applies its inverse on model output, using the raw pre-normalization
+  state explicitly.
 
 Reference:
   - OpenPI: openpi/src/openpi/shared/image_tools.py (resize_with_pad)
@@ -51,7 +51,6 @@ Reference:
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import numpy as np
@@ -60,8 +59,6 @@ import torch.nn.functional as F
 from PIL import Image
 
 from vllm_omni.diffusion.models.pi05.config import resolve_excluded_action_indices
-
-logger = logging.getLogger(__name__)
 
 # Defaults straight from the π0.5 reference configs.
 PI05_IMAGE_SIZE = 224  # openpi/models/model.py IMAGE_RESOLUTION
@@ -116,8 +113,13 @@ class Pi05ImageProcessor:
         self.image_size = image_size
 
     def preprocess_single(self, image: Any) -> torch.Tensor:
-        """Accept a PIL image, an HWC uint8/float ndarray, or a CHW tensor and
-        return a ``(1, 3, image_size, image_size)`` float tensor in ``[-1, 1]``."""
+        """Convert one LeRobot-domain image to a normalized model tensor.
+
+        PIL and uint8 inputs have domain ``[0, 255]``. Floating ndarray/tensor
+        inputs must be finite and in ``[0, 1]``. Values are converted
+        deterministically to ``[-1, 1]``; the pixel content is never used to
+        guess its input domain.
+        """
         t = self._to_tensor(image)
         if t.shape[2] != self.image_size or t.shape[3] != self.image_size:
             t = resize_with_pad(t, self.image_size, self.image_size)
@@ -127,20 +129,44 @@ class Pi05ImageProcessor:
         if isinstance(image, Image.Image):
             return pil_image_to_tensor(image)
         if isinstance(image, np.ndarray):
-            arr = image
-            # HWC → normalize uint8/[0,255] to [-1,1]; assume already [-1,1] if float.
-            if arr.ndim == 3 and arr.shape[-1] in (1, 3):
-                if np.issubdtype(arr.dtype, np.integer) or arr.max() > 1.0:
-                    arr = arr.astype(np.float32) / 255.0 * 2.0 - 1.0
-                else:
-                    arr = arr.astype(np.float32)
-                return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-            return torch.as_tensor(arr, dtype=torch.float32)
+            if image.ndim != 3 or image.shape[-1] != 3:
+                raise ValueError(f"Expected an HWC ndarray with 3 channels, got shape {image.shape}.")
+            if image.dtype == np.uint8:
+                arr = image.astype(np.float32) / 255.0
+            elif np.issubdtype(image.dtype, np.floating):
+                if not np.isfinite(image).all():
+                    raise ValueError("Floating π0.5 image contains NaN or Inf.")
+                min_value = float(image.min())
+                max_value = float(image.max())
+                if min_value < 0.0 or max_value > 1.0:
+                    raise ValueError(
+                        f"Floating π0.5 images must be in [0, 1]; observed min={min_value}, max={max_value}."
+                    )
+                arr = image.astype(np.float32)
+            else:
+                raise TypeError(f"π0.5 ndarray images must use uint8 or floating dtype, got {image.dtype}.")
+            return torch.from_numpy(arr * 2.0 - 1.0).permute(2, 0, 1).unsqueeze(0)
         if isinstance(image, torch.Tensor):
             t = image
             if t.ndim == 3:  # (C, H, W) → (1, C, H, W)
                 t = t.unsqueeze(0)
-            return t.to(dtype=torch.float32)
+            if t.ndim != 4 or t.shape[0] != 1 or t.shape[1] != 3:
+                raise ValueError(f"Expected a CHW tensor (optionally batched once), got shape {tuple(t.shape)}.")
+            if t.dtype == torch.uint8:
+                t = t.to(dtype=torch.float32) / 255.0
+            elif t.is_floating_point():
+                if not torch.isfinite(t).all():
+                    raise ValueError("Floating π0.5 image contains NaN or Inf.")
+                min_value = float(t.amin().item())
+                max_value = float(t.amax().item())
+                if min_value < 0.0 or max_value > 1.0:
+                    raise ValueError(
+                        f"Floating π0.5 images must be in [0, 1]; observed min={min_value}, max={max_value}."
+                    )
+                t = t.to(dtype=torch.float32)
+            else:
+                raise TypeError(f"π0.5 tensor images must use uint8 or floating dtype, got {t.dtype}.")
+            return t * 2.0 - 1.0
         raise TypeError(f"Unsupported image type for π0.5 preprocessing: {type(image)}")
 
     def make_empty_image(self) -> torch.Tensor:
@@ -254,8 +280,7 @@ def discretize_state(state: np.ndarray, *, num_bins: int = PI05_NUM_BINS) -> np.
     A state below ``-1`` lands in bin ``-1``, and that negative bin is part of
     the contract: the checkpoint was trained with ``" -1"`` in the state prompt
     for those dimensions. Clipping it to ``0`` changes the tokens the model
-    sees, so this must not clip — parity caught exactly that (7 of 32 state
-    dims differed, every one of them ``-1`` vs ``0``).
+    sees, so this must not clip.
 
     ``bins`` stays float64, matching LeRobot's default ``linspace`` dtype, so
     boundary values fall on the same side.
@@ -459,10 +484,14 @@ def build_model_inputs(robot_obs: dict, config, tokenizer, device: torch.device)
     Returns ``(images, image_masks, lang_tokens, lang_masks)`` — note there is
     **no state tensor**: π0.5 carries the state inside ``lang_tokens``.
 
-    Camera ordering follows ``config.image_feature_keys`` exactly (the ordered
-    identities from the checkpoint's ``input_features``); for each, use the
-    supplied image (mask ``True``) or a ``-1``-filled empty image (mask ``False``).
+    Real cameras are filtered in ``config.image_feature_keys`` order and packed
+    contiguously, matching LeRobot. Empty images are appended only at the tail
+    to reach ``max_cameras`` for the selected graph shape.
     """
+    state = robot_obs.get("state")
+    if state is None:
+        raise ValueError("π0.5 observation requires a non-null 'state'.")
+
     image_size = int(config.image_resolution[0])
     img_proc = Pi05ImageProcessor(image_size=image_size)
     max_cameras = max(1, int(getattr(config, "max_cameras", PI05_MAX_CAMERAS)))
@@ -471,21 +500,23 @@ def build_model_inputs(robot_obs: dict, config, tokenizer, device: torch.device)
     obs_images = _extract_images(robot_obs, config)
     if not feature_keys:
         # No declared camera order — fall back to whatever the obs provides,
-        # capped at max_cameras (preserves insertion order).
-        feature_keys = list(obs_images.keys())[:max_cameras]
+        # preserving insertion order.
+        feature_keys = list(obs_images.keys())
+
+    present_images = [obs_images[key] for key in feature_keys if obs_images.get(key) is not None]
+    if not present_images:
+        raise ValueError("π0.5 observation must provide at least one configured camera image.")
+    if len(present_images) > max_cameras:
+        raise ValueError(
+            f"π0.5 observation provides {len(present_images)} configured cameras, "
+            f"which exceeds max_cameras={max_cameras}."
+        )
 
     images: list[torch.Tensor] = []
     image_masks: list[torch.Tensor] = []
-    for key in feature_keys[:max_cameras]:
-        img = obs_images.get(key)
-        if img is not None:
-            tensor = img_proc.preprocess_single(img).to(device=device)
-            mask = True
-        else:
-            tensor = img_proc.make_empty_image().to(device=device)
-            mask = False
-        images.append(tensor)
-        image_masks.append(torch.tensor([mask], dtype=torch.bool, device=device))
+    for image in present_images:
+        images.append(img_proc.preprocess_single(image).to(device=device))
+        image_masks.append(torch.tensor([True], dtype=torch.bool, device=device))
 
     # Pad up to max_cameras with empty slots if the checkpoint declares fewer
     # cameras than the model attends to.
@@ -496,7 +527,7 @@ def build_model_inputs(robot_obs: dict, config, tokenizer, device: torch.device)
     # Steps 4 + 5 + 6: normalize → discretize → prompt → tokenize.
     prompt = build_pi05_prompt(
         task=robot_obs.get("prompt", "") or "",
-        state=robot_obs.get("state"),
+        state=state,
         max_state_dim=config.max_state_dim,
         state_norm_stats=getattr(config, "state_norm_stats", None),
         state_num_bins=getattr(config, "state_num_bins", PI05_NUM_BINS),

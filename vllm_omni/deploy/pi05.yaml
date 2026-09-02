@@ -31,6 +31,9 @@ stages:
       paligemma_variant: gemma_2b
       action_expert_variant: gemma_300m
       chunk_size: 50
+      # Stateless serving returns one complete chunk; partial client-side
+      # n_action_steps queues are not supported.
+      n_action_steps: 50
       max_action_dim: 32
       max_state_dim: 32
       num_inference_steps: 10
@@ -67,4 +70,5 @@ stages:
         action_space: joint_position
         action_horizon: 50
         action_dim: 32
+        max_action_dim: 32
         max_cameras: 3
