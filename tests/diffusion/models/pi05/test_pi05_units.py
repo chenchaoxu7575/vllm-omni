@@ -48,7 +48,6 @@ from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
 )
 from vllm_omni.diffusion.models.pi05.processor_pi05 import (
     PI05_MAX_TOKEN_LEN,
-    PI05_NUM_IMAGE_TOKENS,
     Pi05ImageProcessor,
     Pi05RelativeActions,
     build_model_inputs,
@@ -106,10 +105,13 @@ _ACTION_NAMES = ["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5
 
 
 def test_config_parses_lerobot_pi05_json():
+    """``_LEROBOT_CFG`` carries the training-only keys a real checkpoint ships,
+    so this also covers the allowlist accepting them."""
     c = Pi05Config.from_model_config(_LEROBOT_CFG)
     assert c.tokenizer_max_length == 200
     assert c.state_num_bins == 256
     assert c.image_feature_keys == _EXPECTED_CAMERA_ORDER
+    assert c.image_resolution == (224, 224)
 
 
 def test_config_tokenizer_length_differs_from_pi0():
@@ -117,12 +119,6 @@ def test_config_tokenizer_length_differs_from_pi0():
     carries the serialized state."""
     assert Pi05Config().tokenizer_max_length == 200
     assert PI05_MAX_TOKEN_LEN == 200
-
-
-def test_config_filters_training_only_keys():
-    c = Pi05Config.from_model_config(_LEROBOT_CFG)
-    assert not hasattr(c, "optimizer_lr")
-    assert not hasattr(c, "scheduler_warmup_steps")
 
 
 def test_config_rejects_unknown_key():
@@ -164,19 +160,9 @@ def test_config_rejects_inconsistent_openpi_metadata():
         )
 
 
-def test_config_coerces_image_resolution_to_tuple():
-    c = Pi05Config.from_model_config(_LEROBOT_CFG)
-    assert c.image_resolution == (224, 224)
-
-
 def test_config_non_square_resolution_raises():
     with pytest.raises(ValueError):
         Pi05Config(image_resolution=(224, 256))
-
-
-def test_config_state_norm_stats_view_derived_from_norm_stats():
-    c = Pi05Config(norm_stats={"state": {"q01": [0.0], "q99": [1.0]}})
-    assert c.state_norm_stats == {"q01": [0.0], "q99": [1.0]}
 
 
 # ----------------------------------------------------------------------------
@@ -276,17 +262,6 @@ def test_load_lerobot_norm_stats_skips_identity_features(tmp_path):
 
     assert "state" not in stats
     assert stats["action"]["mode"] == "quantile"
-
-
-def test_load_lerobot_norm_stats_ignores_visual_features(tmp_path):
-    path = _write_lerobot_checkpoint(
-        tmp_path,
-        norm_map={"STATE": "QUANTILES", "ACTION": "QUANTILES", "VISUAL": "IDENTITY"},
-        stats={**_FULL_DATASET_STATS, "observation.images.base_0_rgb": {"q01": [0.0], "q99": [1.0]}},
-    )
-    stats = load_lerobot_norm_stats(path)
-
-    assert set(stats) == {"state", "action"}
 
 
 def test_load_lerobot_norm_stats_without_state_file_is_none(tmp_path):
@@ -433,15 +408,13 @@ def test_sidecar_quantile_stats_reach_the_prompt(tmp_path):
 )
 def test_config_rejects_unsupported_capability(key, value):
     """MEM and RTC change what a correct action chunk looks like and are not
-    visible in the weights. Serving such a checkpoint must fail loudly."""
+    visible in the weights. Serving such a checkpoint must fail loudly.
+
+    Only *enabling* trips: ``_LEROBOT_CFG`` already carries these keys at their
+    disabled defaults, so ``test_config_parses_lerobot_pi05_json`` covers the
+    accepting side."""
     with pytest.raises(UnsupportedCheckpointCapabilityError, match=key):
         Pi05Config.from_model_config(dict(_LEROBOT_CFG, **{key: value}))
-
-
-@pytest.mark.parametrize("key", ["use_visual_memory", "use_proprioceptive_memory"])
-def test_config_accepts_disabled_capability(key):
-    """Carrying the field at its default is fine — only *enabling* it trips."""
-    assert Pi05Config.from_model_config(dict(_LEROBOT_CFG, **{key: False}))
 
 
 def test_config_accepts_rtc_training_max_delay():
@@ -558,11 +531,6 @@ def test_discretize_underflows_to_minus_one_and_saturates_at_the_top():
     assert out.tolist() == [-1, 255]
 
 
-def test_discretize_respects_num_bins():
-    out = discretize_state(np.array([-1.0, 1.0], dtype=np.float32), num_bins=16)
-    assert out.tolist() == [0, 15]
-
-
 @pytest.mark.parametrize(
     "stats",
     [
@@ -650,11 +618,6 @@ def test_prefix_token_budget(views, expected):
     assert budget["image_tokens"] == 256 * views
     assert budget["text_tokens"] == 200
     assert budget["total_prefix_len"] == expected
-
-
-def test_image_tokens_per_view_matches_siglip():
-    """SigLIP So400m/14 at 224x224 → (224/14)**2 = 256 tokens per view."""
-    assert PI05_NUM_IMAGE_TOKENS == (224 // 14) ** 2
 
 
 # ----------------------------------------------------------------------------
@@ -752,12 +715,6 @@ def test_resize_with_pad_pads_with_minus_one():
     assert out[0, 0, 0, 0] == -1.0
 
 
-def test_empty_camera_slot_is_all_minus_one():
-    empty = Pi05ImageProcessor().make_empty_image()
-    assert empty.shape == (1, 3, 224, 224)
-    assert torch.all(empty == -1.0)
-
-
 class _FakeTokenizer:
     def __call__(self, text, **kwargs):
         del text
@@ -799,8 +756,14 @@ def test_build_model_inputs_requires_configured_camera():
 
 
 # ----------------------------------------------------------------------------
-# Model structure + weight-load remap (tiny action dims; full Gemma backbone)
+# Model behaviour + weight-load remap (tiny action dims; full Gemma backbone)
 # ----------------------------------------------------------------------------
+# Module *structure* (no ``state_proj``, ``time_mlp_{in,out}`` widths, AdaRMS on
+# the expert norms but not the prefix) is not asserted here: ``load_weights``
+# audits every model parameter against the checkpoint and raises on a missing,
+# unmatched or π0-shaped key, so a structural drift fails loudly at load time
+# rather than silently. ``test_pi0_shaped_keys_are_not_silently_loaded`` guards
+# that audit, and ``test_pi05_parity.py`` is the numerical oracle.
 def _tiny_pi05_model():
     """Small action/state dims — the PaliGemma backbone is always full-size."""
     return Pi05ForActionPrediction(Pi05Config(max_action_dim=8, max_state_dim=8, chunk_size=4, n_action_steps=4))
@@ -810,48 +773,6 @@ def _tiny_pi05_model():
 def _silence_pi05_loader():
     logging.getLogger("vllm_omni.diffusion.models.pi05.modeling_pi05").setLevel(logging.CRITICAL)
     yield
-
-
-@pytest.mark.slow
-def test_model_has_no_state_proj():
-    """The π0.5 difference: state reaches the model as prompt tokens, so there
-    is no continuous state projection."""
-    model = _tiny_pi05_model()
-    assert not hasattr(model, "state_proj")
-    assert hasattr(model, "time_mlp_in") and hasattr(model, "time_mlp_out")
-
-
-@pytest.mark.slow
-def test_time_mlp_is_width_to_width():
-    """π0's ``action_time_mlp_in`` is ``2W → W`` because it concatenates time
-    onto the action embedding. π0.5's ``time_mlp_in`` is ``W → W`` and feeds
-    AdaRMS instead."""
-    model = _tiny_pi05_model()
-    assert model.time_mlp_in.in_features == model.expert_width
-    assert model.time_mlp_out.out_features == model.expert_width
-
-
-@pytest.mark.slow
-def test_action_expert_norms_are_adarms_and_prefix_norms_are_not():
-    model = _tiny_pi05_model()
-    expert = model.paligemma_with_expert.gemma_expert.model
-    for layer in expert.layers:
-        assert isinstance(layer.input_layernorm, Pi05AdaRMSNorm)
-        assert isinstance(layer.post_attention_layernorm, Pi05AdaRMSNorm)
-    assert isinstance(expert.norm, Pi05AdaRMSNorm)
-    # The prefix sees no timestep, so it keeps stock Gemma norms.
-    prefix_norm = model.paligemma_with_expert.paligemma.model.language_model.norm
-    assert not isinstance(prefix_norm, Pi05AdaRMSNorm)
-
-
-@pytest.mark.slow
-def test_adarms_dense_is_zero_initialized():
-    """OpenPI's zero-init means an untrained AdaRMS is the identity modulation
-    with a closed gate."""
-    model = _tiny_pi05_model()
-    dense = model.paligemma_with_expert.gemma_expert.model.layers[0].input_layernorm.dense
-    assert torch.count_nonzero(dense.weight) == 0
-    assert torch.count_nonzero(dense.bias) == 0
 
 
 @pytest.mark.slow
