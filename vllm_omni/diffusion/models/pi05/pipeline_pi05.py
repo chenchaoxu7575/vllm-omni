@@ -31,7 +31,7 @@ from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.models.pi05.config import Pi05Config
+from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
 from vllm_omni.diffusion.models.pi05.processor_pi05 import (
     Pi05RelativeActions,
@@ -44,6 +44,25 @@ logger = init_logger(__name__)
 
 # π0.5 pins the PaliGemma tokenizer (LeRobot hardcodes it too).
 DEFAULT_PI05_TOKENIZER = "google/paligemma-3b-pt-224"
+
+# Both are first-class serving dtypes, but they are not equivalent:
+#
+# * ``float32`` is what ``lerobot/pi05_base`` stores and what the LeRobot parity
+#   oracle runs in. It is the dtype the correctness evidence covers.
+# * ``bfloat16`` halves resident weights and cuts latency substantially. Its
+#   action chunks deviate from float32 systematically — the deviation is not
+#   run-to-run noise, and it compounds across the denoising ODE. See
+#   ``recipes/lerobot/Pi05.md`` for measured numbers before deploying it.
+#
+# float16 is excluded deliberately rather than by omission: its 10-bit mantissa
+# is narrower than bfloat16's dynamic range at these activation magnitudes, and
+# nothing here has been validated against it.
+SUPPORTED_DTYPES = (torch.float32, torch.bfloat16)
+
+# The two lists guard different entry points (checkpoint-declared vs the dtype
+# actually cast to), so drift between them would silently reopen the gap this
+# pairing exists to close.
+assert {str(dtype).split(".")[-1] for dtype in SUPPORTED_DTYPES} == set(SUPPORTED_DTYPE_NAMES)
 
 
 def _pi05_post_process(x):
@@ -161,13 +180,20 @@ class Pi05Pipeline(nn.Module):
 
     @staticmethod
     def _resolve_dtype(od_config: OmniDiffusionConfig) -> torch.dtype:
+        """Resolve the dtype the weights are actually cast to.
+
+        This is the load-bearing check, not ``Pi05Config.dtype``: the cast in
+        :meth:`_initialize_model` reads the *top-level* ``OmniDiffusionConfig``
+        field, so a guard on the model config alone would let an unsupported
+        dtype through. See :data:`SUPPORTED_DTYPES` for why float16 is excluded.
+        """
         dt = od_config.dtype
-        if isinstance(dt, torch.dtype):
-            return dt
-        name = str(dt).split(".")[-1]
-        resolved = getattr(torch, name, None)
-        if not isinstance(resolved, torch.dtype):
-            raise ValueError(f"Unsupported π0.5 dtype: {dt!r}.")
+        resolved = dt if isinstance(dt, torch.dtype) else getattr(torch, str(dt).split(".")[-1], None)
+        if resolved not in SUPPORTED_DTYPES:
+            raise ValueError(
+                f"Unsupported π0.5 dtype: {dt!r}. Supported: "
+                f"{', '.join(sorted(str(d).split('.')[-1] for d in SUPPORTED_DTYPES))}."
+            )
         return resolved
 
     @staticmethod

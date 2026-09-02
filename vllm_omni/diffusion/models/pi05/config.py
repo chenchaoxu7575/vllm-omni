@@ -40,6 +40,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # LeRobot / OpenPI observation key conventions.
+# Serving dtypes, by name. Kept in sync with ``Pi05Pipeline.SUPPORTED_DTYPES``,
+# which guards the path that performs the actual cast. Defined here rather than
+# imported to keep config.py free of a pipeline import cycle.
+SUPPORTED_DTYPE_NAMES = frozenset({"float32", "bfloat16"})
+
 ACTION = "action"
 OBS_STR = "observation"
 OBS_STATE = OBS_STR + ".state"
@@ -236,8 +241,12 @@ class Pi05Config:
             raise ValueError(f"state_num_bins must be >= 2, got {self.state_num_bins}.")
         if self.min_period <= 0 or self.max_period <= self.min_period:
             raise ValueError(f"Expected 0 < min_period < max_period, got {self.min_period!r} and {self.max_period!r}.")
-        if self.dtype not in {"float32", "bfloat16"}:
-            raise ValueError(f"dtype must be 'float32' or 'bfloat16', got {self.dtype!r}.")
+        # Mirrors Pi05Pipeline.SUPPORTED_DTYPES. Note this field records what the
+        # *checkpoint* declares; the dtype the weights are actually cast to comes
+        # from the top-level OmniDiffusionConfig and is validated there, which is
+        # the check that decides what runs.
+        if self.dtype not in SUPPORTED_DTYPE_NAMES:
+            raise ValueError(f"dtype must be one of {sorted(SUPPORTED_DTYPE_NAMES)}, got {self.dtype!r}.")
 
         # Derive the camera order from input_features if not given explicitly.
         if self.image_feature_keys is None and self.input_features:

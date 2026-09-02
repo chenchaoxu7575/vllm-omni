@@ -19,6 +19,11 @@
 pipeline: pi05
 async_chunk: false
 distributed_executor_backend: mp
+# float32 or bfloat16. float32 is the default because it is what the checkpoint
+# stores and what the LeRobot parity oracle verifies. bfloat16 halves resident
+# weights and is up to ~2x faster, at a systematic numerical cost that compounds
+# across the denoising steps — see "Choosing a dtype" in recipes/lerobot/Pi05.md
+# before switching. float16 is rejected at startup.
 dtype: float32
 
 stages:
