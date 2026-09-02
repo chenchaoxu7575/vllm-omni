@@ -290,10 +290,26 @@ def test_pipeline_rejects_missing_model_weights_before_initialization(tmp_path):
         pipeline._initialize_model()
 
 
-def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
-    from types import SimpleNamespace
+class _WideActionModel:
+    """Stands in for the 3.6B model, which is the one collaborator here that is
+    genuinely expensive to build. It returns the padded ``max_action_dim`` width
+    the real model emits, so the assertion is about the pipeline's cropping."""
 
+    def __init__(self, chunk_size: int, max_action_dim: int):
+        self._shape = (1, chunk_size, max_action_dim)
+
+    def sample_actions(self, **kwargs):
+        del kwargs
+        return torch.ones(self._shape)
+
+    def _unnormalize_actions(self, actions):
+        return actions
+
+
+def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
     from vllm_omni.diffusion.models.pi05 import pipeline_pi05
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     config = Pi05Config.from_model_config(
         dict(_LEROBOT_CFG, output_features={"action": {"type": "ACTION", "shape": [7]}})
@@ -302,21 +318,21 @@ def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
     pipeline.config = config
     pipeline.tokenizer = object()
     pipeline._device = torch.device("cpu")
-    pipeline.relative_actions = SimpleNamespace(enabled=False)
-    pipeline.model = SimpleNamespace(
-        sample_actions=lambda **kwargs: torch.ones(1, config.chunk_size, config.max_action_dim),
-        _unnormalize_actions=lambda actions: actions,
+    pipeline.relative_actions = Pi05RelativeActions(
+        enabled=False, exclude_joints=[], action_names=None, max_action_dim=config.max_action_dim
     )
+    pipeline.model = _WideActionModel(config.chunk_size, config.max_action_dim)
     monkeypatch.setattr(
         pipeline_pi05,
         "build_model_inputs",
         lambda *args: ([torch.empty(0)], [torch.empty(0)], torch.empty(0), torch.empty(0)),
     )
-    request = SimpleNamespace(
-        sampling_params=SimpleNamespace(
-            num_inference_steps=2,
-            extra_args={"robot_obs": {"state": np.zeros(config.max_state_dim)}},
-        )
+    request = OmniDiffusionRequest(
+        prompt="",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"robot_obs": {"state": np.zeros(config.max_state_dim)}, "num_inference_steps": 2},
+        ),
+        request_id="crop-test",
     )
 
     result = pipeline.forward(request)
