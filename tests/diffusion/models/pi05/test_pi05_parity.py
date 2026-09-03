@@ -288,7 +288,7 @@ def test_pi05_prompt_parity():
     prompt = build_pi05_prompt(
         task=raw_batch["task"][0],
         state=raw_batch["observation.state"][0],
-        max_state_dim=STATE_DIM,
+        state_dim=STATE_DIM,
         state_norm_stats={"q01": stats["q01"], "q99": stats["q99"]},
         state_num_bins=NUM_STATE_BINS,
     )
@@ -297,6 +297,38 @@ def test_pi05_prompt_parity():
 
     assert len(ids) == MAX_TOKEN_LEN
     assert torch.equal(torch.tensor(ids), lerobot_tokens.cpu()), "π0.5 prompt tokens diverge from LeRobot"
+
+
+@pytest.mark.skipif(not _HAS_LEROBOT, reason="lerobot not installed (run in a lerobot venv).")
+@pytest.mark.parametrize("state_dim", [7, STATE_DIM])
+def test_pi05_prompt_parity_across_state_widths(state_dim):
+    """``pi05_base`` declares a 32-dim state, which is exactly ``max_state_dim``,
+    so the full-policy parity above cannot tell padding apart from the real
+    width. This drives LeRobot's tokenizer step directly, at both widths.
+    """
+    from lerobot.lerobot_types import TransitionKey
+    from lerobot.policies.pi05.processor_pi05 import Pi05PrepareStateTokenizerProcessorStep
+    from lerobot.utils.constants import OBS_STATE
+
+    from vllm_omni.diffusion.models.pi05.processor_pi05 import build_pi05_prompt
+
+    g = torch.Generator().manual_seed(state_dim)
+    state = torch.randn(state_dim, generator=g, dtype=torch.float32)
+    task = "pick up the red block"
+
+    step = Pi05PrepareStateTokenizerProcessorStep(max_state_dim=STATE_DIM)
+    transition = step(
+        {
+            TransitionKey.OBSERVATION: {OBS_STATE: state.unsqueeze(0)},
+            TransitionKey.COMPLEMENTARY_DATA: {"task": [task]},
+        }
+    )
+    lerobot_prompt = transition[TransitionKey.COMPLEMENTARY_DATA]["task"][0]
+
+    prompt = build_pi05_prompt(task=task, state=state, state_dim=state_dim, state_norm_stats=None)
+
+    assert prompt == lerobot_prompt
+    assert len(prompt.split("State: ")[1].split(";")[0].split()) == state_dim
 
 
 @pytest.mark.skipif(not _HAS_LEROBOT, reason="lerobot not installed (run in a lerobot venv).")

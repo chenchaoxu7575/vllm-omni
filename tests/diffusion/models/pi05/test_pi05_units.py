@@ -134,6 +134,28 @@ def test_config_rejects_action_schema_wider_than_model():
         Pi05Config.from_model_config(dict(_LEROBOT_CFG, output_features={"action": {"type": "ACTION", "shape": [33]}}))
 
 
+def test_config_derives_real_state_dim_from_input_features():
+    """The state width decides how many values are serialized into the prompt,
+    so a 7-joint checkpoint must not be served a 32-value state prompt."""
+    features = dict(_LEROBOT_CFG["input_features"], **{"observation.state": {"type": "STATE", "shape": [7]}})
+    config = Pi05Config.from_model_config(dict(_LEROBOT_CFG, input_features=features))
+    assert config.state_dim == 7
+    assert config.max_state_dim == 32
+
+
+def test_config_state_dim_falls_back_to_max_state_dim():
+    """LeRobot's ``validate_features`` fills in a ``max_state_dim``-wide state
+    feature when the checkpoint declares none; match that."""
+    features = {k: v for k, v in _LEROBOT_CFG["input_features"].items() if k != "observation.state"}
+    assert Pi05Config.from_model_config(dict(_LEROBOT_CFG, input_features=features)).state_dim == 32
+
+
+def test_config_rejects_state_schema_wider_than_model():
+    features = dict(_LEROBOT_CFG["input_features"], **{"observation.state": {"type": "STATE", "shape": [33]}})
+    with pytest.raises(ValueError, match="exceeds max_state_dim"):
+        Pi05Config.from_model_config(dict(_LEROBOT_CFG, input_features=features))
+
+
 def test_config_rejects_inconsistent_openpi_metadata():
     with pytest.raises(ValueError, match="policy_server_config.action_dim"):
         Pi05Config.from_model_config(
@@ -368,8 +390,8 @@ def test_sidecar_quantile_stats_reach_the_prompt(tmp_path):
     config = Pi05Config.from_pretrained(path)
     raw = np.array([1.0, -1.0], dtype=np.float32)
 
-    with_stats = discretize_state(normalize_state(raw, max_state_dim=2, state_norm_stats=config.state_norm_stats))
-    without = discretize_state(normalize_state(raw, max_state_dim=2, state_norm_stats=None))
+    with_stats = discretize_state(normalize_state(raw, state_dim=2, state_norm_stats=config.state_norm_stats))
+    without = discretize_state(normalize_state(raw, state_dim=2, state_norm_stats=None))
 
     # q01=-1/q99=1 maps [-1, 1] onto itself, so this is identical to the
     # pass-through path: the top saturates at 255 and -1.0 sits exactly on the
@@ -385,7 +407,7 @@ def test_sidecar_quantile_stats_reach_the_prompt(tmp_path):
             },
         )
     )
-    moved = discretize_state(normalize_state(raw, max_state_dim=2, state_norm_stats=shifted.state_norm_stats))
+    moved = discretize_state(normalize_state(raw, state_dim=2, state_norm_stats=shifted.state_norm_stats))
     assert moved.tolist() != without.tolist(), "different quantiles must move the prompt bins"
 
 
@@ -406,6 +428,20 @@ def test_config_rejects_unsupported_capability(key, value):
     visible in the weights. Serving such a checkpoint must fail loudly."""
     with pytest.raises(UnsupportedCheckpointCapabilityError, match=key):
         Pi05Config.from_model_config(dict(_LEROBOT_CFG, **{key: value}))
+
+
+def test_config_rejects_empty_rtc_config():
+    """``RTCConfig`` defaults ``enabled=True``, so ``rtc_config={}`` selects RTC
+    with LeRobot's defaults rather than turning it off."""
+    with pytest.raises(UnsupportedCheckpointCapabilityError, match="rtc_config"):
+        Pi05Config.from_model_config(dict(_LEROBOT_CFG, rtc_config={}))
+
+
+@pytest.mark.parametrize("key,value", [("rtc_config", None), ("n_obs_steps", 1), ("empty_cameras", 0)])
+def test_config_accepts_capability_at_its_off_value(key, value):
+    """The off value differs per capability: ``None`` for a config mapping, 1
+    for an observation count, 0 for a camera count."""
+    assert Pi05Config.from_model_config(dict(_LEROBOT_CFG, **{key: value})).tokenizer_max_length == 200
 
 
 def test_config_accepts_rtc_training_max_delay():
@@ -534,14 +570,14 @@ def test_normalize_state_supports_every_mode(stats):
     """π0.5 defaults STATE/ACTION to QUANTILES where π0 uses MEAN_STD, so the
     ``q01``/``q99`` schema must be recognized. An unrecognized entry would fall
     back to identity and wrongly bin every state dimension without raising."""
-    out = normalize_state([5.0] * 32, max_state_dim=32, state_norm_stats=stats)
+    out = normalize_state([5.0] * 32, state_dim=32, state_norm_stats=stats)
     assert np.allclose(out, 0.0, atol=1e-6)
 
 
 def test_normalize_state_without_stats_passes_through():
     """LeRobot's NormalizeProcessor returns the tensor unchanged when stats are
     missing, so a client that normalizes its own state must not be re-scaled."""
-    out = normalize_state([5.0, -5.0] + [0.0] * 30, max_state_dim=32, state_norm_stats=None)
+    out = normalize_state([5.0, -5.0] + [0.0] * 30, state_dim=32, state_norm_stats=None)
     assert out[0] == 5.0 and out[1] == -5.0
 
 
@@ -554,7 +590,7 @@ def test_normalize_state_does_not_clip_out_of_range():
     ``2.0 * (x - q01) / (q99 - q01) - 1.0`` with no clip.
     """
     stats = {"q01": [0.0] * 32, "q99": [10.0] * 32}
-    out = normalize_state([-10.0, 20.0] + [5.0] * 30, max_state_dim=32, state_norm_stats=stats)
+    out = normalize_state([-10.0, 20.0] + [5.0] * 30, state_dim=32, state_norm_stats=stats)
     assert out[0] == pytest.approx(-3.0)  # would be -1.0 if clipped
     assert out[1] == pytest.approx(3.0)  # would be 1.0 if clipped
     # and the under-range dim must reach the -1 bin end to end
@@ -563,7 +599,7 @@ def test_normalize_state_does_not_clip_out_of_range():
 
 def test_normalize_state_rejects_unknown_mode():
     with pytest.raises(ValueError, match="Unsupported"):
-        normalize_state([0.0] * 32, max_state_dim=32, state_norm_stats={"mode": "bogus"})
+        normalize_state([0.0] * 32, state_dim=32, state_norm_stats={"mode": "bogus"})
 
 
 def test_normalization_must_precede_discretization():
@@ -575,24 +611,33 @@ def test_normalization_must_precede_discretization():
     """
     stats = {"q01": [0.0] * 32, "q99": [10.0] * 32}
     raw = [5.0] * 32
-    correct = discretize_state(normalize_state(raw, max_state_dim=32, state_norm_stats=stats))
+    correct = discretize_state(normalize_state(raw, state_dim=32, state_norm_stats=stats))
     skipped = discretize_state(np.asarray(raw, dtype=np.float32))
     assert correct.tolist() != skipped.tolist()
     assert correct[0] == 128, "mid-range state should land mid-range"
     assert skipped[0] == 255, "unnormalized state saturates the top bin"
 
 
-def test_state_is_padded_to_max_state_dim():
-    prompt = build_pi05_prompt(task="x", state=[0.0, 0.0], max_state_dim=32, state_norm_stats=None)
+def test_prompt_serializes_the_declared_state_width():
+    """LeRobot's tokenizer step discretizes the state at its real width and
+    never pads to ``max_state_dim``."""
+    prompt = build_pi05_prompt(task="x", state=[0.0] * 7, state_dim=7, state_norm_stats=None)
     bins = prompt.split("State: ")[1].split(";")[0].split()
-    assert len(bins) == 32
+    assert len(bins) == 7
+
+
+def test_prompt_rejects_a_state_of_the_wrong_width():
+    """Padding or truncating here would change the prompt tokens instead of
+    reporting a misconfigured client."""
+    with pytest.raises(ValueError, match="dimension"):
+        build_pi05_prompt(task="x", state=[0.0, 0.0], state_dim=32, state_norm_stats=None)
 
 
 def test_prompt_template_matches_lerobot():
     prompt = build_pi05_prompt(
         task="  pick_up the red\nblock ",
         state=[0.0] * 4,
-        max_state_dim=4,
+        state_dim=4,
         state_norm_stats=None,
     )
     assert prompt.startswith("Task: pick up the red block, State: ")

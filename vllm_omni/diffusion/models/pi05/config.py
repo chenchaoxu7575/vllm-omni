@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
@@ -102,6 +102,22 @@ def resolve_excluded_action_indices(
     return sorted(set(indices))
 
 
+def _declared_width(feature: Mapping[str, Any], label: str, width_name: str, cap: int) -> int:
+    """Read the single-axis width off a LeRobot ``PolicyFeature`` entry."""
+    shape = feature.get("shape")
+    if (
+        not isinstance(shape, (list, tuple))
+        or len(shape) != 1
+        or isinstance(shape[0], bool)
+        or not isinstance(shape[0], int)
+        or shape[0] < 1
+    ):
+        raise ValueError(f"{label}.shape must be [{width_name}], got {shape!r}.")
+    if shape[0] > cap:
+        raise ValueError(f"Checkpoint {width_name}={shape[0]} exceeds max_{width_name}={cap}.")
+    return int(shape[0])
+
+
 @dataclass
 class Pi05Config:
     """π0.5 VLA config (dataclass, not an HF ``PretrainedConfig``)."""
@@ -162,8 +178,9 @@ class Pi05Config:
     # Optional map from raw OpenPI obs keys → ``image_feature_keys`` entries.
     image_key_map: dict[str, str] = field(default_factory=dict)
 
-    # Checkpoint feature schemas. The input schema determines camera order; the
-    # output schema determines the unpadded action width returned on the wire.
+    # Checkpoint feature schemas. The input schema determines camera order and
+    # the state width serialized into the prompt; the output schema determines
+    # the unpadded action width returned on the wire.
     input_features: dict[str, Any] = field(default_factory=dict)
     output_features: dict[str, Any] = field(default_factory=dict)
     # OpenPI handshake metadata from the deploy config. Construction validates
@@ -173,6 +190,9 @@ class Pi05Config:
     # Derived from output_features[ACTION].shape; never accepted as a second
     # source of truth in config.json.
     action_dim: int = field(init=False)
+    # Derived from input_features[OBS_STATE].shape — the number of values the
+    # prompt serializes, not a padding target. See processor_pi05.as_state_vector.
+    state_dim: int = field(init=False)
 
     def __post_init__(self) -> None:
         # Coerce list → tuple (JSON has no tuples). Squareness is a real
@@ -203,6 +223,7 @@ class Pi05Config:
             self.state_norm_stats = self.norm_stats.get("state")
 
         self._derive_action_dim()
+        self._derive_state_dim()
         self._validate_policy_server_config()
         self._validate_relative_actions()
 
@@ -228,18 +249,29 @@ class Pi05Config:
         feature_type = str(feature.get("type", "")).upper()
         if feature_type != "ACTION":
             raise ValueError(f"output_features['action'].type must be 'ACTION', got {feature.get('type')!r}.")
-        shape = feature.get("shape")
-        if (
-            not isinstance(shape, (list, tuple))
-            or len(shape) != 1
-            or isinstance(shape[0], bool)
-            or not isinstance(shape[0], int)
-            or shape[0] < 1
-        ):
-            raise ValueError(f"output_features['action'].shape must be [action_dim], got {shape!r}.")
-        if shape[0] > self.max_action_dim:
-            raise ValueError(f"Checkpoint action_dim={shape[0]} exceeds max_action_dim={self.max_action_dim}.")
-        self.action_dim = int(shape[0])
+        self.action_dim = _declared_width(feature, "output_features['action']", "action_dim", self.max_action_dim)
+
+    def _derive_state_dim(self) -> None:
+        """Resolve the real state width from the checkpoint input schema.
+
+        A checkpoint that declares no state feature keeps ``max_state_dim``,
+        which is what LeRobot's ``validate_features`` fills in for that case.
+        """
+        self.state_dim = self.max_state_dim
+        if not self.input_features:
+            return
+        if not isinstance(self.input_features, Mapping):
+            raise ValueError(f"input_features must be a mapping, got {type(self.input_features).__name__}.")
+
+        feature = self.input_features.get(OBS_STATE)
+        if feature is None:
+            return
+        if not isinstance(feature, Mapping):
+            raise ValueError(f"input_features[{OBS_STATE!r}] must be a mapping, got {type(feature).__name__}.")
+        feature_type = str(feature.get("type", "")).upper()
+        if feature_type != "STATE":
+            raise ValueError(f"input_features[{OBS_STATE!r}].type must be 'STATE', got {feature.get('type')!r}.")
+        self.state_dim = _declared_width(feature, f"input_features[{OBS_STATE!r}]", "state_dim", self.max_state_dim)
 
     def _validate_policy_server_config(self) -> None:
         """Keep OpenPI handshake metadata aligned with the model contract."""
@@ -321,11 +353,7 @@ class Pi05Config:
 
     @classmethod
     def from_model_config(cls, model_config: dict[str, Any] | None) -> Pi05Config:
-        """Build from a config dict (LeRobot ``config.json`` or deploy yaml).
-
-        Only an explicit LeRobot training/metadata allowlist may be ignored.
-        Unknown keys and enabled unsupported capabilities fail closed.
-        """
+        """Build from a config dict (LeRobot ``config.json`` or deploy yaml)."""
         if not model_config:
             return cls()
 
@@ -447,20 +475,31 @@ def load_lerobot_norm_stats(checkpoint_dir: str | Path) -> dict[str, dict[str, A
 # ----------------------------------------------------------------------
 # Checkpoint-boundary rule
 # ----------------------------------------------------------------------
-# Each entry: config key → (predicate on the raw value, human explanation).
-# A key only trips when its value is actually *enabled*; a checkpoint that
-# carries the field at its default is servable.
-# Capability → why we cannot serve it. Each one changes what a *correct* action
-# chunk looks like, and none is visible in the weights, so a checkpoint that
-# enables it is refused rather than served plausibly wrong. See
-# recipes/lerobot/Pi05.md for the longer explanations.
-_UNSUPPORTED: dict[str, str] = {
-    "use_peft": "adapter-aware loading; this loader takes a merged checkpoint only",
-    "empty_cameras": "mutates the input schema; declare camera features explicitly instead",
-    "use_visual_memory": "MEM needs a per-session observation history, which this path does not keep",
-    "use_proprioceptive_memory": "MEM sends the state as a projected token, not the discretized prompt built here",
-    "rtc_config": "RTC needs prefix guidance in the denoising loop and per-request chunk carry-over",
-    "n_obs_steps": "an observation history; this path is first-order Markov",
+# Each entry: config key → (is this value *enabled*?, why we cannot serve it).
+# Every capability here changes what a *correct* action chunk looks like, and
+# none is visible in the weights, so a checkpoint that enables one is refused
+# rather than served plausibly wrong. See recipes/lerobot/Pi05.md for the
+# longer explanations.
+#
+# The predicate is per key because these are not all flags: ``n_obs_steps`` is
+# a count whose supported value is 1, and an empty ``rtc_config`` still selects
+# RTC — LeRobot's ``RTCConfig`` defaults ``enabled=True``.
+_UNSUPPORTED: dict[str, tuple[Callable[[Any], bool], str]] = {
+    "use_peft": (bool, "adapter-aware loading; this loader takes a merged checkpoint only"),
+    "empty_cameras": (bool, "mutates the input schema; declare camera features explicitly instead"),
+    "use_visual_memory": (bool, "MEM needs a per-session observation history, which this path does not keep"),
+    "use_proprioceptive_memory": (
+        bool,
+        "MEM sends the state as a projected token, not the discretized prompt built here",
+    ),
+    "rtc_config": (
+        lambda value: value is not None,
+        "RTC needs prefix guidance in the denoising loop and per-request chunk carry-over",
+    ),
+    "n_obs_steps": (
+        lambda value: bool(value) and value > 1,
+        "an observation history; this path is first-order Markov",
+    ),
 }
 
 
@@ -472,9 +511,8 @@ def _reject_unsupported_capabilities(raw: dict[str, Any]) -> None:
     """
     problems = [
         f"  - {key}={raw[key]!r}: {why}"
-        for key, why in _UNSUPPORTED.items()
-        # n_obs_steps is a count, not a flag: 1 is the supported value.
-        if raw.get(key) and (key != "n_obs_steps" or raw[key] > 1)
+        for key, (is_enabled, why) in _UNSUPPORTED.items()
+        if key in raw and is_enabled(raw[key])
     ]
     if problems:
         raise UnsupportedCheckpointCapabilityError(

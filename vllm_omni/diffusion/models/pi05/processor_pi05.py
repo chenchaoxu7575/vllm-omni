@@ -150,26 +150,48 @@ class Pi05ImageProcessor:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# State: pad → normalize → discretize → prompt  (π0.5's defining path)
+# State: normalize → discretize → prompt  (π0.5's defining path)
 # ──────────────────────────────────────────────────────────────────────
-def pad_or_truncate_state(raw_state: Any, max_state_dim: int) -> np.ndarray:
-    """Zero-pad / truncate the raw state to ``(max_state_dim,)`` float32."""
+def pad_or_truncate_state(raw_state: Any, width: int) -> np.ndarray:
+    """Zero-pad / truncate a vector to ``(width,)`` float32."""
     if raw_state is None:
-        return np.zeros((max_state_dim,), dtype=np.float32)
+        return np.zeros((width,), dtype=np.float32)
     if isinstance(raw_state, torch.Tensor):
         raw_state = raw_state.detach().cpu().numpy()
     state = np.asarray(raw_state, dtype=np.float32).reshape(-1)
-    if state.shape[0] < max_state_dim:
-        state = np.pad(state, (0, max_state_dim - state.shape[0]))
-    elif state.shape[0] > max_state_dim:
-        state = state[:max_state_dim]
+    if state.shape[0] < width:
+        state = np.pad(state, (0, width - state.shape[0]))
+    elif state.shape[0] > width:
+        state = state[:width]
     return state.astype(np.float32)
 
 
-def _stat_vector(value: Any, max_state_dim: int, fill: float) -> np.ndarray:
+def as_state_vector(raw_state: Any, state_dim: int) -> np.ndarray:
+    """Coerce a request's raw state to ``(state_dim,)`` float32, or raise.
+
+    LeRobot's ``Pi05PrepareStateTokenizerProcessorStep`` discretizes whatever
+    width it is handed and never pads to ``max_state_dim``, so zero-filling a
+    7-dim state up to 32 would append 25 state tokens the checkpoint never saw
+    in training.
+    """
+    if raw_state is None:
+        raise ValueError("π0.5 requires a state; there is no default to fall back on.")
+    if isinstance(raw_state, torch.Tensor):
+        raw_state = raw_state.detach().cpu().numpy()
+    state = np.asarray(raw_state, dtype=np.float32).reshape(-1)
+    if state.shape[0] != state_dim:
+        raise ValueError(
+            f"π0.5 state has {state.shape[0]} dimension(s), but the checkpoint declares "
+            f"{state_dim}. The state is serialized into the prompt at its real width, so "
+            "padding or truncating it would change the tokens the model sees."
+        )
+    return state
+
+
+def _stat_vector(value: Any, state_dim: int, fill: float) -> np.ndarray:
     if value is None:
-        return np.full((max_state_dim,), fill, dtype=np.float32)
-    return pad_or_truncate_state(value, max_state_dim)
+        return np.full((state_dim,), fill, dtype=np.float32)
+    return pad_or_truncate_state(value, state_dim)
 
 
 def _infer_norm_mode(stats: dict[str, Any]) -> str | None:
@@ -196,7 +218,7 @@ def _infer_norm_mode(stats: dict[str, Any]) -> str | None:
 def normalize_state(
     raw_state: Any,
     *,
-    max_state_dim: int,
+    state_dim: int,
     state_norm_stats: dict[str, Any] | None,
 ) -> np.ndarray:
     """Normalize the state to the ``[-1, 1]`` scale ready for discretization.
@@ -213,7 +235,7 @@ def normalize_state(
     With no stats the state passes through untouched: a client that already
     normalizes its own state is a supported deployment mode.
     """
-    state = pad_or_truncate_state(raw_state, max_state_dim)
+    state = as_state_vector(raw_state, state_dim)
     if not state_norm_stats:
         return state
 
@@ -221,22 +243,22 @@ def normalize_state(
     mode = _infer_norm_mode(stats)
 
     if mode == "mean_std":
-        mean = _stat_vector(stats.get("mean"), max_state_dim, 0.0)
-        std = _stat_vector(stats.get("std"), max_state_dim, 1.0)
+        mean = _stat_vector(stats.get("mean"), state_dim, 0.0)
+        std = _stat_vector(stats.get("std"), state_dim, 1.0)
         std = np.where(np.abs(std) < 1e-6, 1.0, std)
         return (state - mean) / std
 
     if mode == "min_max":
-        vmin = _stat_vector(stats.get("min"), max_state_dim, -1.0)
-        vmax = _stat_vector(stats.get("max"), max_state_dim, 1.0)
+        vmin = _stat_vector(stats.get("min"), state_dim, -1.0)
+        vmax = _stat_vector(stats.get("max"), state_dim, 1.0)
         denom = np.where(np.abs(vmax - vmin) < 1e-6, 1.0, vmax - vmin)
         return 2.0 * (state - vmin) / denom - 1.0
 
     if mode == "quantile":
         low_key = "q01" if "q01" in stats else "low"
         high_key = "q99" if "q99" in stats else "high"
-        low = _stat_vector(stats.get(low_key), max_state_dim, -1.0)
-        high = _stat_vector(stats.get(high_key), max_state_dim, 1.0)
+        low = _stat_vector(stats.get(low_key), state_dim, -1.0)
+        high = _stat_vector(stats.get(high_key), state_dim, 1.0)
         denom = np.where(np.abs(high - low) < 1e-6, 1.0, high - low)
         return 2.0 * (state - low) / denom - 1.0
 
@@ -270,19 +292,19 @@ def build_pi05_prompt(
     *,
     task: str,
     state: Any,
-    max_state_dim: int,
+    state_dim: int,
     state_norm_stats: dict[str, Any] | None,
     state_num_bins: int = PI05_NUM_BINS,
 ) -> str:
     """Build the π0.5 prompt: instruction + serialized discretized state.
 
     Matches LeRobot's ``Pi05PrepareStateTokenizerProcessorStep``, including the
-    task cleanup (``strip``, ``_`` → space, newline → space) and the exact
-    template. The template already ends in a newline, so — unlike π0 — there is
-    no separate newline-appending step.
+    task cleanup (``strip``, ``_`` → space, newline → space), the exact template
+    and the ``state_dim`` state values it serializes. The template already ends
+    in a newline, so — unlike π0 — there is no separate newline-appending step.
     """
     cleaned_task = (task or "").strip().replace("_", " ").replace("\n", " ")
-    normed = normalize_state(state, max_state_dim=max_state_dim, state_norm_stats=state_norm_stats)
+    normed = normalize_state(state, state_dim=state_dim, state_norm_stats=state_norm_stats)
     bins = discretize_state(normed, num_bins=state_num_bins)
     state_str = " ".join(str(int(x)) for x in bins.tolist())
     return f"Task: {cleaned_task}, State: {state_str};\nAction: "
@@ -503,7 +525,7 @@ def build_model_inputs(robot_obs: dict, config, tokenizer, device: torch.device)
     prompt = build_pi05_prompt(
         task=robot_obs.get("prompt", "") or "",
         state=state,
-        max_state_dim=config.max_state_dim,
+        state_dim=int(getattr(config, "state_dim", None) or config.max_state_dim),
         state_norm_stats=getattr(config, "state_norm_stats", None),
         state_num_bins=getattr(config, "state_num_bins", PI05_NUM_BINS),
     )
