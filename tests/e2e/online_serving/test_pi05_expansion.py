@@ -63,9 +63,6 @@ test_params = [
 
 @pytest.mark.full_model
 @pytest.mark.diffusion
-# H100 is the long-term optimization and regression target for this serving
-# path; the nightly job names this file directly rather than relying on a broad
-# diffusion marker sweep.
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_pi05_openpi_online(omni_server):

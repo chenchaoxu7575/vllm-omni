@@ -1,31 +1,22 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""π0.5 LeRobot parity: the correctness oracle for this port.
+"""π0.5 parity against LeRobot.
 
-Feeds vllm-omni's ``Pi05ForActionPrediction`` and LeRobot's ``PI05Policy`` the
-same weights, the same preprocessed inputs and the same initial noise, then
-compares the final action chunks. Flow matching is an ODE integrated with a
-fixed step count, so the output is deterministic once the noise is pinned and
-``torch.allclose`` is a valid oracle.
+Reference: **lerobot 0.6.1**, transformers 5.5.4, torch 2.11.0+cpu. The oracle
+is LeRobot's own code, so a later version changing its π0.5 implementation
+fails this without anything here regressing — diff ``policies/pi05/`` first.
 
-Beyond the π0 parity test this also compares the discretized-state prompt
-tokens directly, since π0.5's state reaches the model as language rather than a
-tensor.
+Compares final action chunks under fixed noise: float32 exactly, bfloat16
+against LeRobot's own bfloat16 layout within ``BF16_ATOL``.
 
-**The oracle is LeRobot's own code, so its version is part of the contract.**
-Verified against **lerobot 0.6.1** (transformers 5.5.4, torch 2.11.0+cpu). A
-later LeRobot may change its π0.5 implementation for its own reasons; a failure
-then means the reference moved, not that this port regressed, so diff LeRobot's
-``policies/pi05/`` across the two versions before touching ``vllm_omni``.
-
-Run in a SEPARATE ``lerobot[pi]`` venv — its dependencies conflict with
-vllm-omni's — with the vllm-omni ``pi05`` package importable::
+Needs a separate ``lerobot[pi]`` venv (its dependencies conflict with
+vllm-omni's) with the vllm-omni ``pi05`` package importable::
 
     python -m pytest tests/diffusion/models/pi05/test_pi05_parity.py -v -s
 
-Skips itself when LeRobot is absent. CPU/float32; the one override is
-``PI05_PARITY_MODEL_PATH``, a local checkpoint dir to skip the HF download.
+Skips itself when LeRobot is absent. ``PI05_PARITY_MODEL_PATH`` points at a
+local checkpoint to skip the HF download.
 """
 
 from __future__ import annotations
@@ -50,10 +41,7 @@ pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, pytest.mark.cpu]
 DEVICE = "cpu"
 DTYPE_STR = "float32"
 ATOL = 1e-4
-# Measured 2.95e-2 max on the three-view batch, reproducible to the digit. The
-# margin is for checkpoint and LeRobot version drift, not for slack: a layout or
-# dtype-bridging mistake moves the result by an order of magnitude, not by 2x.
-BF16_ATOL = 5e-2
+BF16_ATOL = 5e-2  # measured 2.95e-2, reproducible; margin is for version drift
 NUM_STEPS = 10
 BATCH_SIZE = 2
 ACTION_DIM = 32
@@ -240,24 +228,12 @@ def test_pi05_vllm_omni_vs_lerobot(num_views):
 
 @pytest.mark.skipif(not _HAS_LEROBOT, reason="lerobot not installed (run in a lerobot venv).")
 def test_pi05_bfloat16_matches_lerobot_bfloat16():
-    """bfloat16 is a supported serving dtype, so it needs its own oracle.
-
-    This is not the same question as "how far does bfloat16 drift from
-    float32" — that drift is real and documented in the recipe. What matters
-    here is that *our* bfloat16 is the same model as *LeRobot's* bfloat16, and
-    that hinges on a layout detail: LeRobot casts to bfloat16 and then puts the
-    vision tower, the projector and every norm back in float32. Casting
-    everything, which is the obvious implementation, silently compares two
-    different models.
-
-    The tolerance is looser than the float32 oracle because bfloat16 has ~8
-    mantissa bits; it is tight enough to catch a layout mismatch, which moves
-    the result far more than rounding does.
-    """
+    """Both sides in bfloat16, so this compares implementations rather than
+    measuring bfloat16's drift from float32."""
     from vllm_omni.diffusion.models.pi05.pipeline_pi05 import _keep_float32_like_lerobot
 
-    # LeRobot applies the layout inside PaliGemmaWithExpertModel.__init__, driven
-    # by config.dtype, so the policy has to be built as bfloat16 from the start.
+    # LeRobot applies the layout in PaliGemmaWithExpertModel.__init__ from
+    # config.dtype, so the policy must be built as bfloat16 rather than cast after.
     lerobot_policy, lerobot_pre, _ = _instantiate_lerobot(dtype="bfloat16")
 
     omni_model, _ = _instantiate_vllm_omni()

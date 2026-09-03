@@ -67,11 +67,6 @@ def get_pi05_post_process_func(od_config: OmniDiffusionConfig):
     return _pi05_post_process
 
 
-# LeRobot's ``to_bfloat16_for_selected_params`` casts to bfloat16 and then puts
-# these back in float32. Matching it is a correctness requirement, not a tuning
-# choice: the parity oracle runs LeRobot's mixed layout, so casting everything
-# would compare two different models. The vision tower dominates the exception
-# list, and norms are the layers where reduced precision accumulates worst.
 _LEROBOT_FLOAT32_IN_BFLOAT16 = (
     "vision_tower",
     "multi_modal_projector",

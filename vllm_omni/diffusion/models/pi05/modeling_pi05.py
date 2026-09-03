@@ -288,8 +288,6 @@ class Pi05AdaRMSNorm(nn.Module):
         if cond.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected AdaRMS cond dim {self.cond_dim}, got {cond.shape[-1]}")
 
-        # ``dense`` lives inside a norm, which LeRobot keeps in float32 under
-        # bfloat16, so the conditioning vector may arrive in the other dtype.
         modulation = self.dense(cond.to(self.dense.weight.dtype))
         if x.ndim == 3:
             # (B, 3*dim) → (B, 1, 3*dim), broadcast across the token axis: the
@@ -338,13 +336,7 @@ def _attend(query_states, key_states, value_states, attention_mask, num_kv_group
 
 
 def _match(tensor: torch.Tensor, module: nn.Module) -> torch.Tensor:
-    """Cast ``tensor`` to the dtype ``module``'s weight expects.
-
-    Under bfloat16 LeRobot keeps the vision tower, the projector and every norm
-    in float32, so a layer's input and its weight can legitimately differ. See
-    ``Pi05Pipeline._keep_float32_like_lerobot``. A no-op when the model is
-    uniformly typed.
-    """
+    """Cast ``tensor`` to the dtype ``module``'s weight expects."""
     return tensor.to(module.weight.dtype) if tensor.dtype != module.weight.dtype else tensor
 
 
