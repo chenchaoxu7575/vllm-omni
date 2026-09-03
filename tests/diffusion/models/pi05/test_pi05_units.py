@@ -107,8 +107,7 @@ _ACTION_NAMES = ["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5
 
 
 def test_config_parses_lerobot_pi05_json():
-    """``_LEROBOT_CFG`` carries the training-only keys a real checkpoint ships,
-    so this also covers the allowlist accepting them."""
+    """``_LEROBOT_CFG`` mirrors a real checkpoint, training-only keys included."""
     c = Pi05Config.from_model_config(_LEROBOT_CFG)
     assert c.tokenizer_max_length == 200
     assert c.state_num_bins == 256
@@ -123,9 +122,12 @@ def test_config_tokenizer_length_differs_from_pi0():
     assert PI05_MAX_TOKEN_LEN == 200
 
 
-def test_config_rejects_unknown_key():
-    with pytest.raises(ValueError, match="mystery_option"):
-        Pi05Config.from_model_config(dict(_LEROBOT_CFG, mystery_option=42))
+def test_config_drops_training_only_keys():
+    """A LeRobot config.json carries the whole training recipe. None of it is
+    consumed here, and none of it may leak onto the dataclass."""
+    c = Pi05Config.from_model_config(dict(_LEROBOT_CFG, mystery_option=42))
+    assert not hasattr(c, "optimizer_lr")
+    assert not hasattr(c, "mystery_option")
 
 
 def test_config_rejects_wrong_model_type():

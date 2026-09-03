@@ -39,12 +39,12 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# LeRobot / OpenPI observation key conventions.
 # Serving dtypes, by name. Kept in sync with ``Pi05Pipeline.SUPPORTED_DTYPES``,
 # which guards the path that performs the actual cast. Defined here rather than
 # imported to keep config.py free of a pipeline import cycle.
 SUPPORTED_DTYPE_NAMES = frozenset({"float32", "bfloat16"})
 
+# LeRobot / OpenPI observation key conventions.
 ACTION = "action"
 OBS_STR = "observation"
 OBS_STATE = OBS_STR + ".state"
@@ -53,39 +53,6 @@ OBS_IMAGES = OBS_STR + ".images"
 # π0.5 discretizes normalized state into this many bins before serializing it
 # into the prompt. Ref: openpi ``PaliGemmaTokenizer.tokenize()``.
 DEFAULT_STATE_NUM_BINS = 256
-
-# LeRobot fields that affect training, export, or Hub metadata but not the
-# frozen inference graph. Keep this list explicit: accepting an arbitrary key
-# would turn checkpoint typos into silent defaulting.
-_LEROBOT_TRAINING_ONLY_KEYS = {
-    "device",
-    "use_amp",
-    "push_to_hub",
-    "repo_id",
-    "private",
-    "tags",
-    "license",
-    "pretrained_path",
-    "pretrained_revision",
-    "time_sampling_beta_alpha",
-    "time_sampling_beta_beta",
-    "time_sampling_scale",
-    "time_sampling_offset",
-    "normalization_mapping",
-    "gradient_checkpointing",
-    "compile_model",
-    "compile_mode",
-    "freeze_vision_encoder",
-    "train_expert_only",
-    "optimizer_lr",
-    "optimizer_betas",
-    "optimizer_eps",
-    "optimizer_weight_decay",
-    "optimizer_grad_clip_norm",
-    "scheduler_warmup_steps",
-    "scheduler_decay_steps",
-    "scheduler_decay_lr",
-}
 
 
 class UnsupportedCheckpointCapabilityError(ValueError):
@@ -171,17 +138,13 @@ class Pi05Config:
     dtype: str = "float32"
 
     # ── Relative actions ──────────────────────────────────────────────
-    # When true, the model was trained on actions expressed relative to the
-    # current state, and ``norm_stats`` holds *relative-space* statistics.
-    # Serving such a checkpoint without the transform silently yields wrong
-    # actions — the weights look identical either way.
+    # Its ``norm_stats`` are then in relative space, so serving without the
+    # transform silently yields wrong actions; the weights look identical.
     use_relative_actions: bool = False
     # Joint names kept absolute (gripper open/close is an absolute quantity).
     relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
-    # Ordered action feature names. LeRobot populates this at training time
-    # from dataset metadata; it must therefore be present in the checkpoint's
-    # config.json for ``relative_exclude_joints`` to be resolvable at serving
-    # time (there is no dataset to fall back on).
+    # Needed to resolve ``relative_exclude_joints``; there is no dataset to
+    # fall back on at serving time.
     action_feature_names: list[str] | None = None
 
     # Per-dataset normalization stats (schema matches LeRobot's
@@ -210,56 +173,28 @@ class Pi05Config:
     action_dim: int = field(init=False)
 
     def __post_init__(self) -> None:
-        # Coerce list → tuple (JSON has no tuples) and validate squareness.
+        # Coerce list → tuple (JSON has no tuples). Squareness is a real
+        # constraint: SigLIP only takes square inputs.
         res = self.image_resolution
         if not isinstance(res, (tuple, list)) or len(res) != 2 or res[0] != res[1]:
             raise ValueError(f"π0.5 expects a square image_resolution (H == W); got {res!r}.")
         self.image_resolution = (int(res[0]), int(res[1]))
-        if self.image_resolution[0] < 1:
-            raise ValueError(f"image_resolution must be positive, got {self.image_resolution!r}.")
 
-        for name in (
-            "chunk_size",
-            "n_action_steps",
-            "max_action_dim",
-            "max_state_dim",
-            "num_inference_steps",
-            "tokenizer_max_length",
-            "max_cameras",
-        ):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise ValueError(f"{name} must be a positive integer, got {value!r}.")
         if self.n_action_steps != self.chunk_size:
             raise UnsupportedCheckpointCapabilityError(
                 "The stateless OpenPI serving path returns one complete action chunk and "
                 f"does not support n_action_steps={self.n_action_steps} with "
                 f"chunk_size={self.chunk_size}."
             )
-
-        if isinstance(self.state_num_bins, bool) or not isinstance(self.state_num_bins, int) or self.state_num_bins < 2:
-            raise ValueError(f"state_num_bins must be >= 2, got {self.state_num_bins}.")
-        if self.min_period <= 0 or self.max_period <= self.min_period:
-            raise ValueError(f"Expected 0 < min_period < max_period, got {self.min_period!r} and {self.max_period!r}.")
-        # Mirrors Pi05Pipeline.SUPPORTED_DTYPES. Note this field records what the
+        # Mirrors Pi05Pipeline.SUPPORTED_DTYPES. This field records what the
         # *checkpoint* declares; the dtype the weights are actually cast to comes
-        # from the top-level OmniDiffusionConfig and is validated there, which is
-        # the check that decides what runs.
+        # from the top-level OmniDiffusionConfig and is validated there.
         if self.dtype not in SUPPORTED_DTYPE_NAMES:
             raise ValueError(f"dtype must be one of {sorted(SUPPORTED_DTYPE_NAMES)}, got {self.dtype!r}.")
 
         # Derive the camera order from input_features if not given explicitly.
         if self.image_feature_keys is None and self.input_features:
             self.image_feature_keys = [key for key in self.input_features if key.startswith(OBS_IMAGES + ".")]
-        if self.image_feature_keys:
-            if len(set(self.image_feature_keys)) != len(self.image_feature_keys):
-                raise ValueError(f"image_feature_keys contains duplicates: {self.image_feature_keys!r}.")
-            if len(self.image_feature_keys) > self.max_cameras:
-                raise ValueError(
-                    f"Checkpoint declares {len(self.image_feature_keys)} image features but "
-                    f"max_cameras={self.max_cameras}."
-                )
-        self._validate_input_features()
 
         # ``state_norm_stats`` is just a view onto norm_stats["state"].
         if self.state_norm_stats is None and isinstance(self.norm_stats, dict):
@@ -272,57 +207,6 @@ class Pi05Config:
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
-    def _validate_input_features(self) -> None:
-        """Validate a declared LeRobot observation schema."""
-        if not self.input_features:
-            return
-        if not isinstance(self.input_features, Mapping):
-            raise ValueError(f"input_features must be a mapping, got {type(self.input_features).__name__}.")
-
-        state_feature = self.input_features.get(OBS_STATE)
-        if state_feature is not None:
-            self._validate_feature_shape(
-                name=OBS_STATE,
-                feature=state_feature,
-                expected_type="STATE",
-                expected_rank=1,
-            )
-            state_dim = int(state_feature["shape"][0])
-            if state_dim > self.max_state_dim:
-                raise ValueError(f"Checkpoint state_dim={state_dim} exceeds max_state_dim={self.max_state_dim}.")
-
-        for key in self.image_feature_keys or []:
-            feature = self.input_features.get(key)
-            if feature is None:
-                raise ValueError(f"image_feature_keys contains {key!r}, but input_features does not declare it.")
-            self._validate_feature_shape(name=key, feature=feature, expected_type="VISUAL", expected_rank=3)
-            shape = tuple(feature["shape"])
-            expected_shape = (3, *self.image_resolution)
-            if shape != expected_shape:
-                raise ValueError(f"input_features[{key!r}].shape must be {expected_shape}, got {shape}.")
-
-    @staticmethod
-    def _validate_feature_shape(
-        *,
-        name: str,
-        feature: Any,
-        expected_type: str,
-        expected_rank: int,
-    ) -> None:
-        if not isinstance(feature, Mapping):
-            raise ValueError(f"input_features[{name!r}] must be a mapping.")
-        if str(feature.get("type", "")).upper() != expected_type:
-            raise ValueError(f"input_features[{name!r}].type must be {expected_type!r}.")
-        shape = feature.get("shape")
-        if (
-            not isinstance(shape, (list, tuple))
-            or len(shape) != expected_rank
-            or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in shape)
-        ):
-            raise ValueError(
-                f"input_features[{name!r}].shape must contain {expected_rank} positive integers, got {shape!r}."
-            )
-
     def _derive_action_dim(self) -> None:
         """Resolve the real action width from the checkpoint output schema."""
         self.action_dim = self.max_action_dim
@@ -381,15 +265,6 @@ class Pi05Config:
                 f"{declared_resolution!r} does not match image_resolution={self.image_resolution!r}."
             )
 
-    def _validate_checkpoint_feature_schema(self, config_path: Path) -> None:
-        """Require the feature schema that defines checkpoint I/O semantics."""
-        if not isinstance(self.input_features, Mapping) or OBS_STATE not in self.input_features:
-            raise ValueError(f"{config_path} must declare input_features[{OBS_STATE!r}].")
-        if not self.image_feature_keys:
-            raise ValueError(f"{config_path} must declare at least one {OBS_IMAGES!r} input feature.")
-        if not isinstance(self.output_features, Mapping) or ACTION not in self.output_features:
-            raise ValueError(f"{config_path} must declare output_features[{ACTION!r}].")
-
     def _validate_relative_actions(self) -> None:
         """``relative_exclude_joints`` is only meaningful if we can resolve the
         names to action indices, which needs ``action_feature_names``.
@@ -434,7 +309,6 @@ class Pi05Config:
         with open(config_path, encoding="utf-8") as f:
             raw = json.load(f)
         config = cls.from_model_config(raw)
-        config._validate_checkpoint_feature_schema(config_path)
 
         if config.norm_stats is None:
             stats = load_lerobot_norm_stats(checkpoint_dir)
@@ -463,49 +337,34 @@ class Pi05Config:
         if "image_resolution" in raw:
             raw["image_resolution"] = tuple(raw["image_resolution"])
 
+        # A config.json carries the whole training recipe; none of it reaches
+        # inference. Capabilities we cannot serve are rejected above instead.
         allowed = {item.name for item in dataclass_fields(cls) if item.init}
-        known_capability_keys = set(_UNSUPPORTED) | {"memory_frames", "rtc_training_max_delay"}
-        unknown = sorted(set(raw) - allowed - _LEROBOT_TRAINING_ONLY_KEYS - known_capability_keys)
-        if unknown:
-            raise ValueError(
-                "Unknown π0.5 config key(s): "
-                f"{unknown}. Only explicit runtime fields and reviewed LeRobot training metadata are accepted."
-            )
-
         filtered = {key: value for key, value in raw.items() if key in allowed}
-        ignored = sorted(set(raw) & _LEROBOT_TRAINING_ONLY_KEYS)
-        if ignored:
-            logger.debug("π0.5 config: ignoring LeRobot training/metadata keys: %s", ignored)
+        dropped = sorted(set(raw) - allowed)
+        if dropped:
+            logger.debug("π0.5 config: ignoring %d non-runtime key(s): %s", len(dropped), dropped)
         return cls(**filtered)
 
 
 # ----------------------------------------------------------------------
 # LeRobot normalization-stats sidecar
 # ----------------------------------------------------------------------
-# LeRobot keeps normalization stats out of ``config.json``. It serializes the
-# processor pipeline as ``policy_preprocessor.json`` (structure only) plus one
-# safetensors file per *stateful* step, named in that step's ``state_file``
-# entry. ``NormalizerProcessorStep.state_dict`` flattens the stats to
-# ``"<feature_name>.<stat_name>"`` keys.
+# Stats live beside config.json: ``policy_preprocessor.json`` names a
+# safetensors file per stateful step, keyed ``"<feature_name>.<stat_name>"``.
 _PREPROCESSOR_JSON = "policy_preprocessor.json"
 
-# LeRobot ``NormalizationMode`` → (our mode name, the two stat tensors it uses).
-# ``IDENTITY`` maps to None: the feature is deliberately left untransformed.
-#
-# The mode has to come from ``norm_map``. A LeRobot state_dict carries *all* of
-# mean/std/min/max/q01/q99 — ``compute_stats`` emits the full set regardless of
-# norm_map — so inferring it from which keys are present would read a QUANTILES
-# checkpoint as ``mean_std`` and apply a wrong affine map.
+# The mode must come from ``norm_map``: a state_dict carries all of
+# mean/std/min/max/q01/q99 regardless, so guessing from the present keys would
+# read a QUANTILES checkpoint as mean_std and apply a wrong affine map.
 _NORM_MODE_FROM_LEROBOT: dict[str, tuple[str, str, str] | None] = {
     "IDENTITY": None,
     "MEAN_STD": ("mean_std", "mean", "std"),
     "MIN_MAX": ("min_max", "min", "max"),
     "QUANTILES": ("quantile", "q01", "q99"),
 }
-# The two features we consume, as (LeRobot FeatureType, our norm_stats key).
-# Feature renaming happens in an earlier processor step, so these names are
-# canonical by the time the normalizer runs. VISUAL is absent by design: π0.5
-# normalizes images in the image processor, not from these stats.
+# Renaming happens in an earlier processor step, so these names are canonical
+# here. VISUAL is absent by design: images are normalized in the processor.
 _NORM_STATS_FEATURES = {OBS_STATE: ("STATE", "state"), ACTION: ("ACTION", "action")}
 
 
@@ -589,39 +448,17 @@ def load_lerobot_norm_stats(checkpoint_dir: str | Path) -> dict[str, dict[str, A
 # Each entry: config key → (predicate on the raw value, human explanation).
 # A key only trips when its value is actually *enabled*; a checkpoint that
 # carries the field at its default is servable.
-_UNSUPPORTED: dict[str, tuple[Any, str]] = {
-    "use_peft": (
-        lambda v: bool(v),
-        "PEFT checkpoints require adapter-aware loading; this loader accepts only a complete merged checkpoint.",
-    ),
-    "empty_cameras": (
-        lambda v: v is not None and int(v) != 0,
-        "LeRobot's empty_cameras feature mutates the checkpoint input schema. Declare the final camera "
-        "features explicitly and use max_cameras for tail padding instead.",
-    ),
-    "use_visual_memory": (
-        lambda v: bool(v),
-        "MEM visual memory feeds historical image frames into SigLIP. It needs a "
-        "per-session observation history, which this stateless serving path does "
-        "not keep.",
-    ),
-    "use_proprioceptive_memory": (
-        lambda v: bool(v),
-        "MEM proprioceptive memory replaces the discretized state prompt tokens "
-        "with a continuous projected state token (it flips "
-        "include_state_in_prompt to False), so the prompt this implementation "
-        "builds would not match what the checkpoint was trained on.",
-    ),
-    "rtc_config": (
-        lambda v: v is not None,
-        "Real-Time Chunking requires prefix guidance inside the denoising loop "
-        "and per-request carry-over of the previous action chunk. Not implemented.",
-    ),
-    "n_obs_steps": (
-        lambda v: v is not None and int(v) > 1,
-        "n_obs_steps > 1 means the policy consumes an observation history; this "
-        "path is first-order Markov (one observation in, one action chunk out).",
-    ),
+# Capability → why we cannot serve it. Each one changes what a *correct* action
+# chunk looks like, and none is visible in the weights, so a checkpoint that
+# enables it is refused rather than served plausibly wrong. See
+# recipes/lerobot/Pi05.md for the longer explanations.
+_UNSUPPORTED: dict[str, str] = {
+    "use_peft": "adapter-aware loading; this loader takes a merged checkpoint only",
+    "empty_cameras": "mutates the input schema; declare camera features explicitly instead",
+    "use_visual_memory": "MEM needs a per-session observation history, which this path does not keep",
+    "use_proprioceptive_memory": "MEM sends the state as a projected token, not the discretized prompt built here",
+    "rtc_config": "RTC needs prefix guidance in the denoising loop and per-request chunk carry-over",
+    "n_obs_steps": "an observation history; this path is first-order Markov",
 }
 
 
@@ -631,30 +468,21 @@ def _reject_unsupported_capabilities(raw: dict[str, Any]) -> None:
     Scope note: this validates that we correctly consume *the checkpoint we were
     handed*. Choosing which checkpoint to load belongs to the caller.
     """
-    problems: list[str] = []
-    for key, (is_enabled, why) in _UNSUPPORTED.items():
-        if key not in raw:
-            continue
-        value = raw[key]
-        try:
-            tripped = is_enabled(value)
-        except (TypeError, ValueError):
-            tripped = True
-        if tripped:
-            problems.append(f"  - {key}={value!r}: {why}")
-
+    problems = [
+        f"  - {key}={raw[key]!r}: {why}"
+        for key, why in _UNSUPPORTED.items()
+        # n_obs_steps is a count, not a flag: 1 is the supported value.
+        if raw.get(key) and (key != "n_obs_steps" or raw[key] > 1)
+    ]
     if problems:
         raise UnsupportedCheckpointCapabilityError(
-            "This checkpoint declares capabilities the vllm-omni π0.5 "
-            "implementation does not support:\n"
-            + "\n".join(problems)
-            + "\nServing it anyway would produce plausible-looking but wrong actions."
+            "This checkpoint declares capabilities the vllm-omni π0.5 implementation "
+            "does not support:\n" + "\n".join(problems) + "\nServing it anyway would "
+            "produce plausible-looking but wrong actions."
         )
 
-    # `rtc_training_max_delay > 0` is deliberately NOT an error. It is a
-    # property of how the checkpoint was *trained* (it had clean action
-    # prefixes sampled during training), not a request to run RTC at
-    # inference. Such a checkpoint is still correct to serve without RTC.
+    # Not an error: it describes how the checkpoint was trained, not a request
+    # to run RTC. Such a checkpoint is still correct to serve without it.
     delay = raw.get("rtc_training_max_delay")
     if delay:
         logger.info(
