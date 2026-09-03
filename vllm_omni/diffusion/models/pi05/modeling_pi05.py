@@ -288,7 +288,9 @@ class Pi05AdaRMSNorm(nn.Module):
         if cond.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected AdaRMS cond dim {self.cond_dim}, got {cond.shape[-1]}")
 
-        modulation = self.dense(cond)
+        # ``dense`` lives inside a norm, which LeRobot keeps in float32 under
+        # bfloat16, so the conditioning vector may arrive in the other dtype.
+        modulation = self.dense(cond.to(self.dense.weight.dtype))
         if x.ndim == 3:
             # (B, 3*dim) → (B, 1, 3*dim), broadcast across the token axis: the
             # timestep is a per-sample scalar, identical for every action token.
@@ -335,6 +337,17 @@ def _attend(query_states, key_states, value_states, attention_mask, num_kv_group
     return torch.matmul(attn_weights, v)
 
 
+def _match(tensor: torch.Tensor, module: nn.Module) -> torch.Tensor:
+    """Cast ``tensor`` to the dtype ``module``'s weight expects.
+
+    Under bfloat16 LeRobot keeps the vision tower, the projector and every norm
+    in float32, so a layer's input and its weight can legitimately differ. See
+    ``Pi05Pipeline._keep_float32_like_lerobot``. A no-op when the model is
+    uniformly typed.
+    """
+    return tensor.to(module.weight.dtype) if tensor.dtype != module.weight.dtype else tensor
+
+
 def _compute_layer_prefix_only(layer_idx, hidden_states, attention_mask, position_ids, paligemma):
     """Run one PaliGemma LM layer on the prefix, returning the layer output and
     the post-RoPE ``(k, v)`` for the suffix pass.
@@ -345,7 +358,7 @@ def _compute_layer_prefix_only(layer_idx, hidden_states, attention_mask, positio
     model = paligemma.model.language_model
     layer = model.layers[layer_idx]
     residual = hidden_states
-    x = layer.input_layernorm(hidden_states)
+    x = _match(layer.input_layernorm(hidden_states), layer.self_attn.q_proj)
 
     hidden_shape = (*x.shape[:-1], -1, layer.self_attn.head_dim)
     q = layer.self_attn.q_proj(x).view(hidden_shape).transpose(1, 2)
@@ -365,9 +378,10 @@ def _compute_layer_prefix_only(layer_idx, hidden_states, attention_mask, positio
     )
     att = att.transpose(1, 2).reshape(q.shape[0], -1, q.shape[1] * layer.self_attn.head_dim)
 
-    out = layer.self_attn.o_proj(att) + residual
+    out = layer.self_attn.o_proj(_match(att, layer.self_attn.o_proj)) + residual
     after_resid = out
-    out = layer.mlp(layer.post_attention_layernorm(out)) + after_resid
+    normed = layer.post_attention_layernorm(out)
+    out = layer.mlp(_match(normed, layer.mlp.up_proj)) + after_resid
     return out, (k, v)
 
 
@@ -390,6 +404,7 @@ def _compute_layer_suffix_only(
 
     residual = hidden_states
     x, gate = layer.input_layernorm(hidden_states, adarms_cond)
+    x = _match(x, layer.self_attn.q_proj)
 
     hidden_shape = (*x.shape[:-1], -1, layer.self_attn.head_dim)
     q = layer.self_attn.q_proj(x).view(hidden_shape).transpose(1, 2)
@@ -415,11 +430,11 @@ def _compute_layer_suffix_only(
     )
     att = att.transpose(1, 2).reshape(q.shape[0], -1, q.shape[1] * layer.self_attn.head_dim)
 
-    hidden_states = _gated_residual(residual, layer.self_attn.o_proj(att), gate)
+    hidden_states = _gated_residual(residual, layer.self_attn.o_proj(_match(att, layer.self_attn.o_proj)), gate)
 
     residual = hidden_states
     x, gate = layer.post_attention_layernorm(hidden_states, adarms_cond)
-    return _gated_residual(residual, layer.mlp(x), gate)
+    return _gated_residual(residual, layer.mlp(_match(x, layer.mlp.up_proj)), gate)
 
 
 class PaliGemmaWithActionExpertPi05(nn.Module):

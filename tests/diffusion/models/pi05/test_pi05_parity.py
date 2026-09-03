@@ -1,32 +1,31 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""π0.5 LeRobot parity (in-process): the bit-for-bit correctness oracle.
+"""π0.5 LeRobot parity: the correctness oracle for this port.
 
-Verifies that vllm-omni's ``Pi05ForActionPrediction`` produces matching action
-chunks with LeRobot's ``PI05Policy`` when fed the same weights, the same
-pre-processed inputs, and the same initial noise. π0.5 is a flow-matching model
-(Euler-integrated ODE from t=1 → t=0 with a fixed ``num_steps``), so the output
-is deterministic once the noise is fixed and ``torch.allclose`` on the final
-action chunk is a valid oracle.
+Feeds vllm-omni's ``Pi05ForActionPrediction`` and LeRobot's ``PI05Policy`` the
+same weights, the same preprocessed inputs and the same initial noise, then
+compares the final action chunks. Flow matching is an ODE integrated with a
+fixed step count, so the output is deterministic once the noise is pinned and
+``torch.allclose`` is a valid oracle.
 
-Three things this must cover that the π0 parity test does not:
+Beyond the π0 parity test this also compares the discretized-state prompt
+tokens directly, since π0.5's state reaches the model as language rather than a
+tensor.
 
-1. **The discretized-state prompt.** π0.5's state reaches the model as language
-   tokens, so a prompt mismatch shows up as an action mismatch — the tokens
-   themselves are compared explicitly (``test_pi05_prompt_parity``).
-2. **AdaRMS conditioning.** The action expert's per-layer modulation is the main
-   new numerical path.
-3. **Relative actions**, both ``use_relative_actions=False`` and ``True``.
+**The oracle is LeRobot's own code, so its version is part of the contract.**
+Verified against **lerobot 0.6.1** (transformers 5.5.4, torch 2.11.0+cpu). A
+later LeRobot may change its π0.5 implementation for its own reasons; a failure
+then means the reference moved, not that this port regressed, so diff LeRobot's
+``policies/pi05/`` across the two versions before touching ``vllm_omni``.
 
-Run in a SEPARATE ``lerobot[pi]`` venv (avoids dep conflict with the vllm-omni
-env), with the vllm-omni ``pi05`` package importable::
+Run in a SEPARATE ``lerobot[pi]`` venv — its dependencies conflict with
+vllm-omni's — with the vllm-omni ``pi05`` package importable::
 
     python -m pytest tests/diffusion/models/pi05/test_pi05_parity.py -v -s
 
-Skipped automatically when LeRobot is not installed (e.g. the vllm-omni env).
-CPU/float32 with fixed defaults; the only override is ``PI05_PARITY_MODEL_PATH``
-(a local π0.5 checkpoint dir in LeRobot format, to skip the HF download).
+Skips itself when LeRobot is absent. CPU/float32; the one override is
+``PI05_PARITY_MODEL_PATH``, a local checkpoint dir to skip the HF download.
 """
 
 from __future__ import annotations
@@ -51,6 +50,10 @@ pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, pytest.mark.cpu]
 DEVICE = "cpu"
 DTYPE_STR = "float32"
 ATOL = 1e-4
+# Measured 2.95e-2 max on the three-view batch, reproducible to the digit. The
+# margin is for checkpoint and LeRobot version drift, not for slack: a layout or
+# dtype-bridging mistake moves the result by an order of magnitude, not by 2x.
+BF16_ATOL = 5e-2
 NUM_STEPS = 10
 BATCH_SIZE = 2
 ACTION_DIM = 32
@@ -122,11 +125,11 @@ def _create_dummy_batch(batch_size: int = BATCH_SIZE, num_views: int = 3, device
 
 
 # ─── Instantiation ────────────────────────────────────────────────────
-def _instantiate_lerobot(use_relative_actions: bool = False, action_feature_names=None):
+def _instantiate_lerobot(use_relative_actions: bool = False, action_feature_names=None, dtype: str = DTYPE_STR):
     from lerobot.policies.pi05 import PI05Policy
     from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
 
-    policy = PI05Policy.from_pretrained(MODEL_PATH, strict=True)
+    policy = PI05Policy.from_pretrained(MODEL_PATH, strict=True, dtype=dtype)
     policy.to(DEVICE)
     policy.config.device = DEVICE
     policy.config.use_relative_actions = use_relative_actions
@@ -232,6 +235,57 @@ def test_pi05_vllm_omni_vs_lerobot(num_views):
         _diagnose_divergence(lerobot_policy.model, omni_model, images, img_masks, lang_tokens, lang_masks, noise)
     assert torch.allclose(lerobot_actions.float(), omni_actions.float(), atol=ATOL), (
         f"actions differ beyond atol={ATOL}; max_diff={diff.max().item():.2e}"
+    )
+
+
+@pytest.mark.skipif(not _HAS_LEROBOT, reason="lerobot not installed (run in a lerobot venv).")
+def test_pi05_bfloat16_matches_lerobot_bfloat16():
+    """bfloat16 is a supported serving dtype, so it needs its own oracle.
+
+    This is not the same question as "how far does bfloat16 drift from
+    float32" — that drift is real and documented in the recipe. What matters
+    here is that *our* bfloat16 is the same model as *LeRobot's* bfloat16, and
+    that hinges on a layout detail: LeRobot casts to bfloat16 and then puts the
+    vision tower, the projector and every norm back in float32. Casting
+    everything, which is the obvious implementation, silently compares two
+    different models.
+
+    The tolerance is looser than the float32 oracle because bfloat16 has ~8
+    mantissa bits; it is tight enough to catch a layout mismatch, which moves
+    the result far more than rounding does.
+    """
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import _keep_float32_like_lerobot
+
+    # LeRobot applies the layout inside PaliGemmaWithExpertModel.__init__, driven
+    # by config.dtype, so the policy has to be built as bfloat16 from the start.
+    lerobot_policy, lerobot_pre, _ = _instantiate_lerobot(dtype="bfloat16")
+
+    omni_model, _ = _instantiate_vllm_omni()
+    omni_model.to(dtype=torch.bfloat16)
+    _keep_float32_like_lerobot(omni_model)
+
+    raw_batch = _create_dummy_batch(num_views=3)
+    processed = lerobot_pre(copy.deepcopy(raw_batch))
+    images, img_masks, lang_tokens, lang_masks = _extract_lerobot_model_inputs(lerobot_policy, processed)
+    noise = _make_fixed_noise(raw_batch["observation.state"].shape[0], DEVICE)
+
+    with torch.no_grad():
+        lerobot_actions = lerobot_policy.model.sample_actions(
+            images, img_masks, lang_tokens, lang_masks, noise=noise, num_steps=NUM_STEPS
+        )
+        omni_actions = omni_model.sample_actions(
+            images=images,
+            image_masks=img_masks,
+            lang_tokens=lang_tokens,
+            lang_masks=lang_masks,
+            noise=noise,
+            num_steps=NUM_STEPS,
+        )
+
+    diff = (lerobot_actions.float() - omni_actions.float()).abs()
+    print(f"[parity] bfloat16 |Δ| max={diff.max().item():.2e} mean={diff.mean().item():.2e}")
+    assert torch.allclose(lerobot_actions.float(), omni_actions.float(), atol=BF16_ATOL), (
+        f"bfloat16 actions differ beyond atol={BF16_ATOL}; max_diff={diff.max().item():.2e}"
     )
 
 
