@@ -279,18 +279,6 @@ class Pi05Pipeline(nn.Module):
             robot_obs, self.config, self.tokenizer, self._device
         )
 
-        noise = extra_args.get("noise")
-        if noise is not None and not isinstance(noise, torch.Tensor):
-            noise = torch.as_tensor(noise, dtype=torch.float32, device=self._device)
-        elif isinstance(noise, torch.Tensor):
-            noise = noise.to(device=self._device, dtype=torch.float32)
-        if noise is not None:
-            expected_noise_shape = (1, self.config.chunk_size, self.config.max_action_dim)
-            if tuple(noise.shape) != expected_noise_shape:
-                raise ValueError(f"noise must have shape {expected_noise_shape}, got {tuple(noise.shape)}.")
-            if not torch.isfinite(noise).all():
-                raise ValueError("noise must contain only finite values.")
-
         num_steps = getattr(req.sampling_params, "num_inference_steps", None)
         if num_steps is not None and (
             isinstance(num_steps, bool) or not isinstance(num_steps, (int, np.integer)) or int(num_steps) < 1
@@ -304,7 +292,6 @@ class Pi05Pipeline(nn.Module):
             image_masks=image_masks,
             lang_tokens=lang_tokens,
             lang_masks=lang_masks,
-            noise=noise,
             num_steps=num_steps,
         )
 
