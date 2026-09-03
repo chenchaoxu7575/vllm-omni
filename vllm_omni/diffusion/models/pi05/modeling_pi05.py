@@ -2,29 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Inference-only π0.5 VLA math kernel for vllm-omni.
 
-A self-contained inference kernel: only the math that turns a robot observation
-into an action chunk, with no serving/request glue. Deliberately shaped like
-``models/pi0/modeling_pi0.py`` so the two can later be diffed and factored into
-a shared Pi-family module (RFC step 2) on a "behaviour unchanged" review.
+Only the math that turns a robot observation into an action chunk; no serving or
+request glue. Deliberately shaped like ``models/pi0/modeling_pi0.py`` so the two
+can later be factored into a shared Pi-family module (RFC step 2) on a
+"behaviour unchanged" review.
 
 π0.5 = PaliGemma (SigLIP vision + Gemma 2B LM) prefix + Gemma 300M action expert
-suffix + flow-matching head. It differs from π0 in exactly five places:
+suffix + flow-matching head. Where π0 projects the robot state through
+``state_proj``, π0.5 discretizes it into prompt tokens — so there is no
+``state_proj`` layer, ``sample_actions`` takes no ``state`` argument, and the
+suffix is action tokens only, which drops π0's leading state-token boundary from
+the suffix attention mask and leaves ``[1] + [0] * (horizon - 1)``.
 
-===========================  ====================================  =============================================
-what                         π0                                    π0.5
-===========================  ====================================  =============================================
-timestep conditioning        ``action_time_mlp_*``, time is         ``time_mlp_*``, time drives **AdaRMS**
-                             concatenated onto the action embedding
-AdaRMS                       not used                              used in every action-expert norm
-tokenizer length             48                                    200
-state input                  continuous, via ``state_proj``        **discretized into prompt tokens**
-parameter count              higher (carries a state embedding)    lower (no state embedding)
-===========================  ====================================  =============================================
-
-Consequences of "state lives in the prompt": there is no ``state_proj`` layer,
-``sample_actions`` takes no ``state`` argument, and the suffix is action tokens
-only — so the suffix attention mask loses π0's leading state-token boundary and
-becomes ``[1] + [0] * (horizon - 1)``.
+π0.5 is nonetheless the *larger* model: the 37 AdaRMS ``dense`` projections add
+~116M parameters against the ~8K that ``state_proj`` saves. (LeRobot's README
+says otherwise; the checkpoint disagrees.)
 
 Reference implementations:
    - OpenPI: openpi/src/openpi/models_pytorch/pi0_pytorch.py, gemma_pytorch.py
@@ -148,16 +140,10 @@ def prepare_attention_masks_4d(att_2d_masks: torch.Tensor) -> torch.Tensor:
 def _build_norm_buffers(norm_stats: dict | None, key: str) -> dict[str, torch.Tensor] | None:
     """Parse a ``norm_stats[key]`` entry into CPU tensors, or ``None``.
 
-    Supports LeRobot's ``NormalizationMode`` variants:
-      - ``mean_std`` : ``forward = (x - mean) / std``, ``inverse = x * std + mean``
-      - ``min_max``  : forward maps into ``[-1, 1]``, inverse maps back.
-      - ``quantile`` : same shape as min_max but bounded by ``q01``/``q99``.
-
-    ``quantile`` matters for π0.5 specifically: LeRobot's ``PI05Config`` defaults
-    ``STATE``/``ACTION`` to ``NormalizationMode.QUANTILES`` where ``PI0Config``
-    uses ``MEAN_STD``. A π0.5 checkpoint therefore usually ships ``q01``/``q99``,
-    and treating that entry as unparsable would silently fall back to identity —
-    i.e. return actions in normalized space and look merely "badly tuned".
+    ``quantile`` is the one to get right: LeRobot defaults π0.5 to QUANTILES
+    where π0 uses MEAN_STD, so a π0.5 checkpoint usually ships ``q01``/``q99``.
+    Returning ``None`` for it would leave actions in normalized space, which
+    reads as a badly tuned policy rather than as a failure.
     """
     if not norm_stats or not isinstance(norm_stats, dict):
         return None

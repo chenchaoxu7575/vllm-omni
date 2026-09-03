@@ -45,23 +45,13 @@ logger = init_logger(__name__)
 # π0.5 pins the PaliGemma tokenizer (LeRobot hardcodes it too).
 DEFAULT_PI05_TOKENIZER = "google/paligemma-3b-pt-224"
 
-# Both are first-class serving dtypes, but they are not equivalent:
-#
-# * ``float32`` is what ``lerobot/pi05_base`` stores and what the LeRobot parity
-#   oracle runs in. It is the dtype the correctness evidence covers.
-# * ``bfloat16`` halves resident weights and cuts latency substantially. Its
-#   action chunks deviate from float32 systematically — the deviation is not
-#   run-to-run noise, and it compounds across the denoising ODE. See
-#   ``recipes/lerobot/Pi05.md`` for measured numbers before deploying it.
-#
-# float16 is excluded deliberately rather than by omission: its 10-bit mantissa
-# is narrower than bfloat16's dynamic range at these activation magnitudes, and
-# nothing here has been validated against it.
+# float16 is absent deliberately, not by oversight: nothing here has been
+# validated against it. The float32/bfloat16 trade-off is in the deploy config
+# and recipes/lerobot/Pi05.md.
 SUPPORTED_DTYPES = (torch.float32, torch.bfloat16)
 
-# The two lists guard different entry points (checkpoint-declared vs the dtype
-# actually cast to), so drift between them would silently reopen the gap this
-# pairing exists to close.
+# The two lists guard different entry points — what the checkpoint declares
+# versus the dtype actually cast to — so they must not drift apart.
 assert {str(dtype).split(".")[-1] for dtype in SUPPORTED_DTYPES} == set(SUPPORTED_DTYPE_NAMES)
 
 

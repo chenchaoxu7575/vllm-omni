@@ -3,45 +3,20 @@
 r"""Preprocessing for the π0.5 VLA model.
 
 Converts a raw robot observation (multi-camera images + language instruction +
-proprioceptive state) into the tensors that ``Pi05ForActionPrediction.sample_actions``
-consumes. Shaped like ``processor_pi0`` — a set of stateless helpers the
-diffusion pipeline calls directly (the DreamZero contract: the pipeline owns its
-preprocessing).
+proprioceptive state) into the tensors ``Pi05ForActionPrediction.sample_actions``
+consumes.
 
-**The defining π0.5 difference:** state is not projected by a ``state_proj``
-layer. It is normalized to ``[-1, 1]``, discretized into ``state_num_bins``
-bins, and serialized into the language prompt::
+**The defining π0.5 difference:** the state is not projected by a ``state_proj``
+layer. It is normalized to ``[-1, 1]``, discretized into ``state_num_bins`` bins,
+and serialized into the language prompt::
 
     "Task: <instruction>, State: <b0> <b1> ... <bN>;\nAction: "
 
 so ``sample_actions`` receives no state tensor at all.
 
-Functional spec — LeRobot ``make_pi05_pre_post_processors``. The serving input
-path applies the observation-only subset in this order:
-
-===  =========================================  ==========================================
-  #  LeRobot step                               here
-===  =========================================  ==========================================
-  1  ``rename_observations``                    ``_extract_images`` via ``image_key_map``
-  2  ``add_batch_dim``                          tensors built with a leading batch dim of 1
-  3  ``normalize``                              :func:`normalize_state`
-  4  ``Pi05PrepareStateTokenizerProcessorStep`` :func:`discretize_state` + :func:`build_pi05_prompt`
-  5  ``TokenizerProcessorStep``                 :func:`tokenize_prompt`
-  6  ``to_device``                              ``device=`` on every tensor built below
-===  =========================================  ==========================================
-
-Output side, 3 steps: ``unnormalize`` (model-side ``_unnormalize_actions``) →
-:meth:`Pi05RelativeActions.to_absolute` → ``to_cpu``.
-
-Two ordering constraints that fail *silently* if broken:
-
-* **Normalization must precede discretization.** The discretizer bins over ``[-1, 1]`` and
-  assumes the state is already normalized into that range. Reversed, every bin
-  index is wrong and nothing raises.
-* LeRobot also applies ``RelativeActionsProcessorStep`` to training batches
-  that contain actions. Online observations contain no input action, so serving
-  only applies its inverse on model output, using the raw pre-normalization
-  state explicitly.
+**Normalization must precede discretization.** The discretizer bins over
+``[-1, 1]`` and assumes the state is already in that range. Reversed, every bin
+index is wrong and nothing raises.
 
 Reference:
   - OpenPI: openpi/src/openpi/shared/image_tools.py (resize_with_pad)

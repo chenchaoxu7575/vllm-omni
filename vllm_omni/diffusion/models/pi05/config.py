@@ -138,8 +138,10 @@ class Pi05Config:
     dtype: str = "float32"
 
     # ── Relative actions ──────────────────────────────────────────────
-    # Its ``norm_stats`` are then in relative space, so serving without the
-    # transform silently yields wrong actions; the weights look identical.
+    # True when the checkpoint was trained on actions relative to the current
+    # state. Its ``norm_stats`` are then in relative space, so serving it without
+    # the transform silently yields wrong actions — the weights look identical
+    # either way.
     use_relative_actions: bool = False
     # Joint names kept absolute (gripper open/close is an absolute quantity).
     relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
@@ -481,8 +483,9 @@ def _reject_unsupported_capabilities(raw: dict[str, Any]) -> None:
             "produce plausible-looking but wrong actions."
         )
 
-    # Not an error: it describes how the checkpoint was trained, not a request
-    # to run RTC. Such a checkpoint is still correct to serve without it.
+    # Not an error: it records that the checkpoint was trained with clean action
+    # prefixes sampled in, which is a property of training rather than a request
+    # to run RTC. Such a checkpoint is still correct to serve without RTC.
     delay = raw.get("rtc_training_max_delay")
     if delay:
         logger.info(
