@@ -210,28 +210,17 @@ steps:
             --run-level "full_model"
         mirror_hardwares: h100_1
 
-      # Both robot-policy jobs need Hugging Face credentials with access to
-      # google/paligemma-3b-pt-224. It is a gated repo, neither pi0_base nor
-      # pi05_base ships a tokenizer of its own, and without access the server
-      # fails during model load. The failure is hard to read: the API server
-      # reports `Orchestrator initialization failed:` with an empty message plus
-      # a cascade of EOFErrors, and the 401 is a few hundred lines earlier in the
-      # worker log. If the agent image has no such credentials, either log in
-      # from a Buildkite secret or bake the ~17 MB tokenizer into the image.
+      # Needs Hugging Face credentials with access to google/paligemma-3b-pt-224.
+      # It is a gated repo and pi05_base ships no tokenizer of its own, so
+      # without access the server fails during model load. The failure is hard
+      # to read: the API server reports `Orchestrator initialization failed:`
+      # with an empty message plus a cascade of EOFErrors, and the 401 is a few
+      # hundred lines earlier in the worker log. If the agent image has no such
+      # credentials, either log in from a Buildkite secret or bake the ~17 MB
+      # tokenizer into the image.
       #
       # Measured runtime is ~3.5 min for the test plus ~1 min for the pip
       # install and up to a few minutes for a cold 14.5 GB checkpoint download.
-      - label: ":robot_face: Robot Policy OpenPI · π0 · H100 · Single-GPU"
-        timeout_in_minutes: 120
-        commands:
-          - pip install "openpi-client @ git+https://github.com/Physical-Intelligence/openpi.git@215abfb217dbac7d5f1273282331b9b1866c0479#subdirectory=packages/openpi-client"
-          - >-
-            pytest -sv
-            tests/e2e/online_serving/test_pi0_expansion.py
-            -m "full_model and diffusion and H100 and cards_1"
-            --run-level "full_model"
-        mirror_hardwares: h100_1
-
       - label: ":robot_face: Robot Policy OpenPI · π0.5 · H100 · Single-GPU"
         timeout_in_minutes: 120
         commands:

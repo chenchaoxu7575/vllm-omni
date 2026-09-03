@@ -78,7 +78,6 @@ def test_pi05_openpi_online(omni_server):
         session_id="pi05-online-e2e",
         num_steps=2,
         num_inference_steps=2,
-        float_images=True,
     )
 
     # Asserts every returned chunk is [50, 32] + finite, and the handshake
