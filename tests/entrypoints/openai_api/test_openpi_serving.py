@@ -296,12 +296,15 @@ def test_build_request_rejects_unusable_step_count(bad):
         )
 
 
-def test_build_request_rejects_unknown_sampling_param_with_suggestion():
+@pytest.mark.parametrize("unknown", ["num_infrence_steps", "guidance_scale"])
+def test_build_request_rejects_unknown_sampling_param(unknown):
+    """The error names the whole namespace rather than guessing at intent, so a
+    key that resembles nothing supported is as actionable as a near miss."""
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
 
-    with pytest.raises(ValueError, match="did you mean 'num_inference_steps'"):
+    with pytest.raises(ValueError, match=r"Supported: \['noise', 'num_inference_steps'\]"):
         serving._build_request(
-            {"prompt": "x", "sampling_params": {"num_infrence_steps": 4}},
+            {"prompt": "x", "sampling_params": {unknown: 4}},
             session_id="s",
             reset=True,
         )

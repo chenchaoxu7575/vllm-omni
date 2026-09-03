@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from difflib import get_close_matches
 from itertools import count
 from typing import Any, TypeAlias
 
@@ -68,13 +67,10 @@ def _extract_inference_params(
 
     unknown = sorted(set(raw_params) - set(_INFERENCE_PARAM_NAMES))
     if unknown:
-        hints = []
-        for key in unknown:
-            match = get_close_matches(str(key), _INFERENCE_PARAM_NAMES, n=1, cutoff=0.6)
-            if match:
-                hints.append(f"{key!r}: did you mean {match[0]!r}?")
-        suffix = f" Suggestions: {'; '.join(hints)}" if hints else ""
-        raise ValueError(f"Unknown sampling_params key(s): {unknown}.{suffix}")
+        # Naming the whole namespace beats guessing at the intent: it is two
+        # keys long, so the supported set is shorter than a fuzzy suggestion
+        # would be and it stays useful for a key that resembles neither.
+        raise ValueError(f"Unknown sampling_params key(s): {unknown}. Supported: {sorted(_INFERENCE_PARAM_NAMES)}.")
 
     params: dict[str, Any] = {}
     for key in _INFERENCE_PARAM_NAMES:
