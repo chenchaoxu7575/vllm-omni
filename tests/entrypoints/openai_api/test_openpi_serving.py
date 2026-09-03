@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
 import asyncio
 import json
 import threading
@@ -25,9 +22,6 @@ TEST_POLICY_SERVER_CONFIG = {
     "needs_stereo_camera": False,
     "needs_session_id": True,
     "action_space": "joint_position",
-    "action_horizon": 50,
-    "action_dim": 32,
-    "max_action_dim": 32,
 }
 
 

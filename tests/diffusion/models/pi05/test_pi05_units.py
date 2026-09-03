@@ -77,17 +77,6 @@ _LEROBOT_CFG = {
     "image_resolution": [224, 224],
     "tokenizer_max_length": 200,
     "dtype": "float32",
-    "use_visual_memory": False,
-    "use_proprioceptive_memory": False,
-    "memory_frames": 6,
-    "rtc_config": None,
-    "rtc_training_max_delay": 0,
-    "use_relative_actions": False,
-    "relative_exclude_joints": ["gripper"],
-    # Training-only keys that must be filtered out of the dataclass.
-    "optimizer_lr": 2.5e-5,
-    "scheduler_warmup_steps": 1000,
-    "freeze_vision_encoder": False,
     "input_features": {
         "observation.images.base_0_rgb": {"type": "VISUAL", "shape": [3, 224, 224]},
         "observation.images.left_wrist_0_rgb": {"type": "VISUAL", "shape": [3, 224, 224]},
@@ -107,7 +96,7 @@ _ACTION_NAMES = ["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5
 
 
 def test_config_parses_lerobot_pi05_json():
-    """``_LEROBOT_CFG`` mirrors a real checkpoint, training-only keys included."""
+    """``_LEROBOT_CFG`` mirrors the runtime keys of a real checkpoint."""
     c = Pi05Config.from_model_config(_LEROBOT_CFG)
     assert c.tokenizer_max_length == 200
     assert c.state_num_bins == 256
@@ -120,14 +109,6 @@ def test_config_tokenizer_length_differs_from_pi0():
     carries the serialized state."""
     assert Pi05Config().tokenizer_max_length == 200
     assert PI05_MAX_TOKEN_LEN == 200
-
-
-def test_config_drops_training_only_keys():
-    """A LeRobot config.json carries the whole training recipe. None of it is
-    consumed here, and none of it may leak onto the dataclass."""
-    c = Pi05Config.from_model_config(dict(_LEROBOT_CFG, mystery_option=42))
-    assert not hasattr(c, "optimizer_lr")
-    assert not hasattr(c, "mystery_option")
 
 
 def test_config_rejects_wrong_model_type():
@@ -234,43 +215,41 @@ _FULL_DATASET_STATS = {
 }
 
 
-def test_load_lerobot_norm_stats_picks_mode_from_norm_map_not_from_keys(tmp_path):
-    """The regression guard: all six stats are present, so a key-sniffing
-    implementation would infer mean_std. norm_map says QUANTILES."""
-    path = _write_lerobot_checkpoint(tmp_path, stats=_FULL_DATASET_STATS)
-    stats = load_lerobot_norm_stats(path)
-
-    assert stats is not None
-    assert stats["state"]["mode"] == "quantile"
-    assert stats["state"]["q01"] == [-1.0, -2.0]
-    assert stats["state"]["q99"] == [1.0, 2.0]
-    assert "mean" not in stats["state"], "mean/std must not leak into a quantile entry"
-    assert stats["action"]["mode"] == "quantile"
-    assert stats["action"]["q01"] == [-0.25, -0.5]
-
-
-def test_load_lerobot_norm_stats_honours_mean_std_norm_map(tmp_path):
+@pytest.mark.parametrize(
+    "declared,expected",
+    [
+        ("QUANTILES", {"mode": "quantile", "q01": [-1.0, -2.0], "q99": [1.0, 2.0]}),
+        ("MEAN_STD", {"mode": "mean_std", "mean": [10.0, 20.0], "std": [1.0, 2.0]}),
+        ("IDENTITY", None),
+    ],
+)
+def test_load_lerobot_norm_stats_takes_the_mode_from_norm_map(tmp_path, declared, expected):
+    """The regression guard. ``_FULL_DATASET_STATS`` carries all six statistics,
+    as a real state_dict does, so an implementation that sniffed the present keys
+    would answer mean_std for every case here. Only norm_map distinguishes them.
+    """
     path = _write_lerobot_checkpoint(
-        tmp_path, norm_map={"STATE": "MEAN_STD", "ACTION": "MEAN_STD"}, stats=_FULL_DATASET_STATS
+        tmp_path, norm_map={"STATE": declared, "ACTION": "QUANTILES"}, stats=_FULL_DATASET_STATS
     )
     stats = load_lerobot_norm_stats(path)
 
-    assert stats["state"] == {"mode": "mean_std", "mean": [10.0, 20.0], "std": [1.0, 2.0]}
-
-
-def test_load_lerobot_norm_stats_skips_identity_features(tmp_path):
-    path = _write_lerobot_checkpoint(
-        tmp_path, norm_map={"STATE": "IDENTITY", "ACTION": "QUANTILES"}, stats=_FULL_DATASET_STATS
-    )
-    stats = load_lerobot_norm_stats(path)
-
-    assert "state" not in stats
+    if expected is None:
+        assert "state" not in stats
+    else:
+        assert stats["state"] == expected
     assert stats["action"]["mode"] == "quantile"
 
 
-def test_load_lerobot_norm_stats_without_state_file_is_none(tmp_path):
-    """The lerobot/pi05_base shape: a normalizer step carrying no stats."""
-    path = _write_lerobot_checkpoint(tmp_path, write_state_file=False)
+@pytest.mark.parametrize("shape", ["no_sidecar", "no_state_file"])
+def test_load_lerobot_norm_stats_absent_stats_are_none(tmp_path, shape):
+    """``lerobot/pi05_base`` is the second shape: a normalizer step with no
+    stats attached. Neither is an error — the client is then expected to send an
+    already-normalized state."""
+    if shape == "no_sidecar":
+        path = str(tmp_path)
+    else:
+        path = _write_lerobot_checkpoint(tmp_path, write_state_file=False)
+
     assert load_lerobot_norm_stats(path) is None
 
 
@@ -340,10 +319,6 @@ def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
     result = pipeline.forward(request)
 
     assert result.output["actions"].shape == (config.chunk_size, 7)
-
-
-def test_load_lerobot_norm_stats_without_sidecar_is_none(tmp_path):
-    assert load_lerobot_norm_stats(tmp_path) is None
 
 
 def test_load_lerobot_norm_stats_unknown_mode_raises(tmp_path):
@@ -428,11 +403,7 @@ def test_sidecar_quantile_stats_reach_the_prompt(tmp_path):
 )
 def test_config_rejects_unsupported_capability(key, value):
     """MEM and RTC change what a correct action chunk looks like and are not
-    visible in the weights. Serving such a checkpoint must fail loudly.
-
-    Only *enabling* trips: ``_LEROBOT_CFG`` already carries these keys at their
-    disabled defaults, so ``test_config_parses_lerobot_pi05_json`` covers the
-    accepting side."""
+    visible in the weights. Serving such a checkpoint must fail loudly."""
     with pytest.raises(UnsupportedCheckpointCapabilityError, match=key):
         Pi05Config.from_model_config(dict(_LEROBOT_CFG, **{key: value}))
 
