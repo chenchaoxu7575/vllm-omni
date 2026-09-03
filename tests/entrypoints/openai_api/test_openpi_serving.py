@@ -250,31 +250,6 @@ def test_build_request_omits_num_inference_steps_when_not_sent():
     assert request.sampling_params.num_inference_steps is None
 
 
-@pytest.mark.parametrize("unknown", ["num_infrence_steps", "guidance_scale"])
-def test_build_request_rejects_unknown_sampling_param(unknown):
-    """Only the entrypoint can catch this: the pipeline never sees the namespace,
-    so a misspelling would otherwise run on the default without telling anyone.
-
-    The error names the whole namespace rather than guessing at intent, so a key
-    that resembles nothing supported is as actionable as a near miss.
-    """
-    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
-
-    with pytest.raises(ValueError, match=r"Supported: \['num_inference_steps'\]"):
-        serving._build_request(
-            {"prompt": "x", "sampling_params": {unknown: 4}},
-            session_id="s",
-            reset=True,
-        )
-
-
-def test_build_request_rejects_non_mapping_sampling_params():
-    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
-
-    with pytest.raises(ValueError, match="must be a mapping"):
-        serving._build_request({"prompt": "x", "sampling_params": [1, 2]}, session_id="s", reset=True)
-
-
 def test_build_request_does_not_forward_arbitrary_observation_keys():
     """A robot observation may carry any feature name; none of them become
     engine parameters."""

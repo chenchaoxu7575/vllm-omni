@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
-from typing import Any, TypeAlias
+from typing import Any
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -20,8 +20,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Annotated so mypy reads it as a type alias rather than a module variable.
-ActionOutput: TypeAlias = np.ndarray | dict[str, np.ndarray]
+ActionOutput = np.ndarray | dict[str, np.ndarray]
 
 
 def _to_builtin_container(value: Any) -> Any:
@@ -151,18 +150,8 @@ class ServingRealtimeRobotOpenPI:
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-        # Engine knobs are nested rather than top-level because an OpenPI
-        # observation's other keys are robot-defined feature names. Only the
-        # entrypoint can catch a misspelling here — the pipeline never sees this
-        # namespace, so an unrecognised key would quietly leave the request on
-        # the deploy-config default. Values are validated where they are used.
+        # Nested so engine knobs cannot collide with robot-defined obs keys.
         sampling = obs.get("sampling_params") or {}
-        if not isinstance(sampling, Mapping):
-            raise ValueError(f"sampling_params must be a mapping, got {type(sampling).__name__}.")
-        unknown = sorted(set(sampling) - {"num_inference_steps"})
-        if unknown:
-            raise ValueError(f"Unknown sampling_params key(s): {unknown}. Supported: ['num_inference_steps'].")
-
         robot_obs = {key: value for key, value in obs.items() if key != "sampling_params"}
         extra_args = {
             "reset": reset,
