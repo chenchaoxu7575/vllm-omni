@@ -23,17 +23,6 @@ logger = init_logger(__name__)
 # Annotated so mypy reads it as a type alias rather than a module variable.
 ActionOutput: TypeAlias = np.ndarray | dict[str, np.ndarray]
 
-# Inference parameters live in a dedicated single-stage wire namespace so
-# arbitrary robot feature names cannot be confused with engine controls.
-_INFERENCE_PARAM_NAMES = (
-    # Flow-matching denoising steps. Fewer steps trades accuracy for latency,
-    # which a robot may want to vary with its control budget.
-    "num_inference_steps",
-    # Initial noise for the denoising ODE. Pinning it makes a request
-    # reproducible, which is what the parity tests compare against.
-    "noise",
-)
-
 
 def _to_builtin_container(value: Any) -> Any:
     if OmegaConf.is_config(value):
@@ -43,66 +32,6 @@ def _to_builtin_container(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_to_builtin_container(item) for item in value]
     return value
-
-
-def _extract_inference_params(
-    obs: Mapping[str, Any],
-    policy_server_config: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Validate the strict per-request ``sampling_params`` namespace.
-
-    Unknown names, invalid values, and legacy top-level controls fail before the
-    request reaches the engine. This prevents a typo from silently falling back
-    to a deploy-config default.
-    """
-    legacy = sorted(key for key in _INFERENCE_PARAM_NAMES if key in obs)
-    if legacy:
-        raise ValueError(f"Inference controls {legacy!r} must be nested under observation['sampling_params'].")
-
-    if "sampling_params" not in obs:
-        return {}
-    raw_params = obs["sampling_params"]
-    if not isinstance(raw_params, Mapping):
-        raise ValueError(f"sampling_params must be a mapping, got {type(raw_params).__name__}.")
-
-    unknown = sorted(set(raw_params) - set(_INFERENCE_PARAM_NAMES))
-    if unknown:
-        # Naming the whole namespace beats guessing at the intent: it is two
-        # keys long, so the supported set is shorter than a fuzzy suggestion
-        # would be and it stays useful for a key that resembles neither.
-        raise ValueError(f"Unknown sampling_params key(s): {unknown}. Supported: {sorted(_INFERENCE_PARAM_NAMES)}.")
-
-    params: dict[str, Any] = {}
-    for key in _INFERENCE_PARAM_NAMES:
-        if key not in raw_params:
-            continue
-        value = raw_params[key]
-        if key == "num_inference_steps":
-            # bool is an int subclass, and msgpack round-trips numpy scalars.
-            if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or int(value) < 1:
-                raise ValueError(f"num_inference_steps must be a positive integer, got {value!r}.")
-            value = int(value)
-        elif key == "noise":
-            try:
-                array = np.asarray(value)
-            except Exception as exc:
-                raise ValueError("noise must be a numeric rank-3 array.") from exc
-            if array.ndim != 3 or not np.issubdtype(array.dtype, np.number) or np.iscomplexobj(array):
-                raise ValueError(
-                    f"noise must be a real numeric rank-3 array, got shape={array.shape}, dtype={array.dtype}."
-                )
-            if not np.isfinite(array).all():
-                raise ValueError("noise must contain only finite values.")
-            expected_horizon = (policy_server_config or {}).get("action_horizon")
-            expected_dim = (policy_server_config or {}).get(
-                "max_action_dim", (policy_server_config or {}).get("action_dim")
-            )
-            if expected_horizon is not None and expected_dim is not None:
-                expected_shape = (1, int(expected_horizon), int(expected_dim))
-                if array.shape != expected_shape:
-                    raise ValueError(f"noise must have shape {expected_shape}, got {array.shape}.")
-        params[key] = value
-    return params
 
 
 @dataclass(frozen=True)
@@ -222,19 +151,27 @@ class ServingRealtimeRobotOpenPI:
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-        inference_params = _extract_inference_params(obs, self.policy_server_config.values)
+        # Engine knobs are nested rather than top-level because an OpenPI
+        # observation's other keys are robot-defined feature names. Only the
+        # entrypoint can catch a misspelling here — the pipeline never sees this
+        # namespace, so an unrecognised key would quietly leave the request on
+        # the deploy-config default. Values are validated where they are used.
+        sampling = obs.get("sampling_params") or {}
+        if not isinstance(sampling, Mapping):
+            raise ValueError(f"sampling_params must be a mapping, got {type(sampling).__name__}.")
+        unknown = sorted(set(sampling) - {"num_inference_steps"})
+        if unknown:
+            raise ValueError(f"Unknown sampling_params key(s): {unknown}. Supported: ['num_inference_steps'].")
+
         robot_obs = {key: value for key, value in obs.items() if key != "sampling_params"}
         extra_args = {
             "reset": reset,
             "session_id": session_id,
             "robot_obs": robot_obs,
         }
-        if "noise" in inference_params:
-            extra_args["noise"] = inference_params["noise"]
-
         prompt = obs.get("prompt", "")
         sampling_params = OmniDiffusionSamplingParams(
-            num_inference_steps=inference_params.get("num_inference_steps"),
+            num_inference_steps=sampling.get("num_inference_steps"),
             extra_args=extra_args,
         )
         return OmniDiffusionRequest(

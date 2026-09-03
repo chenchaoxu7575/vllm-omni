@@ -226,83 +226,41 @@ def test_build_request_uses_unique_engine_request_id_per_inference():
 
 # Per-request inference parameters live in a strict namespace so robot feature
 # names remain open-ended without making engine option typos silent.
-def test_build_request_forwards_per_request_inference_params():
+def test_build_request_forwards_num_inference_steps():
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
-    noise = np.zeros((1, 50, 32), dtype=np.float32)
 
     request = serving._build_request(
-        {
-            "prompt": "pick up the object",
-            "sampling_params": {"num_inference_steps": 4, "noise": noise},
-        },
+        {"prompt": "pick up the object", "sampling_params": {"num_inference_steps": 4}},
         session_id="session-a",
         reset=True,
     )
 
     assert request.sampling_params.num_inference_steps == 4
-    assert request.sampling_params.extra_args["noise"] is noise
+    # The namespace is an engine concern; the pipeline must not see it as a feature.
     assert "sampling_params" not in request.sampling_params.extra_args["robot_obs"]
 
 
-def test_build_request_omits_inference_params_that_were_not_sent():
-    """An absent key must not become an explicit None — the pipelines treat
-    None as 'use the configured default', but only if the key is missing."""
+def test_build_request_omits_num_inference_steps_when_not_sent():
+    """Absent must stay absent: the pipeline reads None as "use the configured
+    default", so materialising a null here would be a different request."""
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
 
     request = serving._build_request({"prompt": "x"}, session_id="s", reset=True)
 
     assert request.sampling_params.num_inference_steps is None
-    assert "noise" not in request.sampling_params.extra_args
-
-
-@pytest.mark.parametrize("key", ["num_inference_steps", "noise"])
-def test_build_request_rejects_explicitly_null_inference_params(key):
-    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
-
-    with pytest.raises(ValueError, match=key):
-        serving._build_request(
-            {"prompt": "x", "sampling_params": {key: None}},
-            session_id="s",
-            reset=True,
-        )
-
-
-def test_build_request_accepts_numpy_integer_step_count():
-    """msgpack-numpy round-trips scalars as numpy types, not Python ints."""
-    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
-
-    request = serving._build_request(
-        {"prompt": "x", "sampling_params": {"num_inference_steps": np.int64(6)}},
-        session_id="s",
-        reset=True,
-    )
-
-    steps = request.sampling_params.num_inference_steps
-    assert steps == 6
-    assert isinstance(steps, int)
-
-
-@pytest.mark.parametrize("bad", [0, -1, 2.5, "4", True, False])
-def test_build_request_rejects_unusable_step_count(bad):
-    """Rejected rather than passed through: zero steps returns the initial
-    noise unchanged, which is a well-shaped, finite, completely wrong chunk."""
-    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
-
-    with pytest.raises(ValueError, match="num_inference_steps"):
-        serving._build_request(
-            {"prompt": "x", "sampling_params": {"num_inference_steps": bad}},
-            session_id="s",
-            reset=True,
-        )
 
 
 @pytest.mark.parametrize("unknown", ["num_infrence_steps", "guidance_scale"])
 def test_build_request_rejects_unknown_sampling_param(unknown):
-    """The error names the whole namespace rather than guessing at intent, so a
-    key that resembles nothing supported is as actionable as a near miss."""
+    """Only the entrypoint can catch this: the pipeline never sees the namespace,
+    so a misspelling would otherwise run on the default without telling anyone.
+
+    The error names the whole namespace rather than guessing at intent, so a key
+    that resembles nothing supported is as actionable as a near miss.
+    """
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
 
-    with pytest.raises(ValueError, match=r"Supported: \['noise', 'num_inference_steps'\]"):
+    with pytest.raises(ValueError, match=r"Supported: \['num_inference_steps'\]"):
         serving._build_request(
             {"prompt": "x", "sampling_params": {unknown: 4}},
             session_id="s",
@@ -310,15 +268,16 @@ def test_build_request_rejects_unknown_sampling_param(unknown):
         )
 
 
-@pytest.mark.parametrize("key,value", [("num_inference_steps", 4), ("noise", np.zeros((1, 50, 32)))])
-def test_build_request_rejects_legacy_top_level_inference_params(key, value):
+def test_build_request_rejects_non_mapping_sampling_params():
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
 
-    with pytest.raises(ValueError, match="nested"):
-        serving._build_request({"prompt": "x", key: value}, session_id="s", reset=True)
+    with pytest.raises(ValueError, match="must be a mapping"):
+        serving._build_request({"prompt": "x", "sampling_params": [1, 2]}, session_id="s", reset=True)
 
 
 def test_build_request_does_not_forward_arbitrary_observation_keys():
+    """A robot observation may carry any feature name; none of them become
+    engine parameters."""
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
 
     request = serving._build_request(
@@ -328,26 +287,6 @@ def test_build_request_does_not_forward_arbitrary_observation_keys():
     extra_args = request.sampling_params.extra_args
     assert set(extra_args) == {"reset", "session_id", "robot_obs"}
     assert extra_args["robot_obs"]["guidance_scale"] == 7.5
-
-
-@pytest.mark.parametrize(
-    "bad_noise",
-    [
-        np.zeros((50, 32), dtype=np.float32),
-        np.zeros((1, 49, 32), dtype=np.float32),
-        np.full((1, 50, 32), np.nan, dtype=np.float32),
-        "not-an-array",
-    ],
-)
-def test_build_request_rejects_invalid_noise(bad_noise):
-    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
-
-    with pytest.raises(ValueError, match="noise"):
-        serving._build_request(
-            {"prompt": "x", "sampling_params": {"noise": bad_noise}},
-            session_id="s",
-            reset=True,
-        )
 
 
 def test_infer_keeps_session_state_but_uses_unique_engine_request_ids():
