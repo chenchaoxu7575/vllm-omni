@@ -24,6 +24,7 @@ behaviour still produces a well-shaped, finite action chunk:
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import numpy as np
 import pytest
@@ -66,7 +67,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # ----------------------------------------------------------------------------
 # Pi05Config dataclass + checkpoint resolver
 # ----------------------------------------------------------------------------
-_LEROBOT_CFG = {
+_LEROBOT_CFG: dict[str, Any] = {
     "type": "pi05",
     "paligemma_variant": "gemma_2b",
     "action_expert_variant": "gemma_300m",
@@ -137,7 +138,8 @@ def test_config_rejects_action_schema_wider_than_model():
 def test_config_derives_real_state_dim_from_input_features():
     """The state width decides how many values are serialized into the prompt,
     so a 7-joint checkpoint must not be served a 32-value state prompt."""
-    features = dict(_LEROBOT_CFG["input_features"], **{"observation.state": {"type": "STATE", "shape": [7]}})
+    features: dict[str, Any] = dict(_LEROBOT_CFG["input_features"])
+    features["observation.state"] = {"type": "STATE", "shape": [7]}
     config = Pi05Config.from_model_config(dict(_LEROBOT_CFG, input_features=features))
     assert config.state_dim == 7
     assert config.max_state_dim == 32
@@ -151,7 +153,8 @@ def test_config_state_dim_falls_back_to_max_state_dim():
 
 
 def test_config_rejects_state_schema_wider_than_model():
-    features = dict(_LEROBOT_CFG["input_features"], **{"observation.state": {"type": "STATE", "shape": [33]}})
+    features: dict[str, Any] = dict(_LEROBOT_CFG["input_features"])
+    features["observation.state"] = {"type": "STATE", "shape": [33]}
     with pytest.raises(ValueError, match="exceeds max_state_dim"):
         Pi05Config.from_model_config(dict(_LEROBOT_CFG, input_features=features))
 
