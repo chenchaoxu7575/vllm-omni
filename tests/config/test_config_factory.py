@@ -1475,6 +1475,11 @@ stages:
         deploy = load_deploy_config(Path(get_deploy_config_path("minimax_h3_disaggregated.yaml")))
         stages = merge_pipeline_deploy(pipeline, deploy)
 
+        assert stages[0].yaml_engine_args["model_arch"] == "MiniMaxH3TextEncoder"
+        assert stages[1].yaml_engine_args["model_arch"] == "MiniMaxH3Pipeline"
+        assert stages[0].yaml_runtime["num_replicas"] == 1
+        assert stages[1].yaml_runtime["num_replicas"] == 1
+        assert stages[1].yaml_engine_args["model_loaded"] == {"text_encoder": False}
         assert stages[0].yaml_engine_args["max_num_seqs"] == 1
         assert stages[0].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_model_root")
         assert stages[1].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_diffusion_model_path")
@@ -2398,6 +2403,21 @@ class TestBaseConfigInheritance:
         s0 = deploy.stages[0].default_sampling_params
         # CI overrides max_tokens
         assert s0["max_tokens"] == 150
+
+    def test_qwen3_omni_colocate_async_bounds_only_rocm_kv_cache(self):
+        ci_path = Path(get_deploy_config_path("ci/qwen3_omni_moe_colocate_async.yaml"))
+        pipeline = resolve_pipeline_config("qwen3_omni_moe_thinker_only")
+        assert isinstance(pipeline, PipelineConfig)
+
+        cuda = _apply_platform_overrides(load_deploy_config(ci_path), platform="cuda")
+        cuda_stage = merge_pipeline_deploy(pipeline, cuda)[0]
+        assert cuda_stage.yaml_engine_args["gpu_memory_utilization"] == 0.9
+        assert "kv_cache_memory_bytes" not in cuda_stage.yaml_engine_args
+
+        rocm = _apply_platform_overrides(load_deploy_config(ci_path), platform="rocm")
+        rocm_stage = merge_pipeline_deploy(pipeline, rocm)[0]
+        assert "gpu_memory_utilization" not in rocm_stage.yaml_engine_args
+        assert rocm_stage.yaml_engine_args["kv_cache_memory_bytes"] == 2 * 1024**3
 
     def test_pure_inheritance_overlay(self, tmp_path):
         """An overlay with only ``base_config`` inherits everything."""
