@@ -164,26 +164,30 @@ def _build_norm_buffers(norm_stats: dict | None, key: str) -> dict[str, torch.Te
     if mode == "mean_std":
         mean, std = entry.get("mean"), entry.get("std")
         if mean is None or std is None:
-            return None
+            raise ValueError(f"Normalization mode 'mean_std' for {key!r} requires both 'mean' and 'std'.")
         return {
             "mode": mode,
             "mean": torch.as_tensor(mean, dtype=torch.float32),
             "std": torch.as_tensor(std, dtype=torch.float32),
         }
-    if mode in ("min_max", "quantile"):
+    elif mode in ("min_max", "quantile"):
         if mode == "min_max":
             lo, hi = entry.get("min"), entry.get("max")
         else:
             lo = entry.get("q01", entry.get("low"))
             hi = entry.get("q99", entry.get("high"))
         if lo is None or hi is None:
-            return None
+            expected_bounds = "'min' and 'max'" if mode == "min_max" else "'q01' and 'q99'"
+            raise ValueError(f"Normalization mode {mode!r} for {key!r} requires both {expected_bounds} bounds.")
         return {
             "mode": "min_max",  # same arithmetic; quantile only changes the bounds
             "min": torch.as_tensor(lo, dtype=torch.float32),
             "max": torch.as_tensor(hi, dtype=torch.float32),
         }
-    return None
+    else:
+        raise ValueError(
+            f"Unsupported normalization mode for {key!r}: {mode!r}. Expected one of mean_std / min_max / quantile."
+        )
 
 
 def _apply_norm(
@@ -211,7 +215,7 @@ def _apply_norm(
         if valid == x.shape[-1]:
             return head
         return torch.cat([head, x[..., valid:]], dim=-1)
-    if mode == "min_max":
+    elif mode == "min_max":
         lo = stats["min"].to(device=x.device, dtype=x.dtype)
         hi = stats["max"].to(device=x.device, dtype=x.dtype)
         valid = lo.shape[0]
@@ -221,7 +225,8 @@ def _apply_norm(
         if valid == x.shape[-1]:
             return head
         return torch.cat([head, x[..., valid:]], dim=-1)
-    return x
+    else:
+        raise ValueError(f"Unsupported normalization mode: {mode!r}. Expected one of mean_std / min_max.")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -657,9 +662,19 @@ class Pi05ForActionPrediction(nn.Module):
         bidirectional attention (all-zero ``att_masks``). Identical to π0 — the
         state is inside ``lang_tokens``, so nothing here changes shape-wise.
 
-        Cameras are embedded one at a time; each call is ``(B, 3, 224, 224)``
-        regardless of camera count, so 1/2/3 views need no separate code path.
+        Cameras are embedded one at a time; each call is ``(B, 3, 224, 224)``.
+        The number of slots is fixed by ``config.max_cameras`` for the deployed
+        model; missing cameras occupy their slot with a false image mask.
         """
+        num_views = len(images)
+        if len(image_masks) != num_views:
+            raise ValueError(
+                f"images and image_masks must contain the same number of views, got {num_views} and {len(image_masks)}."
+            )
+        max_cameras = int(self.config.max_cameras)
+        if num_views != max_cameras:
+            raise ValueError(f"Expected exactly max_cameras={max_cameras} image views, got {num_views}.")
+
         embs: list[torch.Tensor] = []
         pad_masks: list[torch.Tensor] = []
         att_masks: list[int] = []

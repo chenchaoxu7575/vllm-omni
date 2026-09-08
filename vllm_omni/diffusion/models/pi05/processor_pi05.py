@@ -481,9 +481,9 @@ def build_model_inputs(robot_obs: dict, config, tokenizer, device: torch.device)
     Returns ``(images, image_masks, lang_tokens, lang_masks)`` — note there is
     **no state tensor**: π0.5 carries the state inside ``lang_tokens``.
 
-    Real cameras are filtered in ``config.image_feature_keys`` order and packed
-    contiguously, matching LeRobot. Empty images are appended only at the tail
-    to reach ``max_cameras`` for the selected graph shape.
+    Camera slots follow ``config.image_feature_keys`` order. A missing key keeps
+    its semantic slot and receives an empty image with a false mask. The output
+    always contains exactly ``max_cameras`` slots for the deployed model.
     """
     state = robot_obs.get("state")
     if state is None:
@@ -498,25 +498,30 @@ def build_model_inputs(robot_obs: dict, config, tokenizer, device: torch.device)
     if not feature_keys:
         # No declared camera order — fall back to whatever the obs provides,
         # preserving insertion order.
-        feature_keys = list(obs_images.keys())
+        feature_keys = list(obs_images.keys())[:max_cameras]
 
-    present_images = [obs_images[key] for key in feature_keys if obs_images.get(key) is not None]
-    if not present_images:
+    camera_keys = feature_keys[:max_cameras]
+    if all(obs_images.get(key) is None for key in camera_keys):
         raise ValueError("π0.5 observation must provide at least one configured camera image.")
-    if len(present_images) > max_cameras:
+    if not config.image_feature_keys and len(obs_images) > max_cameras:
         raise ValueError(
-            f"π0.5 observation provides {len(present_images)} configured cameras, "
-            f"which exceeds max_cameras={max_cameras}."
+            f"π0.5 observation provides {len(obs_images)} cameras, which exceeds max_cameras={max_cameras}."
         )
 
     images: list[torch.Tensor] = []
     image_masks: list[torch.Tensor] = []
-    for image in present_images:
-        images.append(img_proc.preprocess_single(image).to(device=device))
-        image_masks.append(torch.tensor([True], dtype=torch.bool, device=device))
+    for key in camera_keys:
+        image = obs_images.get(key)
+        if image is None:
+            tensor = img_proc.make_empty_image().to(device=device)
+            mask = False
+        else:
+            tensor = img_proc.preprocess_single(image).to(device=device)
+            mask = True
+        images.append(tensor)
+        image_masks.append(torch.tensor([mask], dtype=torch.bool, device=device))
 
-    # Pad up to max_cameras with empty slots if the checkpoint declares fewer
-    # cameras than the model attends to.
+    # A checkpoint may declare fewer named slots than the serving graph.
     while len(images) < max_cameras:
         images.append(img_proc.make_empty_image().to(device=device))
         image_masks.append(torch.tensor([False], dtype=torch.bool, device=device))
@@ -539,10 +544,9 @@ def build_model_inputs(robot_obs: dict, config, tokenizer, device: torch.device)
 def prefix_token_budget(config, num_real_cameras: int) -> dict[str, int]:
     """Report the prefix token layout for a request — the A4/C1 input contract.
 
-    ``1..3 views × 256 image tokens + a constant 200 text tokens``, so the
-    tensor shape is fixed at ``256 * max_cameras + tokenizer_max_length`` and
-    only ``valid_prefix_len`` varies per request. Exposed for tests and for
-    latency accounting.
+    ``max_cameras × 256 image tokens + a constant 200 text tokens``, so the
+    tensor shape is fixed and only ``valid_prefix_len`` varies with the number
+    of real cameras. Exposed for tests and for latency accounting.
     """
     max_cameras = max(1, int(getattr(config, "max_cameras", PI05_MAX_CAMERAS)))
     text_len = int(config.tokenizer_max_length)

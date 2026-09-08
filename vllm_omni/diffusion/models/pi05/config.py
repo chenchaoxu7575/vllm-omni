@@ -172,8 +172,8 @@ class Pi05Config:
     # Convenience view of ``norm_stats["state"]`` used by the prompt builder.
     state_norm_stats: dict | None = None
 
-    # Ordered list of image feature keys, i.e. the **camera order** that must
-    # be reproduced for LeRobot parity.
+    # Ordered camera-slot identities. Missing keys retain their slot and are
+    # represented by an empty image with a false mask during preprocessing.
     image_feature_keys: list[str] | None = None
     # Optional map from raw OpenPI obs keys → ``image_feature_keys`` entries.
     image_key_map: dict[str, str] = field(default_factory=dict)

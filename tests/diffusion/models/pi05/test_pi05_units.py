@@ -648,7 +648,7 @@ def test_prompt_template_matches_lerobot():
 
 
 # ----------------------------------------------------------------------------
-# Input contract: 1..3 views x 256 tokens + a constant 200 text tokens
+# Input contract: fixed camera slots x 256 tokens + constant 200 text tokens
 # ----------------------------------------------------------------------------
 @pytest.mark.parametrize("views,expected", [(1, 456), (2, 712), (3, 968)])
 def test_prefix_token_budget(views, expected):
@@ -705,12 +705,35 @@ def test_build_norm_buffers_recognizes_quantile_stats():
     assert torch.allclose(stats["max"], torch.tensor([2.0]))
 
 
+def test_build_norm_buffers_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="Unsupported normalization mode"):
+        _build_norm_buffers({"action": {"mode": "qunatile"}}, "action")
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"mode": "mean_std", "mean": [0.0]},
+        {"mode": "min_max", "min": [0.0]},
+        {"mode": "quantile", "q01": [0.0]},
+    ],
+)
+def test_build_norm_buffers_rejects_incomplete_stats(entry):
+    with pytest.raises(ValueError, match="requires both"):
+        _build_norm_buffers({"action": entry}, "action")
+
+
 def test_apply_norm_quantile_round_trip_and_padded_tail():
     stats = _build_norm_buffers({"action": {"q01": [0.0, 0.0], "q99": [2.0, 4.0]}}, "action")
     x = torch.tensor([[0.5, -0.5, 7.0]])  # third entry is padding beyond the stats
     back = _apply_norm(_apply_norm(x, stats, inverse=False), stats, inverse=True)
     assert torch.allclose(back, x, atol=1e-5)
     assert back[0, 2] == 7.0, "padded tail must pass through untouched"
+
+
+def test_apply_norm_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="Unsupported normalization mode"):
+        _apply_norm(torch.zeros(1), {"mode": "bogus"}, inverse=False)
 
 
 # ----------------------------------------------------------------------------
@@ -761,20 +784,59 @@ class _FakeTokenizer:
         return {"input_ids": [0] * length, "attention_mask": [1] * length}
 
 
-def test_build_model_inputs_compacts_missing_middle_camera():
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_build_model_inputs_preserves_missing_middle_camera_slot(explicit_none):
     config = Pi05Config(image_feature_keys=_EXPECTED_CAMERA_ORDER, max_cameras=3)
-    observation = {
+    images = {
         _EXPECTED_CAMERA_ORDER[0]: np.zeros((4, 4, 3), dtype=np.uint8),
         _EXPECTED_CAMERA_ORDER[2]: np.full((4, 4, 3), 255, dtype=np.uint8),
+    }
+    if explicit_none:
+        images[_EXPECTED_CAMERA_ORDER[1]] = None
+    observation = {
+        "images": images,
         "state": np.zeros(32, dtype=np.float32),
     }
 
     images, masks, _, _ = build_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"))
 
-    assert [bool(mask.item()) for mask in masks] == [True, True, False]
+    assert [bool(mask.item()) for mask in masks] == [True, False, True]
     assert torch.all(images[0] == -1.0)
-    assert torch.all(images[1] == 1.0), "right camera must compact into slot 1"
-    assert torch.all(images[2] == -1.0), "empty graph padding belongs at the tail"
+    assert torch.all(images[1] == -1.0), "missing left camera must retain an empty slot"
+    assert torch.all(images[2] == 1.0), "right camera must remain in slot 2"
+
+
+def test_build_model_inputs_pads_when_feature_keys_are_shorter_than_max_cameras():
+    config = Pi05Config(image_feature_keys=_EXPECTED_CAMERA_ORDER[:2], max_cameras=3)
+    observation = {
+        "images": {
+            _EXPECTED_CAMERA_ORDER[0]: np.zeros((4, 4, 3), dtype=np.uint8),
+            _EXPECTED_CAMERA_ORDER[1]: np.full((4, 4, 3), 255, dtype=np.uint8),
+        },
+        "state": np.zeros(32, dtype=np.float32),
+    }
+
+    images, masks, _, _ = build_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"))
+
+    assert len(images) == 3
+    assert [bool(mask.item()) for mask in masks] == [True, True, False]
+    assert torch.all(images[2] == -1.0)
+
+
+def test_build_model_inputs_truncates_feature_keys_to_max_cameras():
+    config = Pi05Config(image_feature_keys=_EXPECTED_CAMERA_ORDER, max_cameras=2)
+    observation = {
+        "images": {
+            key: np.full((4, 4, 3), value, dtype=np.uint8) for key, value in zip(_EXPECTED_CAMERA_ORDER, [0, 127, 255])
+        },
+        "state": np.zeros(32, dtype=np.float32),
+    }
+
+    images, masks, _, _ = build_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"))
+
+    assert len(images) == 2
+    assert [bool(mask.item()) for mask in masks] == [True, True]
+    assert not torch.all(images[1] == 1.0), "the third configured camera must be truncated"
 
 
 def test_build_model_inputs_requires_state():
@@ -903,28 +965,42 @@ def test_pi0_shaped_keys_are_not_silently_loaded():
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("num_views", [1, 2, 3])
-def test_prefix_length_and_valid_len_for_each_view_count(num_views, tiny_model):
-    """The input contract: ``256 * views + 200`` total, with only the *valid*
-    length varying per request."""
+@pytest.mark.parametrize("num_real_views", [1, 2, 3])
+def test_prefix_length_is_fixed_and_valid_len_tracks_masks(num_real_views, tiny_model):
+    """The deployed model has three slots; only their validity varies."""
     live_text = 120
-    images = [torch.zeros(1, 3, 224, 224) for _ in range(num_views)]
-    masks = [torch.tensor([True]) for _ in range(num_views)]
+    images = [torch.zeros(1, 3, 224, 224) for _ in range(3)]
+    masks = [torch.tensor([index < num_real_views]) for index in range(3)]
     lang = torch.zeros(1, 200, dtype=torch.long)
     lang_mask = torch.zeros(1, 200, dtype=torch.bool)
     lang_mask[:, :live_text] = True
 
     embs, pad_masks, _ = tiny_model.embed_prefix(images, masks, lang, lang_mask)
-    assert embs.shape[1] == 256 * num_views + 200
-    assert int(pad_masks.sum()) == 256 * num_views + live_text
+    assert embs.shape[1] == 256 * 3 + 200
+    assert int(pad_masks.sum()) == 256 * num_real_views + live_text
+
+
+@pytest.mark.slow
+def test_embed_prefix_rejects_mismatched_image_mask_counts(tiny_model):
+    with pytest.raises(ValueError, match="same number of views"):
+        tiny_model.embed_prefix([torch.zeros(1, 3, 224, 224)], [], torch.zeros(1, 200), torch.ones(1, 200))
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("num_views", [0, 1, 2, 4])
+def test_embed_prefix_requires_configured_view_count(num_views, tiny_model):
+    images = [torch.zeros(1, 3, 224, 224) for _ in range(num_views)]
+    masks = [torch.tensor([True]) for _ in range(num_views)]
+    with pytest.raises(ValueError, match="exactly max_cameras=3"):
+        tiny_model.embed_prefix(images, masks, torch.zeros(1, 200), torch.ones(1, 200))
 
 
 @pytest.mark.slow
 def test_sample_actions_shape_and_determinism(tiny_model):
     """Flow matching is an ODE: fixed noise must give a bit-identical chunk."""
     model = tiny_model.eval()
-    images = [torch.zeros(1, 3, 224, 224)]
-    masks = [torch.tensor([True])]
+    images = [torch.zeros(1, 3, 224, 224) for _ in range(3)]
+    masks = [torch.tensor([True]), torch.tensor([False]), torch.tensor([False])]
     lang = torch.zeros(1, 200, dtype=torch.long)
     lang_mask = torch.ones(1, 200, dtype=torch.bool)
     noise = torch.randn(1, 4, 8, generator=torch.Generator().manual_seed(42))
@@ -993,8 +1069,8 @@ def test_bfloat16_runs_and_tracks_float32(tiny_model):
     """
     import copy
 
-    images = [torch.zeros(1, 3, 224, 224)]
-    masks = [torch.tensor([True])]
+    images = [torch.zeros(1, 3, 224, 224) for _ in range(3)]
+    masks = [torch.tensor([True]), torch.tensor([False]), torch.tensor([False])]
     lang = torch.zeros(1, 200, dtype=torch.long)
     lang_mask = torch.ones(1, 200, dtype=torch.bool)
     noise = torch.randn(1, 4, 8, generator=torch.Generator().manual_seed(7))
