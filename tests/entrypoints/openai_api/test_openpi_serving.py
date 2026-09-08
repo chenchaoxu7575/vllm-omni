@@ -218,8 +218,8 @@ def test_build_request_uses_unique_engine_request_id_per_inference():
     assert request_a.request_id != request_b.request_id
 
 
-# Per-request inference parameters live in a strict namespace so robot feature
-# names remain open-ended without making engine option typos silent.
+# Per-request inference parameters live in their own namespace so robot feature
+# names stay open-ended. Unknown keys inside it are ignored rather than rejected.
 def test_build_request_forwards_num_inference_steps():
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
 

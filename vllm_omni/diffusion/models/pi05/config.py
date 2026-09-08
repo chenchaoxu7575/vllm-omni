@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
@@ -49,10 +49,6 @@ ACTION = "action"
 OBS_STR = "observation"
 OBS_STATE = OBS_STR + ".state"
 OBS_IMAGES = OBS_STR + ".images"
-
-# π0.5 discretizes normalized state into this many bins before serializing it
-# into the prompt. Ref: openpi ``PaliGemmaTokenizer.tokenize()``.
-DEFAULT_STATE_NUM_BINS = 256
 
 
 class UnsupportedCheckpointCapabilityError(ValueError):
@@ -79,43 +75,26 @@ def resolve_excluded_action_indices(
     cannot be resolved — an unresolvable exclusion would otherwise silently
     become "make this dimension relative too".
     """
-    if not exclude_joints:
+    if not [name for name in (exclude_joints or []) if name]:
         return []
     if not action_names:
         raise UnsupportedCheckpointCapabilityError(
             f"Cannot resolve relative_exclude_joints={exclude_joints!r} without action_feature_names."
         )
 
-    indices: list[int] = []
-    unresolved: list[str] = []
-    for name in exclude_joints:
-        exact = [i for i, candidate in enumerate(action_names) if candidate == name]
-        hits = exact or [i for i, candidate in enumerate(action_names) if name in candidate]
-        if not hits:
-            unresolved.append(name)
-        indices.extend(hits)
+    # LeRobot walks the action names and excludes each one any token equals or is
+    # contained in, both lowercased. Walking the tokens instead and stopping at the
+    # first exact hit misses a second name the token is a substring of.
+    tokens = [str(name).lower() for name in exclude_joints if name]
+    lowered = [str(name).lower() for name in action_names]
+    indices = [i for i, name in enumerate(lowered) if any(t == name or t in name for t in tokens)]
+    unresolved = [t for t in tokens if not any(t == name or t in name for name in lowered)]
 
     if unresolved:
         raise UnsupportedCheckpointCapabilityError(
             f"relative_exclude_joints entries {unresolved!r} match no entry in action_feature_names={action_names!r}."
         )
     return sorted(set(indices))
-
-
-def _declared_width(feature: Mapping[str, Any], label: str, width_name: str, cap: int) -> int:
-    """Read the single-axis width off a LeRobot ``PolicyFeature`` entry."""
-    shape = feature.get("shape")
-    if (
-        not isinstance(shape, (list, tuple))
-        or len(shape) != 1
-        or isinstance(shape[0], bool)
-        or not isinstance(shape[0], int)
-        or shape[0] < 1
-    ):
-        raise ValueError(f"{label}.shape must be [{width_name}], got {shape!r}.")
-    if shape[0] > cap:
-        raise ValueError(f"Checkpoint {width_name}={shape[0]} exceeds max_{width_name}={cap}.")
-    return int(shape[0])
 
 
 @dataclass
@@ -147,8 +126,9 @@ class Pi05Config:
     # Number of camera slots the model attends to (real + padded).
     max_cameras: int = 3
 
-    # π0.5-specific: number of bins the normalized state is discretized into.
-    state_num_bins: int = DEFAULT_STATE_NUM_BINS
+    # Bins the normalized state is discretized into before it enters the prompt.
+    # Ref: openpi PaliGemmaTokenizer.tokenize().
+    state_num_bins: int = 256
 
     # Weight dtype the checkpoint was saved in.
     dtype: str = "float32"
@@ -167,10 +147,8 @@ class Pi05Config:
 
     # Per-dataset normalization stats (schema matches LeRobot's
     # ``NormalizerProcessorStep``). ``None`` means identity / pass-through.
-    # π0.5 defaults to quantile mode; see ``_build_norm_buffers``.
+    # π0.5 defaults to quantile mode; see ``processor_pi05.build_norm_stats``.
     norm_stats: dict | None = None
-    # Convenience view of ``norm_stats["state"]`` used by the prompt builder.
-    state_norm_stats: dict | None = None
 
     # Ordered camera-slot identities. Missing keys retain their slot and are
     # represented by an empty image with a false mask during preprocessing.
@@ -218,111 +196,75 @@ class Pi05Config:
         if self.image_feature_keys is None and self.input_features:
             self.image_feature_keys = [key for key in self.input_features if key.startswith(OBS_IMAGES + ".")]
 
-        # ``state_norm_stats`` is just a view onto norm_stats["state"].
-        if self.state_norm_stats is None and isinstance(self.norm_stats, dict):
-            self.state_norm_stats = self.norm_stats.get("state")
+        if self.max_cameras < 1:
+            raise ValueError(f"max_cameras must be at least 1, got {self.max_cameras!r}.")
+        if self.num_inference_steps < 1:
+            # ``dt = -1 / num_steps`` in the Euler loop.
+            raise ValueError(f"num_inference_steps must be at least 1, got {self.num_inference_steps!r}.")
 
-        self._derive_action_dim()
-        self._derive_state_dim()
+        self._derive_widths()
+        self._validate_norm_stats()
         self._validate_policy_server_config()
         self._validate_relative_actions()
+
+    def _validate_norm_stats(self) -> None:
+        """Statistics have to cover the widths the checkpoint declares."""
+        for key, width in (("state", self.state_dim), ("action", self.action_dim)):
+            for name, value in (self.norm_stats or {}).get(key, {}).items():
+                if name != "mode" and len(value) != width:
+                    raise ValueError(f"norm_stats[{key}][{name}] has {len(value)} entries, expected {width}.")
 
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
-    def _derive_action_dim(self) -> None:
-        """Resolve the real action width from the checkpoint output schema."""
-        self.action_dim = self.max_action_dim
-        if not self.output_features:
-            return
-        if not isinstance(self.output_features, Mapping):
-            raise ValueError(f"output_features must be a mapping, got {type(self.output_features).__name__}.")
+    def _derive_widths(self) -> None:
+        """Read the real state and action widths off the checkpoint schema.
 
-        unknown = sorted(set(self.output_features) - {ACTION})
-        if unknown:
-            raise UnsupportedCheckpointCapabilityError(
-                f"π0.5 serving supports only the {ACTION!r} output feature; got {unknown!r}."
-            )
-        feature = self.output_features.get(ACTION)
-        if not isinstance(feature, Mapping):
-            raise ValueError("output_features must declare an 'action' mapping.")
-        feature_type = str(feature.get("type", "")).upper()
-        if feature_type != "ACTION":
-            raise ValueError(f"output_features['action'].type must be 'ACTION', got {feature.get('type')!r}.")
-        self.action_dim = _declared_width(feature, "output_features['action']", "action_dim", self.max_action_dim)
-
-    def _derive_state_dim(self) -> None:
-        """Resolve the real state width from the checkpoint input schema.
-
-        A checkpoint that declares no state feature keeps ``max_state_dim``,
-        which is what LeRobot's ``validate_features`` fills in for that case.
+        π0.5 serializes the state into the prompt at its real width, so a 7-joint
+        checkpoint must not be padded out to ``max_state_dim``. The action chunk
+        is cropped to ``action_dim`` on the way out.
         """
-        self.state_dim = self.max_state_dim
-        if not self.input_features:
-            return
-        if not isinstance(self.input_features, Mapping):
-            raise ValueError(f"input_features must be a mapping, got {type(self.input_features).__name__}.")
-
-        feature = self.input_features.get(OBS_STATE)
-        if feature is None:
-            return
-        if not isinstance(feature, Mapping):
-            raise ValueError(f"input_features[{OBS_STATE!r}] must be a mapping, got {type(feature).__name__}.")
-        feature_type = str(feature.get("type", "")).upper()
-        if feature_type != "STATE":
-            raise ValueError(f"input_features[{OBS_STATE!r}].type must be 'STATE', got {feature.get('type')!r}.")
-        self.state_dim = _declared_width(feature, f"input_features[{OBS_STATE!r}]", "state_dim", self.max_state_dim)
+        state = self.input_features.get(OBS_STATE) or {}
+        action = self.output_features.get(ACTION) or {}
+        if state.get("type", "STATE").upper() != "STATE":
+            raise ValueError(f"input_features[{OBS_STATE!r}].type must be STATE, got {state['type']!r}.")
+        if action.get("type", "ACTION").upper() != "ACTION":
+            raise ValueError(f"output_features[{ACTION!r}].type must be ACTION, got {action['type']!r}.")
+        self.state_dim = int(state["shape"][0]) if state else self.max_state_dim
+        self.action_dim = int(action["shape"][0]) if action else self.max_action_dim
+        if self.state_dim > self.max_state_dim or self.action_dim > self.max_action_dim:
+            raise ValueError(
+                f"Checkpoint declares state_dim={self.state_dim} / action_dim={self.action_dim}, "
+                f"over max_state_dim={self.max_state_dim} / max_action_dim={self.max_action_dim}."
+            )
 
     def _validate_policy_server_config(self) -> None:
-        """Keep OpenPI handshake metadata aligned with the model contract."""
-        if not self.policy_server_config:
-            return
-        if not isinstance(self.policy_server_config, Mapping):
-            raise ValueError("policy_server_config must be a mapping.")
-
+        """The OpenPI handshake has to advertise the resolved contract."""
         expected = {
             "action_horizon": self.chunk_size,
             "action_dim": self.action_dim,
             "max_action_dim": self.max_action_dim,
             "max_cameras": self.max_cameras,
+            "image_resolution": list(self.image_resolution),
         }
         for key, value in expected.items():
-            declared = self.policy_server_config.get(key)
-            if declared is not None and declared != value:
-                raise ValueError(
-                    f"policy_server_config.{key}={declared!r} does not match the resolved π0.5 value {value!r}."
-                )
-        declared_resolution = self.policy_server_config.get("image_resolution")
-        if declared_resolution is not None and tuple(declared_resolution) != self.image_resolution:
-            raise ValueError(
-                "policy_server_config.image_resolution="
-                f"{declared_resolution!r} does not match image_resolution={self.image_resolution!r}."
-            )
+            declared = (self.policy_server_config or {}).get(key)
+            if declared is None:
+                continue
+            if key == "image_resolution":
+                declared = list(declared)
+            if declared != value:
+                raise ValueError(f"policy_server_config.{key}={declared!r} does not match the resolved value {value!r}.")
 
     def _validate_relative_actions(self) -> None:
-        """``relative_exclude_joints`` is only meaningful if we can resolve the
-        names to action indices, which needs ``action_feature_names``.
-
-        Failing loudly here is the whole point: an unresolvable exclusion list
-        would otherwise degrade to "make every dimension relative", which is a
-        wrong-but-plausible action chunk (the gripper would be driven by a
-        delta instead of an absolute command).
-        """
-        if not self.use_relative_actions:
-            return
-        if not self.relative_exclude_joints:
+        """Resolve the excluded joints at load, so a bad name fails before serving."""
+        if not self.use_relative_actions or not self.relative_exclude_joints:
             return
         if not self.action_feature_names:
             raise UnsupportedCheckpointCapabilityError(
-                "config declares use_relative_actions=True with "
-                f"relative_exclude_joints={self.relative_exclude_joints!r}, but "
-                "action_feature_names is missing, so those joint names cannot be "
-                "resolved to action indices. LeRobot fills action_feature_names "
-                "from dataset metadata at training time; a servable checkpoint "
-                "must carry it in config.json. Either add action_feature_names, "
-                "or set relative_exclude_joints=[] to make every dimension relative."
+                f"relative_exclude_joints={self.relative_exclude_joints!r} needs action_feature_names, "
+                "which the checkpoint does not carry."
             )
-        # Resolve eagerly so an unresolvable name fails at load, not mid-request.
         resolve_excluded_action_indices(self.relative_exclude_joints, self.action_feature_names)
 
     # ------------------------------------------------------------------
@@ -348,7 +290,7 @@ class Pi05Config:
             stats = load_lerobot_norm_stats(checkpoint_dir)
             if stats:
                 config.norm_stats = stats
-                config.state_norm_stats = stats.get("state")
+                config._validate_norm_stats()
         return config
 
     @classmethod
@@ -422,17 +364,13 @@ def load_lerobot_norm_stats(checkpoint_dir: str | Path) -> dict[str, dict[str, A
     state_file = step.get("state_file")
     if not state_file:
         logger.info(
-            "π0.5 config: %s declares no normalizer state file — the checkpoint ships no "
-            "normalization stats and the state passes through unchanged.",
+            "π0.5 config: %s declares no normalizer state file; the state passes through.",
             _PREPROCESSOR_JSON,
         )
         return None
     state_path = checkpoint_dir / state_file
     if not state_path.exists():
-        raise FileNotFoundError(
-            f"π0.5 checkpoint preprocessor {preprocessor_path} declares normalizer state "
-            f"{state_file!r}, but {state_path} does not exist."
-        )
+        raise FileNotFoundError(f"{preprocessor_path} declares normalizer state {state_file!r}, which is missing.")
 
     norm_map = {str(k).upper(): str(v).upper() for k, v in ((step.get("config") or {}).get("norm_map") or {}).items()}
 
@@ -445,9 +383,8 @@ def load_lerobot_norm_stats(checkpoint_dir: str | Path) -> dict[str, dict[str, A
         lerobot_mode = norm_map.get(feature_type, "IDENTITY")
         if lerobot_mode not in _NORM_MODE_FROM_LEROBOT:
             raise ValueError(
-                f"π0.5 checkpoint declares normalization mode {lerobot_mode!r} for {feature_type}, "
-                f"which this implementation cannot reproduce. Expected one of "
-                f"{sorted(_NORM_MODE_FROM_LEROBOT)}."
+                f"π0.5 cannot reproduce normalization mode {lerobot_mode!r} for {feature_type}. "
+                f"Expected one of {sorted(_NORM_MODE_FROM_LEROBOT)}."
             )
         selected = _NORM_MODE_FROM_LEROBOT[lerobot_mode]
         if selected is None:
@@ -457,8 +394,7 @@ def load_lerobot_norm_stats(checkpoint_dir: str | Path) -> dict[str, dict[str, A
         missing = [name for name in stat_names if f"{feature_name}.{name}" not in flat]
         if missing:
             raise ValueError(
-                f"π0.5 checkpoint declares {lerobot_mode} normalization for {feature_type} but its "
-                f"normalizer state is missing {missing} for feature {feature_name!r}."
+                f"{feature_type} declares {lerobot_mode} normalization but the state file is missing {missing}."
             )
         stats[stats_key] = {"mode": mode} | {name: flat[f"{feature_name}.{name}"].tolist() for name in stat_names}
 

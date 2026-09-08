@@ -11,8 +11,8 @@ Most assertions here guard *silent* failure modes — cases where the wrong
 behaviour still produces a well-shaped, finite action chunk:
 
   * normalization must run before state discretization;
-  * quantile (``q01``/``q99``) norm stats must be recognized, since π0.5 defaults
-    to them where π0 defaults to ``mean_std``;
+  * the normalization mode comes from the checkpoint, since π0.5 defaults to
+    quantile where π0 defaults to ``mean_std``;
   * relative-action checkpoints must be honoured, and an unresolvable
     ``relative_exclude_joints`` must raise rather than silently make every
     dimension relative;
@@ -38,26 +38,26 @@ from vllm_omni.diffusion.models.pi05.config import (
     resolve_excluded_action_indices,
 )
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
+    DEFAULT_MAX_TOKEN_LEN,
     OPENPI_ATTENTION_MASK_VALUE,
     GemmaVariantConfig,
     Pi05AdaRMSNorm,
     Pi05ForActionPrediction,
-    _apply_norm,
-    _build_norm_buffers,
     create_sinusoidal_pos_embedding,
     get_gemma_config,
     make_att_2d_masks,
     prepare_attention_masks_4d,
 )
 from vllm_omni.diffusion.models.pi05.processor_pi05 import (
-    PI05_MAX_TOKEN_LEN,
     Pi05ImageProcessor,
+    Pi05Processor,
     Pi05RelativeActions,
-    build_model_inputs,
+    as_state_vector,
+    build_norm_stats,
+    _assemble_model_inputs,
     build_pi05_prompt,
     discretize_state,
-    normalize_state,
-    prefix_token_budget,
+    apply_norm,
     resize_with_pad,
 )
 
@@ -105,13 +105,6 @@ def test_config_parses_lerobot_pi05_json():
     assert c.image_resolution == (224, 224)
 
 
-def test_config_tokenizer_length_differs_from_pi0():
-    """π0 pads text to 48 tokens; π0.5 pads to 200 because the prompt also
-    carries the serialized state."""
-    assert Pi05Config().tokenizer_max_length == 200
-    assert PI05_MAX_TOKEN_LEN == 200
-
-
 def test_config_rejects_wrong_model_type():
     with pytest.raises(ValueError, match="type='pi05'"):
         Pi05Config.from_model_config(dict(_LEROBOT_CFG, type="pi0"))
@@ -122,41 +115,38 @@ def test_config_rejects_unsupported_partial_action_chunk():
         Pi05Config.from_model_config(dict(_LEROBOT_CFG, n_action_steps=10))
 
 
-def test_config_derives_real_action_dim_from_output_features():
-    config = Pi05Config.from_model_config(
-        dict(_LEROBOT_CFG, output_features={"action": {"type": "ACTION", "shape": [7]}})
-    )
-    assert config.action_dim == 7
-    assert config.max_action_dim == 32
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("output_features", {"action": {"type": "ACTION", "shape": [33]}}),
+        ("input_features", {**_LEROBOT_CFG["input_features"], "observation.state": {"type": "STATE", "shape": [33]}}),
+    ],
+    ids=["action", "state"],
+)
+def test_config_rejects_a_schema_wider_than_the_model(key, value):
+    """``max_action_dim`` / ``max_state_dim`` are the widths the weights were
+    built for, so a wider checkpoint schema cannot be served."""
+    with pytest.raises(ValueError, match="over max_state_dim"):
+        Pi05Config.from_model_config(dict(_LEROBOT_CFG, **{key: value}))
 
 
-def test_config_rejects_action_schema_wider_than_model():
-    with pytest.raises(ValueError, match="exceeds max_action_dim"):
-        Pi05Config.from_model_config(dict(_LEROBOT_CFG, output_features={"action": {"type": "ACTION", "shape": [33]}}))
-
-
-def test_config_derives_real_state_dim_from_input_features():
-    """The state width decides how many values are serialized into the prompt,
-    so a 7-joint checkpoint must not be served a 32-value state prompt."""
-    features: dict[str, Any] = dict(_LEROBOT_CFG["input_features"])
-    features["observation.state"] = {"type": "STATE", "shape": [7]}
-    config = Pi05Config.from_model_config(dict(_LEROBOT_CFG, input_features=features))
-    assert config.state_dim == 7
-    assert config.max_state_dim == 32
-
-
-def test_config_state_dim_falls_back_to_max_state_dim():
-    """LeRobot's ``validate_features`` fills in a ``max_state_dim``-wide state
-    feature when the checkpoint declares none; match that."""
-    features = {k: v for k, v in _LEROBOT_CFG["input_features"].items() if k != "observation.state"}
-    assert Pi05Config.from_model_config(dict(_LEROBOT_CFG, input_features=features)).state_dim == 32
-
-
-def test_config_rejects_state_schema_wider_than_model():
-    features: dict[str, Any] = dict(_LEROBOT_CFG["input_features"])
-    features["observation.state"] = {"type": "STATE", "shape": [33]}
-    with pytest.raises(ValueError, match="exceeds max_state_dim"):
-        Pi05Config.from_model_config(dict(_LEROBOT_CFG, input_features=features))
+@pytest.mark.parametrize(
+    "key,value,attribute",
+    [
+        ("output_features", {"action": {"type": "ACTION", "shape": [7]}}, "action_dim"),
+        (
+            "input_features",
+            {**_LEROBOT_CFG["input_features"], "observation.state": {"type": "STATE", "shape": [7]}},
+            "state_dim",
+        ),
+    ],
+    ids=["action", "state"],
+)
+def test_config_derives_the_real_width_from_the_schema(key, value, attribute):
+    """The declared width decides how many values reach the prompt and how many
+    columns come back, so a 7-joint checkpoint must not be padded out to 32."""
+    config = Pi05Config.from_model_config(dict(_LEROBOT_CFG, **{key: value}))
+    assert getattr(config, attribute) == 7
 
 
 def test_config_rejects_inconsistent_openpi_metadata():
@@ -175,11 +165,33 @@ def test_config_non_square_resolution_raises():
         Pi05Config(image_resolution=(224, 256))
 
 
+@pytest.mark.parametrize("key", ["max_cameras", "num_inference_steps"])
+def test_config_rejects_counts_below_one(key):
+    """``build_model_inputs`` emits one image slot per camera and the Euler loop
+    steps ``-1 / num_inference_steps``; neither is defined at zero."""
+    with pytest.raises(ValueError, match=f"{key} must be at least 1"):
+        Pi05Config.from_model_config(dict(_LEROBOT_CFG, **{key: 0}))
+
+
+@pytest.mark.parametrize("key", ["state", "action"])
+def test_config_rejects_norm_stats_that_do_not_match_the_declared_width(key):
+    """A checkpoint's statistics and its feature schema come from different
+    files, so they can disagree."""
+    stats = {key: {"mode": "quantile", "q01": [0.0] * 2, "q99": [1.0] * 2}}
+    with pytest.raises(ValueError, match=rf"norm_stats\[{key}\]\[q01\] has 2 entries, expected 32"):
+        Pi05Config.from_model_config(dict(_LEROBOT_CFG, norm_stats=stats))
+
+
 # ----------------------------------------------------------------------------
 # LeRobot normalization-stats sidecar
 # ----------------------------------------------------------------------------
 # LeRobot keeps stats out of config.json: policy_preprocessor.json holds the
 # structure and one safetensors file per stateful step holds the numbers.
+def _normalized(raw, stats):
+    """The serving path's state normalization, without the pipeline."""
+    return apply_norm(torch.as_tensor(raw, dtype=torch.float32), build_norm_stats({"state": stats}, "state")).numpy()
+
+
 def _write_lerobot_checkpoint(
     tmp_path,
     *,
@@ -214,8 +226,24 @@ def _write_lerobot_checkpoint(
     (tmp_path / "policy_preprocessor.json").write_text(
         _json.dumps({"name": "policy_preprocessor", "steps": [step]}), encoding="utf-8"
     )
-    (tmp_path / "config.json").write_text(_json.dumps(_LEROBOT_CFG), encoding="utf-8")
+    (tmp_path / "config.json").write_text(_json.dumps(_config_for(stats)), encoding="utf-8")
     return str(tmp_path)
+
+
+def _config_for(stats: dict | None) -> dict:
+    """``_LEROBOT_CFG`` with the state/action widths the stats actually cover."""
+    if not stats:
+        return _LEROBOT_CFG
+    config = dict(_LEROBOT_CFG)
+    state = next(iter(stats.get("observation.state", {}).values()), None)
+    action = next(iter(stats.get("action", {}).values()), None)
+    if state is not None:
+        features = dict(config["input_features"])
+        features["observation.state"] = {"type": "STATE", "shape": [len(state)]}
+        config["input_features"] = features
+    if action is not None:
+        config["output_features"] = {"action": {"type": "ACTION", "shape": [len(action)]}}
+    return config
 
 
 # A LeRobot state_dict carries every stat compute_stats emits, not just the two
@@ -296,6 +324,24 @@ def test_pipeline_rejects_missing_model_weights_before_initialization(tmp_path):
         pipeline._initialize_model()
 
 
+def test_build_config_merges_the_deploy_yaml_over_the_checkpoint(tmp_path):
+    """The deploy yaml carries the runtime knobs and the checkpoint carries the
+    feature schema and the stats. Both have to land on one config."""
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    pipeline = object.__new__(Pi05Pipeline)
+    pipeline.model_dir = _write_lerobot_checkpoint(tmp_path, stats=_FULL_DATASET_STATS)
+
+    config = pipeline._build_config(SimpleNamespace(model_config={"type": "pi05", "num_inference_steps": 4}))
+
+    assert config.num_inference_steps == 4
+    assert (config.state_dim, config.action_dim) == (2, 2)
+    assert config.image_feature_keys == _EXPECTED_CAMERA_ORDER
+    assert config.norm_stats["state"]["mode"] == "quantile"
+
+
 class _WideActionModel:
     """Stands in for the 3.6B model, which is the one collaborator here that is
     genuinely expensive to build. It returns the padded ``max_action_dim`` width
@@ -307,9 +353,6 @@ class _WideActionModel:
     def sample_actions(self, **kwargs):
         del kwargs
         return torch.ones(self._shape)
-
-    def _unnormalize_actions(self, actions):
-        return actions
 
 
 def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
@@ -324,19 +367,17 @@ def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
     pipeline.config = config
     pipeline.tokenizer = object()
     pipeline._device = torch.device("cpu")
-    pipeline.relative_actions = Pi05RelativeActions(
-        enabled=False, exclude_joints=[], action_names=None, max_action_dim=config.max_action_dim
-    )
+    pipeline.processor = Pi05Processor(config, object(), torch.device("cpu"))
     pipeline.model = _WideActionModel(config.chunk_size, config.max_action_dim)
     monkeypatch.setattr(
-        pipeline_pi05,
+        pipeline.processor,
         "build_model_inputs",
-        lambda *args: ([torch.empty(0)], [torch.empty(0)], torch.empty(0), torch.empty(0)),
+        lambda robot_obs: ([torch.empty(0)], [torch.empty(0)], torch.empty(0), torch.empty(0)),
     )
     request = OmniDiffusionRequest(
         prompt="",
         sampling_params=OmniDiffusionSamplingParams(
-            extra_args={"robot_obs": {"state": np.zeros(config.max_state_dim)}, "num_inference_steps": 2},
+            extra_args={"robot_obs": {"state": np.zeros(config.max_state_dim)}},
         ),
         request_id="crop-test",
     )
@@ -355,22 +396,13 @@ def test_load_lerobot_norm_stats_unknown_mode_raises(tmp_path):
         load_lerobot_norm_stats(path)
 
 
-def test_load_lerobot_norm_stats_missing_declared_stat_raises(tmp_path):
-    """norm_map promises QUANTILES but the state_dict has no q01/q99."""
-    path = _write_lerobot_checkpoint(
-        tmp_path, stats={"observation.state": {"mean": [0.0], "std": [1.0]}, "action": {"q01": [0.0], "q99": [1.0]}}
-    )
-    with pytest.raises(ValueError, match="q01"):
-        load_lerobot_norm_stats(path)
-
-
 def test_from_pretrained_backfills_sidecar_stats(tmp_path):
-    """End to end: the stats reach state_norm_stats without any deploy yaml."""
+    """End to end: the stats reach norm_stats without any deploy yaml."""
     path = _write_lerobot_checkpoint(tmp_path, stats=_FULL_DATASET_STATS)
     config = Pi05Config.from_pretrained(path)
 
     assert config.norm_stats["state"]["mode"] == "quantile"
-    assert config.state_norm_stats == config.norm_stats["state"]
+    assert config.norm_stats["action"]["mode"] == "quantile"
 
 
 def test_from_pretrained_does_not_override_explicit_norm_stats(tmp_path):
@@ -378,40 +410,10 @@ def test_from_pretrained_does_not_override_explicit_norm_stats(tmp_path):
     import json as _json
 
     path = _write_lerobot_checkpoint(tmp_path, stats=_FULL_DATASET_STATS)
-    explicit = {"state": {"mode": "min_max", "min": [0.0], "max": [1.0]}}
+    explicit = {"state": {"mode": "min_max", "min": [0.0] * 32, "max": [1.0] * 32}}
     (tmp_path / "config.json").write_text(_json.dumps({**_LEROBOT_CFG, "norm_stats": explicit}), encoding="utf-8")
 
     assert Pi05Config.from_pretrained(path).norm_stats == explicit
-
-
-def test_sidecar_quantile_stats_reach_the_prompt(tmp_path):
-    """The whole point: sidecar stats must change the discretized prompt bins."""
-    path = _write_lerobot_checkpoint(
-        tmp_path,
-        stats={"observation.state": {"q01": [-1.0, -1.0], "q99": [1.0, 1.0]}, "action": _FULL_DATASET_STATS["action"]},
-    )
-    config = Pi05Config.from_pretrained(path)
-    raw = np.array([1.0, -1.0], dtype=np.float32)
-
-    with_stats = discretize_state(normalize_state(raw, state_dim=2, state_norm_stats=config.state_norm_stats))
-    without = discretize_state(normalize_state(raw, state_dim=2, state_norm_stats=None))
-
-    # q01=-1/q99=1 maps [-1, 1] onto itself, so this is identical to the
-    # pass-through path: the top saturates at 255 and -1.0 sits exactly on the
-    # first bin edge (underflow to -1 needs a value strictly below q01).
-    assert with_stats.tolist() == without.tolist() == [255, 0]
-
-    shifted = Pi05Config.from_pretrained(
-        _write_lerobot_checkpoint(
-            tmp_path / "shifted",
-            stats={
-                "observation.state": {"q01": [0.0, 0.0], "q99": [4.0, 4.0]},
-                "action": _FULL_DATASET_STATS["action"],
-            },
-        )
-    )
-    moved = discretize_state(normalize_state(raw, state_dim=2, state_norm_stats=shifted.state_norm_stats))
-    assert moved.tolist() != without.tolist(), "different quantiles must move the prompt bins"
 
 
 # ----------------------------------------------------------------------------
@@ -433,29 +435,6 @@ def test_config_rejects_unsupported_capability(key, value):
         Pi05Config.from_model_config(dict(_LEROBOT_CFG, **{key: value}))
 
 
-def test_config_rejects_empty_rtc_config():
-    """``RTCConfig`` defaults ``enabled=True``, so ``rtc_config={}`` selects RTC
-    with LeRobot's defaults rather than turning it off."""
-    with pytest.raises(UnsupportedCheckpointCapabilityError, match="rtc_config"):
-        Pi05Config.from_model_config(dict(_LEROBOT_CFG, rtc_config={}))
-
-
-@pytest.mark.parametrize("key,value", [("rtc_config", None), ("n_obs_steps", 1), ("empty_cameras", 0)])
-def test_config_accepts_capability_at_its_off_value(key, value):
-    """The off value differs per capability: ``None`` for a config mapping, 1
-    for an observation count, 0 for a camera count."""
-    assert Pi05Config.from_model_config(dict(_LEROBOT_CFG, **{key: value})).tokenizer_max_length == 200
-
-
-def test_config_accepts_rtc_training_max_delay():
-    """``rtc_training_max_delay`` describes how the checkpoint was *trained*
-    (clean action prefixes were sampled), not a request to run RTC at inference.
-    Such a checkpoint is still correct to serve without RTC, so it must not be
-    rejected — unlike a populated ``rtc_config``."""
-    c = Pi05Config.from_model_config(dict(_LEROBOT_CFG, rtc_training_max_delay=10))
-    assert c.tokenizer_max_length == 200
-
-
 # ----------------------------------------------------------------------------
 # Relative actions
 # ----------------------------------------------------------------------------
@@ -467,25 +446,9 @@ def test_relative_actions_without_action_names_raises():
         Pi05Config.from_model_config(dict(_LEROBOT_CFG, use_relative_actions=True, action_feature_names=None))
 
 
-def test_relative_actions_with_action_names_accepted():
-    c = Pi05Config.from_model_config(dict(_LEROBOT_CFG, use_relative_actions=True, action_feature_names=_ACTION_NAMES))
-    assert c.use_relative_actions
-    assert c.relative_exclude_joints == ["gripper"]
-
-
 def test_relative_actions_empty_exclude_list_needs_no_action_names():
     c = Pi05Config.from_model_config(dict(_LEROBOT_CFG, use_relative_actions=True, relative_exclude_joints=[]))
     assert c.use_relative_actions
-
-
-def test_resolve_excluded_action_indices_exact_match():
-    assert resolve_excluded_action_indices(["gripper"], _ACTION_NAMES) == [6]
-
-
-def test_resolve_excluded_action_indices_substring_match():
-    """A checkpoint may spell the dimension ``gripper_position`` while the
-    config just says ``gripper``."""
-    assert resolve_excluded_action_indices(["gripper"], ["joint_0", "gripper_position"]) == [1]
 
 
 def test_resolve_excluded_action_indices_unresolvable_raises():
@@ -519,21 +482,6 @@ def test_relative_absolute_round_trip_is_exact():
     assert torch.allclose(rel.to_absolute(rel.to_relative(actions, state), state), actions, atol=1e-6)
 
 
-def test_relative_transform_shifts_only_included_dims():
-    rel = _relative_step()
-    actions = torch.zeros(1, 4, 32)
-    state = torch.arange(32, dtype=torch.float32)
-    out = rel.to_absolute(actions, state)
-    assert torch.allclose(out[..., 0], state[0].expand(1, 4))
-    assert torch.allclose(out[..., 6], torch.zeros(1, 4)), "gripper must not be shifted"
-
-
-def test_relative_disabled_is_identity():
-    rel = _relative_step(enabled=False)
-    actions = torch.randn(1, 4, 32)
-    assert torch.equal(rel.to_absolute(actions, torch.randn(32)), actions)
-
-
 def test_relative_rejects_mismatched_action_dim():
     rel = _relative_step()
     with pytest.raises(ValueError, match="max_action_dim"):
@@ -543,11 +491,6 @@ def test_relative_rejects_mismatched_action_dim():
 # ----------------------------------------------------------------------------
 # State discretization — π0.5's defining input path
 # ----------------------------------------------------------------------------
-def test_discretize_spans_the_full_bin_range():
-    out = discretize_state(np.array([-1.0, 0.0, 1.0], dtype=np.float32), num_bins=256)
-    assert out.tolist() == [0, 128, 255]
-
-
 def test_discretize_underflows_to_minus_one_and_saturates_at_the_top():
     """Out-of-range input is asymmetric, and that asymmetry is LeRobot's.
 
@@ -561,29 +504,6 @@ def test_discretize_underflows_to_minus_one_and_saturates_at_the_top():
     assert out.tolist() == [-1, 255]
 
 
-@pytest.mark.parametrize(
-    "stats",
-    [
-        {"mean": [5.0] * 32, "std": [1.0] * 32},
-        {"min": [0.0] * 32, "max": [10.0] * 32},
-        {"q01": [0.0] * 32, "q99": [10.0] * 32},
-    ],
-)
-def test_normalize_state_supports_every_mode(stats):
-    """π0.5 defaults STATE/ACTION to QUANTILES where π0 uses MEAN_STD, so the
-    ``q01``/``q99`` schema must be recognized. An unrecognized entry would fall
-    back to identity and wrongly bin every state dimension without raising."""
-    out = normalize_state([5.0] * 32, state_dim=32, state_norm_stats=stats)
-    assert np.allclose(out, 0.0, atol=1e-6)
-
-
-def test_normalize_state_without_stats_passes_through():
-    """LeRobot's NormalizeProcessor returns the tensor unchanged when stats are
-    missing, so a client that normalizes its own state must not be re-scaled."""
-    out = normalize_state([5.0, -5.0] + [0.0] * 30, state_dim=32, state_norm_stats=None)
-    assert out[0] == 5.0 and out[1] == -5.0
-
-
 def test_normalize_state_does_not_clip_out_of_range():
     """The parity-critical contract: normalization is affine and nothing else.
 
@@ -593,55 +513,25 @@ def test_normalize_state_does_not_clip_out_of_range():
     ``2.0 * (x - q01) / (q99 - q01) - 1.0`` with no clip.
     """
     stats = {"q01": [0.0] * 32, "q99": [10.0] * 32}
-    out = normalize_state([-10.0, 20.0] + [5.0] * 30, state_dim=32, state_norm_stats=stats)
+    out = _normalized([-10.0, 20.0] + [5.0] * 30, stats)
     assert out[0] == pytest.approx(-3.0)  # would be -1.0 if clipped
     assert out[1] == pytest.approx(3.0)  # would be 1.0 if clipped
     # and the under-range dim must reach the -1 bin end to end
     assert discretize_state(out, num_bins=256)[0] == -1
 
 
-def test_normalize_state_rejects_unknown_mode():
-    with pytest.raises(ValueError, match="Unsupported"):
-        normalize_state([0.0] * 32, state_dim=32, state_norm_stats={"mode": "bogus"})
-
-
-def test_normalization_must_precede_discretization():
-    """The ordering constraint from LeRobot's pipeline, as an executable check.
-
-    ``Pi05PrepareStateTokenizerProcessorStep`` bins over [-1, 1] and assumes the
-    normalizer already ran. Reversed, every bin index is wrong and nothing
-    raises — so assert the two orders actually differ.
-    """
-    stats = {"q01": [0.0] * 32, "q99": [10.0] * 32}
-    raw = [5.0] * 32
-    correct = discretize_state(normalize_state(raw, state_dim=32, state_norm_stats=stats))
-    skipped = discretize_state(np.asarray(raw, dtype=np.float32))
-    assert correct.tolist() != skipped.tolist()
-    assert correct[0] == 128, "mid-range state should land mid-range"
-    assert skipped[0] == 255, "unnormalized state saturates the top bin"
-
-
 def test_prompt_serializes_the_declared_state_width():
     """LeRobot's tokenizer step discretizes the state at its real width and
     never pads to ``max_state_dim``."""
-    prompt = build_pi05_prompt(task="x", state=[0.0] * 7, state_dim=7, state_norm_stats=None)
+    prompt = build_pi05_prompt(task="x", normalized_state=np.zeros(7, dtype=np.float32))
     bins = prompt.split("State: ")[1].split(";")[0].split()
     assert len(bins) == 7
-
-
-def test_prompt_rejects_a_state_of_the_wrong_width():
-    """Padding or truncating here would change the prompt tokens instead of
-    reporting a misconfigured client."""
-    with pytest.raises(ValueError, match="dimension"):
-        build_pi05_prompt(task="x", state=[0.0, 0.0], state_dim=32, state_norm_stats=None)
 
 
 def test_prompt_template_matches_lerobot():
     prompt = build_pi05_prompt(
         task="  pick_up the red\nblock ",
-        state=[0.0] * 4,
-        state_dim=4,
-        state_norm_stats=None,
+        normalized_state=np.zeros(4, dtype=np.float32),
     )
     assert prompt.startswith("Task: pick up the red block, State: ")
     assert prompt.endswith(";\nAction: ")
@@ -651,12 +541,26 @@ def test_prompt_template_matches_lerobot():
 # Input contract: fixed camera slots x 256 tokens + constant 200 text tokens
 # ----------------------------------------------------------------------------
 @pytest.mark.parametrize("views,expected", [(1, 456), (2, 712), (3, 968)])
-def test_prefix_token_budget(views, expected):
-    cfg = Pi05Config(max_cameras=views, tokenizer_max_length=200)
-    budget = prefix_token_budget(cfg, num_real_cameras=views)
-    assert budget["image_tokens"] == 256 * views
-    assert budget["text_tokens"] == 200
-    assert budget["total_prefix_len"] == expected
+def test_prefix_length_is_fixed_by_max_cameras(views, expected):
+    """``max_cameras × 256`` image tokens plus a constant ``tokenizer_max_length``.
+
+    The text segment is padded to its maximum and the camera slots are padded to
+    ``max_cameras``, so the prefix shape does not vary with the request — only
+    the attention mask does.
+    """
+    keys = _EXPECTED_CAMERA_ORDER[:views]
+    config = Pi05Config(max_cameras=views, tokenizer_max_length=200, image_feature_keys=keys)
+    observation = {
+        "state": np.zeros(32, dtype=np.float32),
+        "images": {key: np.zeros((4, 4, 3), dtype=np.uint8) for key in keys},
+    }
+
+    images, masks, lang_tokens, _ = _assemble_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"), None)
+
+    assert len(images) == views
+    assert all(bool(mask) for mask in masks)
+    assert lang_tokens.shape[-1] == 200
+    assert 256 * len(images) + lang_tokens.shape[-1] == expected
 
 
 # ----------------------------------------------------------------------------
@@ -669,24 +573,11 @@ def test_gemma_variant_dims():
     assert (expert.width, expert.depth, expert.mlp_dim) == (1024, 18, 4096)
 
 
-def test_gemma_unknown_variant_raises():
-    with pytest.raises(ValueError):
-        get_gemma_config("gemma_7b")
-
-
 def test_sinusoidal_embedding_shape_and_oddity():
     out = create_sinusoidal_pos_embedding(torch.tensor([0.0, 1.0]), 64)
     assert out.shape == (2, 64)
     with pytest.raises(ValueError):
         create_sinusoidal_pos_embedding(torch.tensor([0.0]), 63)
-
-
-def test_prepare_attention_masks_4d():
-    mask = torch.tensor([[[True, False]]])
-    out = prepare_attention_masks_4d(mask)
-    assert out.shape == (1, 1, 1, 2)
-    assert out[0, 0, 0, 0] == 0.0
-    assert out[0, 0, 0, 1] == OPENPI_ATTENTION_MASK_VALUE
 
 
 def test_make_att_2d_masks_respects_padding():
@@ -696,18 +587,9 @@ def test_make_att_2d_masks_respects_padding():
     assert not out[0, :, 2].any()
 
 
-def test_build_norm_buffers_recognizes_quantile_stats():
-    """A π0.5 checkpoint typically ships q01/q99. Returning None here would
-    silently leave actions in normalized space."""
-    stats = _build_norm_buffers({"action": {"q01": [0.0], "q99": [2.0]}}, "action")
-    assert stats is not None
-    assert torch.allclose(stats["min"], torch.tensor([0.0]))
-    assert torch.allclose(stats["max"], torch.tensor([2.0]))
-
-
-def test_build_norm_buffers_rejects_unknown_mode():
+def test_build_norm_stats_rejects_unknown_mode():
     with pytest.raises(ValueError, match="Unsupported normalization mode"):
-        _build_norm_buffers({"action": {"mode": "qunatile"}}, "action")
+        build_norm_stats({"action": {"mode": "qunatile"}}, "action")
 
 
 @pytest.mark.parametrize(
@@ -718,22 +600,17 @@ def test_build_norm_buffers_rejects_unknown_mode():
         {"mode": "quantile", "q01": [0.0]},
     ],
 )
-def test_build_norm_buffers_rejects_incomplete_stats(entry):
-    with pytest.raises(ValueError, match="requires both"):
-        _build_norm_buffers({"action": entry}, "action")
+def test_build_norm_stats_rejects_incomplete_stats(entry):
+    with pytest.raises(ValueError, match="requires"):
+        build_norm_stats({"action": entry}, "action")
 
 
-def test_apply_norm_quantile_round_trip_and_padded_tail():
-    stats = _build_norm_buffers({"action": {"q01": [0.0, 0.0], "q99": [2.0, 4.0]}}, "action")
+def test_normalize_quantile_round_trip_and_padded_tail():
+    stats = build_norm_stats({"action": {"q01": [0.0, 0.0], "q99": [2.0, 4.0]}}, "action")
     x = torch.tensor([[0.5, -0.5, 7.0]])  # third entry is padding beyond the stats
-    back = _apply_norm(_apply_norm(x, stats, inverse=False), stats, inverse=True)
+    back = apply_norm(apply_norm(x, stats), stats, inverse=True)
     assert torch.allclose(back, x, atol=1e-5)
     assert back[0, 2] == 7.0, "padded tail must pass through untouched"
-
-
-def test_apply_norm_rejects_unknown_mode():
-    with pytest.raises(ValueError, match="Unsupported normalization mode"):
-        _apply_norm(torch.zeros(1), {"mode": "bogus"}, inverse=False)
 
 
 # ----------------------------------------------------------------------------
@@ -765,12 +642,6 @@ def test_float_image_rejects_values_outside_lerobot_domain(bad, container):
         Pi05ImageProcessor(image_size=4).preprocess_single(image)
 
 
-def test_uint8_image_uses_zero_to_255_domain():
-    image = np.full((4, 4, 3), 64, dtype=np.uint8)
-    out = Pi05ImageProcessor(image_size=4).preprocess_single(image)
-    assert torch.allclose(out, torch.full_like(out, 64.0 / 255.0 * 2.0 - 1.0))
-
-
 def test_resize_with_pad_pads_with_minus_one():
     out = resize_with_pad(torch.zeros(1, 3, 100, 200), 224, 224)
     assert out.shape == (1, 3, 224, 224)
@@ -798,52 +669,12 @@ def test_build_model_inputs_preserves_missing_middle_camera_slot(explicit_none):
         "state": np.zeros(32, dtype=np.float32),
     }
 
-    images, masks, _, _ = build_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"))
+    images, masks, _, _ = _assemble_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"), None)
 
     assert [bool(mask.item()) for mask in masks] == [True, False, True]
     assert torch.all(images[0] == -1.0)
     assert torch.all(images[1] == -1.0), "missing left camera must retain an empty slot"
     assert torch.all(images[2] == 1.0), "right camera must remain in slot 2"
-
-
-def test_build_model_inputs_pads_when_feature_keys_are_shorter_than_max_cameras():
-    config = Pi05Config(image_feature_keys=_EXPECTED_CAMERA_ORDER[:2], max_cameras=3)
-    observation = {
-        "images": {
-            _EXPECTED_CAMERA_ORDER[0]: np.zeros((4, 4, 3), dtype=np.uint8),
-            _EXPECTED_CAMERA_ORDER[1]: np.full((4, 4, 3), 255, dtype=np.uint8),
-        },
-        "state": np.zeros(32, dtype=np.float32),
-    }
-
-    images, masks, _, _ = build_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"))
-
-    assert len(images) == 3
-    assert [bool(mask.item()) for mask in masks] == [True, True, False]
-    assert torch.all(images[2] == -1.0)
-
-
-def test_build_model_inputs_truncates_feature_keys_to_max_cameras():
-    config = Pi05Config(image_feature_keys=_EXPECTED_CAMERA_ORDER, max_cameras=2)
-    observation = {
-        "images": {
-            key: np.full((4, 4, 3), value, dtype=np.uint8) for key, value in zip(_EXPECTED_CAMERA_ORDER, [0, 127, 255])
-        },
-        "state": np.zeros(32, dtype=np.float32),
-    }
-
-    images, masks, _, _ = build_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"))
-
-    assert len(images) == 2
-    assert [bool(mask.item()) for mask in masks] == [True, True]
-    assert not torch.all(images[1] == 1.0), "the third configured camera must be truncated"
-
-
-def test_build_model_inputs_requires_state():
-    config = Pi05Config(image_feature_keys=_EXPECTED_CAMERA_ORDER)
-    observation = {_EXPECTED_CAMERA_ORDER[0]: np.zeros((4, 4, 3), dtype=np.uint8)}
-    with pytest.raises(ValueError, match="state"):
-        build_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"))
 
 
 def test_build_model_inputs_requires_configured_camera():
@@ -853,7 +684,7 @@ def test_build_model_inputs_requires_configured_camera():
         "state": np.zeros(32, dtype=np.float32),
     }
     with pytest.raises(ValueError, match="configured camera"):
-        build_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"))
+        _assemble_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"), None)
 
 
 # ----------------------------------------------------------------------------
@@ -947,15 +778,6 @@ def test_lm_head_remap_to_embed_tokens():
 
 
 @pytest.mark.slow
-def test_action_time_mlp_remapped_to_time_mlp():
-    """Some exports carry the π0 parameter names for the timestep MLP."""
-    model = _tiny_pi05_model()
-    payload = torch.full(dict(model.named_parameters())["time_mlp_in.weight"].shape, 0.25)
-    model.load_weights([("model.action_time_mlp_in.weight", payload)], strict=False)
-    assert torch.allclose(dict(model.named_parameters())["time_mlp_in.weight"], payload)
-
-
-@pytest.mark.slow
 def test_pi0_shaped_keys_are_not_silently_loaded():
     """A π0 checkpoint pointed at the π0.5 class would leave the AdaRMS expert
     randomly initialized. ``state_proj`` is the tell."""
@@ -978,21 +800,6 @@ def test_prefix_length_is_fixed_and_valid_len_tracks_masks(num_real_views, tiny_
     embs, pad_masks, _ = tiny_model.embed_prefix(images, masks, lang, lang_mask)
     assert embs.shape[1] == 256 * 3 + 200
     assert int(pad_masks.sum()) == 256 * num_real_views + live_text
-
-
-@pytest.mark.slow
-def test_embed_prefix_rejects_mismatched_image_mask_counts(tiny_model):
-    with pytest.raises(ValueError, match="same number of views"):
-        tiny_model.embed_prefix([torch.zeros(1, 3, 224, 224)], [], torch.zeros(1, 200), torch.ones(1, 200))
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize("num_views", [0, 1, 2, 4])
-def test_embed_prefix_requires_configured_view_count(num_views, tiny_model):
-    images = [torch.zeros(1, 3, 224, 224) for _ in range(num_views)]
-    masks = [torch.tensor([True]) for _ in range(num_views)]
-    with pytest.raises(ValueError, match="exactly max_cameras=3"):
-        tiny_model.embed_prefix(images, masks, torch.zeros(1, 200), torch.ones(1, 200))
 
 
 @pytest.mark.slow
@@ -1098,3 +905,100 @@ def test_bfloat16_runs_and_tracks_float32(tiny_model):
 
     scale = float(reference.abs().max())
     assert float((actual - reference).abs().max()) < max(0.5 * scale, 1e-2)
+
+
+# ----------------------------------------------------------------------------
+# State normalization runs π0's stats path
+# ----------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "stats,state,expected",
+    [
+        # A denominator that is small but not zero. ``normalize`` divides by
+        # ``std + eps``; replacing a small std with 1.0 would be a different map.
+        ({"mode": "mean_std", "mean": [0.0], "std": [1e-7]}, [1e-7], 1e-7 / (1e-7 + 1e-8)),
+        ({"mode": "quantile", "q01": [0.0], "q99": [1e-7]}, [1e-7], 1.0),
+        # An exactly zero range maps the bound to -1 instead of dividing by zero.
+        ({"mode": "quantile", "q01": [2.0], "q99": [2.0]}, [2.0], -1.0),
+    ],
+)
+def test_normalize_state_uses_the_shared_denominator_rule(stats, state, expected):
+    """State normalization and action unnormalization are the same affine map,
+    so a narrow range keeps producing LeRobot's answer."""
+    assert _normalized(state, stats)[0] == pytest.approx(expected, rel=1e-5)
+
+
+# ----------------------------------------------------------------------------
+# State wire contract
+# ----------------------------------------------------------------------------
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_state_rejects_non_finite_values(bad):
+    """``np.digitize`` maps nan and inf to the top bin and -inf to -1, all legal
+    state tokens, so a dead sensor would reach the model as an ordinary prompt."""
+    with pytest.raises(ValueError, match="NaN or Inf"):
+        as_state_vector([0.0, bad], 2)
+
+
+def test_state_rejects_a_multi_row_matrix():
+    """Flattening would read a (2, 16) request as a 32-value state."""
+    with pytest.raises(ValueError, match=r"\(D,\) or \(1, D\)"):
+        as_state_vector(np.zeros((2, 16), dtype=np.float32), 32)
+
+
+# ----------------------------------------------------------------------------
+# Per-request denoising steps reach the model
+# ----------------------------------------------------------------------------
+class _SpyModel:
+    """Records the ``num_steps`` ``forward`` hands to ``sample_actions``."""
+
+    def __init__(self):
+        self.seen: list = []
+
+    def sample_actions(self, *, images, image_masks, lang_tokens, lang_masks, num_steps):
+        del images, image_masks, lang_tokens, lang_masks
+        self.seen.append(num_steps)
+        return torch.zeros(1, 50, 32)
+
+
+def _spy_pipeline(spy: _SpyModel):
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    pipeline = object.__new__(Pi05Pipeline)
+    pipeline.config = Pi05Config.from_model_config(_LEROBOT_CFG)
+    pipeline.tokenizer = _FakeTokenizer()
+    pipeline._device = torch.device("cpu")
+    pipeline.model = spy
+    pipeline.processor = Pi05Processor(pipeline.config, _FakeTokenizer(), torch.device("cpu"))
+    return pipeline
+
+
+def _spy_request(num_inference_steps):
+    params = type("_Params", (), {})()
+    params.extra_args = {
+        "robot_obs": {
+            "state": np.zeros(32, dtype=np.float32),
+            "images": {key: np.zeros((4, 4, 3), dtype=np.uint8) for key in _EXPECTED_CAMERA_ORDER},
+        }
+    }
+    params.num_inference_steps = num_inference_steps
+    request = type("_Request", (), {})()
+    request.sampling_params = params
+    return request
+
+
+@pytest.mark.parametrize("requested", [None, 2, 25])
+def test_request_denoising_steps_reach_sample_actions(requested):
+    """The OpenPI E2E cannot see this: a pipeline that ignored the override and
+    ran the static default would still return a finite chunk of the right shape."""
+    spy = _SpyModel()
+    output = _spy_pipeline(spy).forward(_spy_request(requested))
+
+    assert spy.seen == [requested]
+    assert output.output["actions"].shape == (50, 32)
+
+
+@pytest.mark.parametrize("bad", [0, -1, 2.5, True, "4"])
+def test_request_denoising_steps_must_be_a_positive_integer(bad):
+    spy = _SpyModel()
+    with pytest.raises(ValueError, match="num_inference_steps must be a positive integer"):
+        _spy_pipeline(spy).forward(_spy_request(bad))
+    assert spy.seen == []

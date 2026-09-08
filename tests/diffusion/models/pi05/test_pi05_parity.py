@@ -274,7 +274,12 @@ def test_pi05_prompt_parity():
     """
     from transformers import AutoTokenizer
 
-    from vllm_omni.diffusion.models.pi05.processor_pi05 import build_pi05_prompt, tokenize_prompt
+    from vllm_omni.diffusion.models.pi05.processor_pi05 import (
+        apply_norm,
+        build_norm_stats,
+        build_pi05_prompt,
+        tokenize_prompt,
+    )
 
     lerobot_policy, lerobot_pre, _ = _instantiate_lerobot()
     raw_batch = _create_dummy_batch(batch_size=1)
@@ -285,11 +290,11 @@ def test_pi05_prompt_parity():
     lerobot_tokens = processed[OBS_LANGUAGE_TOKENS][0]
 
     stats = _dummy_dataset_stats()["observation.state"]
+    norm = build_norm_stats({"state": {"q01": stats["q01"], "q99": stats["q99"]}}, "state")
+    normalized = apply_norm(raw_batch["observation.state"][0].float(), norm)
     prompt = build_pi05_prompt(
         task=raw_batch["task"][0],
-        state=raw_batch["observation.state"][0],
-        state_dim=STATE_DIM,
-        state_norm_stats={"q01": stats["q01"], "q99": stats["q99"]},
+        normalized_state=normalized.numpy(),
         state_num_bins=NUM_STATE_BINS,
     )
     tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224", padding_side="right")
@@ -325,10 +330,62 @@ def test_pi05_prompt_parity_across_state_widths(state_dim):
     )
     lerobot_prompt = transition[TransitionKey.COMPLEMENTARY_DATA]["task"][0]
 
-    prompt = build_pi05_prompt(task=task, state=state, state_dim=state_dim, state_norm_stats=None)
+    prompt = build_pi05_prompt(task=task, normalized_state=state.numpy())
 
     assert prompt == lerobot_prompt
     assert len(prompt.split("State: ")[1].split(";")[0].split()) == state_dim
+
+
+@pytest.mark.skipif(not _HAS_LEROBOT, reason="lerobot not installed (run in a lerobot venv).")
+@pytest.mark.parametrize(
+    "lerobot_mode,stats,ours,state,state_dim",
+    [
+        ("MEAN_STD", {"mean": [0.0], "std": [1e-7]}, {"mode": "mean_std", "mean": [0.0], "std": [1e-7]}, [1e-7], 1),
+        ("QUANTILES", {"q01": [0.0], "q99": [1e-7]}, {"mode": "quantile", "q01": [0.0], "q99": [1e-7]}, [1e-7], 1),
+        ("QUANTILES", {"q01": [2.0], "q99": [2.0]}, {"mode": "quantile", "q01": [2.0], "q99": [2.0]}, [2.0], 1),
+        (
+            "QUANTILES",
+            {"q01": [0.0] * 4, "q99": [10.0] * 4},
+            {"mode": "quantile", "q01": [0.0] * 4, "q99": [10.0] * 4},
+            [-10.0, 0.0, 5.0, 20.0],
+            4,
+        ),
+        (
+            "MEAN_STD",
+            {"mean": [1.0, 2.0], "std": [0.5, 4.0]},
+            {"mode": "mean_std", "mean": [1.0, 2.0], "std": [0.5, 4.0]},
+            [3.0, -6.0],
+            2,
+        ),
+        ("MIN_MAX", {"min": [-1.0], "max": [3.0]}, {"mode": "min_max", "min": [-1.0], "max": [3.0]}, [2.0], 1),
+    ],
+)
+def test_pi05_state_normalization_parity(lerobot_mode, stats, ours, state, state_dim):
+    """State normalization against LeRobot's ``NormalizerProcessorStep``.
+
+    The full-policy parity test feeds both sides stats with a wide range, so it
+    cannot see the denominator rule. A wrongly normalized state still discretizes
+    into a well-formed prompt: for ``q01=0, q99=1e-7`` a threshold substitution
+    moves the state token from bin 255 to bin 0.
+    """
+    from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+    from lerobot.processor.normalize_processor import NormalizerProcessorStep
+    from lerobot.utils.constants import OBS_STATE
+
+    from vllm_omni.diffusion.models.pi05.processor_pi05 import apply_norm, build_norm_stats
+
+    step = NormalizerProcessorStep(
+        features={OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(state_dim,))},
+        norm_map={FeatureType.STATE: getattr(NormalizationMode, lerobot_mode)},
+        stats={OBS_STATE: {k: torch.tensor(v, dtype=torch.float32) for k, v in stats.items()}},
+    )
+    expected = step._apply_transform(
+        torch.tensor(state, dtype=torch.float32), OBS_STATE, FeatureType.STATE, inverse=False
+    )
+
+    actual = apply_norm(torch.tensor(state, dtype=torch.float32), build_norm_stats({"state": ours}, "state"))
+
+    assert torch.allclose(actual, expected, atol=1e-6)
 
 
 @pytest.mark.skipif(not _HAS_LEROBOT, reason="lerobot not installed (run in a lerobot venv).")
@@ -341,7 +398,11 @@ def test_pi05_relative_actions_parity():
         OBS_LANGUAGE_TOKENS,
     )
 
-    from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05RelativeActions
+    from vllm_omni.diffusion.models.pi05.processor_pi05 import (
+        Pi05RelativeActions,
+        apply_norm,
+        build_norm_stats,
+    )
 
     action_names = [f"joint_{i}" for i in range(ACTION_DIM - 1)] + ["gripper"]
     lerobot_policy, lerobot_pre, lerobot_post = _instantiate_lerobot(
@@ -377,7 +438,7 @@ def test_pi05_relative_actions_parity():
         action_names=action_names,
         max_action_dim=ACTION_DIM,
     )
-    omni_actions = omni_model._unnormalize_actions(omni_raw)
+    omni_actions = apply_norm(omni_raw, build_norm_stats(cfg.norm_stats, "action"), inverse=True)
     # Per-sample reference state, matching LeRobot: its
     # RelativeActionsProcessorStep caches the whole (B, D) state on the input
     # side and shifts each sample by its own row. Passing a single row here

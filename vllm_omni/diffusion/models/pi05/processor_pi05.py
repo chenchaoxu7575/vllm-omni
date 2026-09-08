@@ -26,6 +26,7 @@ Reference:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -33,15 +34,19 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from vllm_omni.diffusion.models.pi05.config import resolve_excluded_action_indices
+from vllm.logger import init_logger
 
-# Defaults straight from the π0.5 reference configs.
-PI05_IMAGE_SIZE = 224  # openpi/models/model.py IMAGE_RESOLUTION
-PI05_NUM_IMAGE_TOKENS = 256  # SigLIP So400m/14 on 224×224 → (224/14)**2
-PI05_IMAGE_TOKEN_INDEX = 257152  # openpi/models_pytorch/gemma_pytorch.py
-PI05_MAX_CAMERAS = 3  # openpi/models/model.py (3 camera slots)
-PI05_MAX_TOKEN_LEN = 200  # openpi/models/pi0_config.py — π0 uses 48
-PI05_NUM_BINS = 256  # openpi PaliGemmaTokenizer.tokenize()
+from vllm_omni.diffusion.models.pi05.config import resolve_excluded_action_indices
+from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
+    DEFAULT_IMAGE_RESOLUTION,
+    DEFAULT_MAX_TOKEN_LEN,
+    DEFAULT_STATE_NUM_BINS,
+)
+
+logger = init_logger(__name__)
+
+# LeRobot NormalizerProcessorStep.eps.
+NORM_EPS = 1e-8
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -84,7 +89,7 @@ def pil_image_to_tensor(image: Image.Image) -> torch.Tensor:
 class Pi05ImageProcessor:
     """Minimal image preprocessor: image → normalized + padded ``[-1,1]`` tensor."""
 
-    def __init__(self, image_size: int = PI05_IMAGE_SIZE):
+    def __init__(self, image_size: int = DEFAULT_IMAGE_RESOLUTION[0]):
         self.image_size = image_size
 
     def preprocess_single(self, image: Any) -> torch.Tensor:
@@ -106,43 +111,24 @@ class Pi05ImageProcessor:
         if isinstance(image, np.ndarray):
             if image.ndim != 3 or image.shape[-1] != 3:
                 raise ValueError(f"Expected an HWC ndarray with 3 channels, got shape {image.shape}.")
-            if image.dtype == np.uint8:
-                arr = image.astype(np.float32) / 255.0
-            elif np.issubdtype(image.dtype, np.floating):
-                if not np.isfinite(image).all():
-                    raise ValueError("Floating π0.5 image contains NaN or Inf.")
-                min_value = float(image.min())
-                max_value = float(image.max())
-                if min_value < 0.0 or max_value > 1.0:
-                    raise ValueError(
-                        f"Floating π0.5 images must be in [0, 1]; observed min={min_value}, max={max_value}."
-                    )
-                arr = image.astype(np.float32)
-            else:
-                raise TypeError(f"π0.5 ndarray images must use uint8 or floating dtype, got {image.dtype}.")
-            return torch.from_numpy(arr * 2.0 - 1.0).permute(2, 0, 1).unsqueeze(0)
-        if isinstance(image, torch.Tensor):
-            t = image
-            if t.ndim == 3:  # (C, H, W) → (1, C, H, W)
-                t = t.unsqueeze(0)
+            t = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).unsqueeze(0)
+        elif isinstance(image, torch.Tensor):
+            t = image.unsqueeze(0) if image.ndim == 3 else image
             if t.ndim != 4 or t.shape[0] != 1 or t.shape[1] != 3:
                 raise ValueError(f"Expected a CHW tensor (optionally batched once), got shape {tuple(t.shape)}.")
-            if t.dtype == torch.uint8:
-                t = t.to(dtype=torch.float32) / 255.0
-            elif t.is_floating_point():
-                if not torch.isfinite(t).all():
-                    raise ValueError("Floating π0.5 image contains NaN or Inf.")
-                min_value = float(t.amin().item())
-                max_value = float(t.amax().item())
-                if min_value < 0.0 or max_value > 1.0:
-                    raise ValueError(
-                        f"Floating π0.5 images must be in [0, 1]; observed min={min_value}, max={max_value}."
-                    )
-                t = t.to(dtype=torch.float32)
-            else:
-                raise TypeError(f"π0.5 tensor images must use uint8 or floating dtype, got {t.dtype}.")
-            return t * 2.0 - 1.0
-        raise TypeError(f"Unsupported image type for π0.5 preprocessing: {type(image)}")
+        else:
+            raise TypeError(f"Unsupported image type for π0.5 preprocessing: {type(image)}")
+
+        if t.dtype == torch.uint8:
+            return t.to(dtype=torch.float32) / 255.0 * 2.0 - 1.0
+        if not t.is_floating_point():
+            raise TypeError(f"π0.5 images must use uint8 or floating dtype, got {t.dtype}.")
+        if not torch.isfinite(t).all():
+            raise ValueError("Floating π0.5 image contains NaN or Inf.")
+        low, high = float(t.amin()), float(t.amax())
+        if low < 0.0 or high > 1.0:
+            raise ValueError(f"Floating π0.5 images must be in [0, 1]; observed min={low}, max={high}.")
+        return t.to(dtype=torch.float32) * 2.0 - 1.0
 
     def make_empty_image(self) -> torch.Tensor:
         """Fill tensor for an unused camera slot — pure -1, matches OpenPI/LeRobot."""
@@ -150,9 +136,80 @@ class Pi05ImageProcessor:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Normalization (LeRobot NormalizerProcessorStep)
+# ──────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class NormStats:
+    """The affine map a checkpoint's statistics define.
+
+    ``mean_std`` carries mean and std; the two range modes carry the lower and
+    upper bound (``min``/``max``, or the ``q01``/``q99`` quantiles π0.5 ships).
+    """
+
+    mode: str
+    lower: torch.Tensor
+    upper: torch.Tensor
+
+
+def build_norm_stats(norm_stats: dict | None, key: str) -> NormStats | None:
+    """Read ``norm_stats[key]`` into tensors, or ``None`` when it carries none.
+
+    The mode comes from the entry. A LeRobot state_dict ships mean, std, min,
+    max, q01 and q99 at once, so the statistic names present cannot select it.
+    Missing modes default to quantile, which is what LeRobot defaults π0.5's
+    STATE and ACTION to (π0 defaults to mean_std).
+    """
+    entry = (norm_stats or {}).get(key)
+    if not entry:
+        return None
+
+    mode = str(entry.get("mode", "quantile")).lower()
+    if mode == "mean_std":
+        names = ("mean", "std")
+    elif mode == "min_max":
+        names = ("min", "max")
+    elif mode == "quantile":
+        mode, names = "min_max", ("q01", "q99")
+    else:
+        raise ValueError(f"Unsupported normalization mode for {key!r}: {mode!r}.")
+
+    bounds = [entry.get(name) for name in names]
+    if any(bound is None for bound in bounds):
+        raise ValueError(f"Normalization mode {mode!r} for {key!r} requires {names[0]!r} and {names[1]!r}.")
+    lower, upper = (torch.as_tensor(bound, dtype=torch.float32) for bound in bounds)
+    return NormStats(mode=mode, lower=lower, upper=upper)
+
+
+def apply_norm(x: torch.Tensor, stats: NormStats | None, *, inverse: bool = False) -> torch.Tensor:
+    """Map raw units to the model's normalized space, or back with ``inverse``.
+
+    Actions are padded to ``max_action_dim`` while the statistics cover only the
+    real width, so the tail passes through untouched. The eps rules are
+    LeRobot's: ``mean_std`` always divides by ``std + eps``, and the range modes
+    substitute ``eps`` only for an exactly zero range.
+    """
+    if stats is None:
+        return x
+    lower = stats.lower.to(device=x.device, dtype=x.dtype)
+    upper = stats.upper.to(device=x.device, dtype=x.dtype)
+    valid = lower.shape[0]
+    head = x[..., :valid]
+
+    if stats.mode == "mean_std":
+        head = head * upper + lower if inverse else (head - lower) / (upper + NORM_EPS)
+    else:
+        span = (upper - lower).clamp_min(NORM_EPS)
+        head = (head + 1.0) * 0.5 * span + lower if inverse else 2.0 * (head - lower) / span - 1.0
+
+    if valid == x.shape[-1]:
+        return head
+    return torch.cat([head, x[..., valid:]], dim=-1)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # State: normalize → discretize → prompt  (π0.5's defining path)
 # ──────────────────────────────────────────────────────────────────────
-def pad_or_truncate_state(raw_state: Any, width: int) -> np.ndarray:
+def _pad_or_truncate(raw_state: Any, width: int) -> np.ndarray:
     """Zero-pad / truncate a vector to ``(width,)`` float32."""
     if raw_state is None:
         return np.zeros((width,), dtype=np.float32)
@@ -178,7 +235,13 @@ def as_state_vector(raw_state: Any, state_dim: int) -> np.ndarray:
         raise ValueError("π0.5 requires a state; there is no default to fall back on.")
     if isinstance(raw_state, torch.Tensor):
         raw_state = raw_state.detach().cpu().numpy()
-    state = np.asarray(raw_state, dtype=np.float32).reshape(-1)
+    state = np.asarray(raw_state, dtype=np.float32)
+    if state.ndim == 2 and state.shape[0] == 1:
+        state = state[0]
+    if state.ndim != 1:
+        raise ValueError(f"π0.5 state must be shaped (D,) or (1, D); got {tuple(state.shape)}.")
+    if not np.isfinite(state).all():
+        raise ValueError("π0.5 state contains NaN or Inf.")
     if state.shape[0] != state_dim:
         raise ValueError(
             f"π0.5 state has {state.shape[0]} dimension(s), but the checkpoint declares "
@@ -188,86 +251,7 @@ def as_state_vector(raw_state: Any, state_dim: int) -> np.ndarray:
     return state
 
 
-def _stat_vector(value: Any, state_dim: int, fill: float) -> np.ndarray:
-    if value is None:
-        return np.full((state_dim,), fill, dtype=np.float32)
-    return pad_or_truncate_state(value, state_dim)
-
-
-def _infer_norm_mode(stats: dict[str, Any]) -> str | None:
-    """Infer the normalization mode from which stat keys are present.
-
-    LeRobot's π0.5 defaults ``STATE``/``ACTION`` to ``NormalizationMode.QUANTILES``
-    (π0 uses ``MEAN_STD``), so a π0.5 checkpoint typically carries ``q01``/``q99``
-    rather than ``mean``/``std``.
-    """
-    mode = stats.get("mode")
-    if mode is not None:
-        return str(mode).lower()
-    if "mean" in stats and "std" in stats:
-        return "mean_std"
-    if "min" in stats and "max" in stats:
-        return "min_max"
-    if "q01" in stats and "q99" in stats:
-        return "quantile"
-    if "low" in stats and "high" in stats:
-        return "quantile"
-    return None
-
-
-def normalize_state(
-    raw_state: Any,
-    *,
-    state_dim: int,
-    state_norm_stats: dict[str, Any] | None,
-) -> np.ndarray:
-    """Normalize the state to the ``[-1, 1]`` scale ready for discretization.
-
-    **Deliberately does not clip.** LeRobot's ``NormalizeProcessor`` applies the
-    affine map and nothing else (``normalize_processor.py``: ``2.0 * (tensor -
-    q01) / denom - 1.0``), and returns the tensor unchanged when stats are
-    missing. A state outside the quantile range therefore leaves this function
-    outside ``[-1, 1]`` and lands in :func:`discretize_state`'s ``-1`` bin —
-    which is what the checkpoint was trained with. Clamping here would silently
-    rewrite those dimensions to bin ``0`` and change the prompt the model sees;
-    LeRobot parity catches it.
-
-    With no stats the state passes through untouched: a client that already
-    normalizes its own state is a supported deployment mode.
-    """
-    state = as_state_vector(raw_state, state_dim)
-    if not state_norm_stats:
-        return state
-
-    stats = state_norm_stats
-    mode = _infer_norm_mode(stats)
-
-    if mode == "mean_std":
-        mean = _stat_vector(stats.get("mean"), state_dim, 0.0)
-        std = _stat_vector(stats.get("std"), state_dim, 1.0)
-        std = np.where(np.abs(std) < 1e-6, 1.0, std)
-        return (state - mean) / std
-
-    if mode == "min_max":
-        vmin = _stat_vector(stats.get("min"), state_dim, -1.0)
-        vmax = _stat_vector(stats.get("max"), state_dim, 1.0)
-        denom = np.where(np.abs(vmax - vmin) < 1e-6, 1.0, vmax - vmin)
-        return 2.0 * (state - vmin) / denom - 1.0
-
-    if mode == "quantile":
-        low_key = "q01" if "q01" in stats else "low"
-        high_key = "q99" if "q99" in stats else "high"
-        low = _stat_vector(stats.get(low_key), state_dim, -1.0)
-        high = _stat_vector(stats.get(high_key), state_dim, 1.0)
-        denom = np.where(np.abs(high - low) < 1e-6, 1.0, high - low)
-        return 2.0 * (state - low) / denom - 1.0
-
-    raise ValueError(
-        f"Unsupported π0.5 state_norm_stats mode: {mode!r}. Expected one of mean_std / min_max / quantile."
-    )
-
-
-def discretize_state(state: np.ndarray, *, num_bins: int = PI05_NUM_BINS) -> np.ndarray:
+def discretize_state(state: np.ndarray, *, num_bins: int = DEFAULT_STATE_NUM_BINS) -> np.ndarray:
     """Discretize a ``[-1, 1]`` state into ``num_bins`` integer bins.
 
     Byte-for-byte LeRobot's ``processor_pi05.py``::
@@ -291,26 +275,25 @@ def discretize_state(state: np.ndarray, *, num_bins: int = PI05_NUM_BINS) -> np.
 def build_pi05_prompt(
     *,
     task: str,
-    state: Any,
-    state_dim: int,
-    state_norm_stats: dict[str, Any] | None,
-    state_num_bins: int = PI05_NUM_BINS,
+    normalized_state: np.ndarray,
+    state_num_bins: int = DEFAULT_STATE_NUM_BINS,
 ) -> str:
     """Build the π0.5 prompt: instruction + serialized discretized state.
 
     Matches LeRobot's ``Pi05PrepareStateTokenizerProcessorStep``, including the
     task cleanup (``strip``, ``_`` → space, newline → space), the exact template
-    and the ``state_dim`` state values it serializes. The template already ends
-    in a newline, so — unlike π0 — there is no separate newline-appending step.
+    and the state values it serializes. The template already ends in a newline,
+    so — unlike π0 — there is no separate newline-appending step.
+
+    ``normalized_state`` comes from ``Pi05ForActionPrediction._normalize_state``.
     """
     cleaned_task = (task or "").strip().replace("_", " ").replace("\n", " ")
-    normed = normalize_state(state, state_dim=state_dim, state_norm_stats=state_norm_stats)
-    bins = discretize_state(normed, num_bins=state_num_bins)
+    bins = discretize_state(normalized_state, num_bins=state_num_bins)
     state_str = " ".join(str(int(x)) for x in bins.tolist())
     return f"Task: {cleaned_task}, State: {state_str};\nAction: "
 
 
-def tokenize_prompt(tokenizer, text: str, max_token_len: int = PI05_MAX_TOKEN_LEN):
+def tokenize_prompt(tokenizer, text: str, max_token_len: int = DEFAULT_MAX_TOKEN_LEN):
     """Return ``(input_ids, attention_mask)`` lists, length exactly ``max_token_len``.
 
     ``padding="max_length"`` is what makes the prefix a constant shape: the text
@@ -390,22 +373,18 @@ class Pi05RelativeActions:
         Accepts one state for the whole batch (``(D,)``, the serving path,
         where the pipeline runs B=1) or one state per sample (``(B, D)``).
         LeRobot caches the batched state and shifts each sample by its own row,
-        so the per-sample form has to be honoured: ``pad_or_truncate_state``
+        so the per-sample form has to be honoured: ``_pad_or_truncate``
         flattens, which would silently reduce ``(B, D)`` to sample 0's state and
         apply it to every sample — wrong answers, no error.
         """
         if isinstance(state, torch.Tensor):
-            arr = state.detach().cpu().numpy()
-        else:
-            arr = state
-        arr = np.asarray(arr if arr is not None else 0.0, dtype=np.float32)
-        if arr.ndim >= 2:
-            if arr.ndim > 2:
-                raise ValueError(f"Expected state shaped (D,) or (B, D), got {tuple(arr.shape)}")
-            rows = np.stack([pad_or_truncate_state(row, self.max_action_dim) for row in arr])
-            return torch.as_tensor(rows, device=device, dtype=dtype)
-        padded = pad_or_truncate_state(state, self.max_action_dim)
-        return torch.as_tensor(padded, device=device, dtype=dtype)[None, :]
+            state = state.detach().cpu().numpy()
+        arr = np.asarray(0.0 if state is None else state, dtype=np.float32)
+        if arr.ndim > 2:
+            raise ValueError(f"Expected state shaped (D,) or (B, D), got {tuple(arr.shape)}")
+        rows = arr if arr.ndim == 2 else arr[None, :]
+        padded = np.stack([_pad_or_truncate(row, self.max_action_dim) for row in rows])
+        return torch.as_tensor(padded, device=device, dtype=dtype)
 
     def to_relative(self, actions: torch.Tensor, state: Any) -> torch.Tensor:
         """``absolute → relative``. Input side (step 3).
@@ -458,7 +437,7 @@ def _extract_images(robot_obs: dict, config) -> dict[str, Any]:
     images = robot_obs.get("images")
     if not isinstance(images, dict):
         images = {k: v for k, v in robot_obs.items() if _is_image_like(v)}
-    key_map = getattr(config, "image_key_map", None) or {}
+    key_map = config.image_key_map or {}
     return {key_map.get(k, k): v for k, v in images.items() if _is_image_like(v)}
 
 
@@ -475,7 +454,7 @@ def _is_image_like(value: Any) -> bool:
     return False
 
 
-def build_model_inputs(robot_obs: dict, config, tokenizer, device: torch.device):
+def _assemble_model_inputs(robot_obs: dict, config, tokenizer, device: torch.device, state_norm: NormStats | None):
     """Convert a raw robot observation into ``sample_actions`` inputs.
 
     Returns ``(images, image_masks, lang_tokens, lang_masks)`` — note there is
@@ -485,13 +464,9 @@ def build_model_inputs(robot_obs: dict, config, tokenizer, device: torch.device)
     its semantic slot and receives an empty image with a false mask. The output
     always contains exactly ``max_cameras`` slots for the deployed model.
     """
-    state = robot_obs.get("state")
-    if state is None:
-        raise ValueError("π0.5 observation requires a non-null 'state'.")
-
     image_size = int(config.image_resolution[0])
     img_proc = Pi05ImageProcessor(image_size=image_size)
-    max_cameras = max(1, int(getattr(config, "max_cameras", PI05_MAX_CAMERAS)))
+    max_cameras = config.max_cameras
 
     feature_keys = config.image_feature_keys or []
     obs_images = _extract_images(robot_obs, config)
@@ -526,13 +501,13 @@ def build_model_inputs(robot_obs: dict, config, tokenizer, device: torch.device)
         images.append(img_proc.make_empty_image().to(device=device))
         image_masks.append(torch.tensor([False], dtype=torch.bool, device=device))
 
-    # Steps 4 + 5 + 6: normalize → discretize → prompt → tokenize.
+    # Normalize and serialize the state into the tokenized prompt.
+    raw_state = as_state_vector(robot_obs.get("state"), config.state_dim)
+    normalized_state = apply_norm(torch.from_numpy(raw_state), state_norm).numpy()
     prompt = build_pi05_prompt(
         task=robot_obs.get("prompt", "") or "",
-        state=state,
-        state_dim=int(getattr(config, "state_dim", None) or config.max_state_dim),
-        state_norm_stats=getattr(config, "state_norm_stats", None),
-        state_num_bins=getattr(config, "state_num_bins", PI05_NUM_BINS),
+        normalized_state=normalized_state,
+        state_num_bins=config.state_num_bins,
     )
     ids, attn = tokenize_prompt(tokenizer, prompt, config.tokenizer_max_length)
     lang_tokens = torch.tensor([ids], dtype=torch.long, device=device)
@@ -541,18 +516,54 @@ def build_model_inputs(robot_obs: dict, config, tokenizer, device: torch.device)
     return images, image_masks, lang_tokens, lang_masks
 
 
-def prefix_token_budget(config, num_real_cameras: int) -> dict[str, int]:
-    """Report the prefix token layout for a request — the A4/C1 input contract.
+# ──────────────────────────────────────────────────────────────────────
+# The interface the pipeline uses
+# ──────────────────────────────────────────────────────────────────────
+class Pi05Processor:
+    """Everything between the OpenPI wire and the model.
 
-    ``max_cameras × 256 image tokens + a constant 200 text tokens``, so the
-    tensor shape is fixed and only ``valid_prefix_len`` varies with the number
-    of real cameras. Exposed for tests and for latency accounting.
+    Owns the normalization statistics and the relative-action transform, so the
+    pipeline holds no preprocessing state of its own.
     """
-    max_cameras = max(1, int(getattr(config, "max_cameras", PI05_MAX_CAMERAS)))
-    text_len = int(config.tokenizer_max_length)
-    return {
-        "image_tokens": PI05_NUM_IMAGE_TOKENS * max_cameras,
-        "valid_image_tokens": PI05_NUM_IMAGE_TOKENS * min(num_real_cameras, max_cameras),
-        "text_tokens": text_len,
-        "total_prefix_len": PI05_NUM_IMAGE_TOKENS * max_cameras + text_len,
-    }
+
+    def __init__(self, config, tokenizer, device: torch.device):
+        self.config = config
+        self.tokenizer = tokenizer
+        self.device = device
+        self._state_norm = build_norm_stats(config.norm_stats, "state")
+        self._action_norm = build_norm_stats(config.norm_stats, "action")
+        self.relative_actions = Pi05RelativeActions(
+            enabled=config.use_relative_actions,
+            exclude_joints=config.relative_exclude_joints,
+            action_names=config.action_feature_names,
+            max_action_dim=config.max_action_dim,
+        )
+        if self._action_norm is None:
+            logger.info("π0.5: no action normalization stats; returned actions stay in normalized space.")
+        if self.relative_actions.enabled:
+            logger.info(
+                "π0.5: relative actions enabled — %d of %d action dims are state-relative "
+                "(excluded joints: %s).",
+                self.relative_actions.num_relative_dims,
+                config.max_action_dim,
+                config.relative_exclude_joints,
+            )
+
+    def build_model_inputs(self, robot_obs: dict):
+        """Raw observation → ``sample_actions`` inputs.
+
+        No state tensor comes back: π0.5 carries the state inside ``lang_tokens``.
+        """
+        return _assemble_model_inputs(robot_obs, self.config, self.tokenizer, self.device, self._state_norm)
+
+    def build_model_outputs(self, actions: torch.Tensor, robot_obs: dict) -> np.ndarray:
+        """Model output → the action chunk the robot receives.
+
+        ``AbsoluteActionsProcessorStep`` runs after unnormalization, because a
+        relative-action checkpoint's statistics are computed in relative space.
+        The raw state is the one the prompt encoded, before normalization.
+        """
+        actions = apply_norm(actions, self._action_norm, inverse=True)
+        if self.relative_actions.enabled:
+            actions = self.relative_actions.to_absolute(actions, robot_obs.get("state"))
+        return actions.squeeze(0)[..., : self.config.action_dim].float().cpu().numpy()

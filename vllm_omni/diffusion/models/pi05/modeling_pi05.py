@@ -51,7 +51,8 @@ DEFAULT_ACTION_DIM = 32
 DEFAULT_ACTION_HORIZON = 50
 DEFAULT_MAX_TOKEN_LEN = 200  # π0 uses 48
 DEFAULT_NUM_INFERENCE_STEPS = 10
-DEFAULT_IMAGE_RESOLUTION = (224, 224)
+DEFAULT_IMAGE_RESOLUTION = (224, 224)  # openpi/models/model.py IMAGE_RESOLUTION
+DEFAULT_STATE_NUM_BINS = 256  # openpi PaliGemmaTokenizer.tokenize()
 
 # Large negative value to fill masked-out positions in a float attention mask.
 # Matches OpenPI's constant exactly so that numerics line up during parity.
@@ -137,101 +138,6 @@ def prepare_attention_masks_4d(att_2d_masks: torch.Tensor) -> torch.Tensor:
     return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
 
-def _build_norm_buffers(norm_stats: dict | None, key: str) -> dict[str, torch.Tensor] | None:
-    """Parse a ``norm_stats[key]`` entry into CPU tensors, or ``None``.
-
-    ``quantile`` is the one to get right: LeRobot defaults π0.5 to QUANTILES
-    where π0 uses MEAN_STD, so a π0.5 checkpoint usually ships ``q01``/``q99``.
-    Returning ``None`` for it would leave actions in normalized space, which
-    reads as a badly tuned policy rather than as a failure.
-    """
-    if not norm_stats or not isinstance(norm_stats, dict):
-        return None
-    entry = norm_stats.get(key)
-    if not entry:
-        return None
-
-    mode = entry.get("mode")
-    if mode is None:
-        if "mean" in entry and "std" in entry:
-            mode = "mean_std"
-        elif "min" in entry and "max" in entry:
-            mode = "min_max"
-        elif ("q01" in entry and "q99" in entry) or ("low" in entry and "high" in entry):
-            mode = "quantile"
-    mode = str(mode).lower() if mode is not None else None
-
-    if mode == "mean_std":
-        mean, std = entry.get("mean"), entry.get("std")
-        if mean is None or std is None:
-            raise ValueError(f"Normalization mode 'mean_std' for {key!r} requires both 'mean' and 'std'.")
-        return {
-            "mode": mode,
-            "mean": torch.as_tensor(mean, dtype=torch.float32),
-            "std": torch.as_tensor(std, dtype=torch.float32),
-        }
-    elif mode in ("min_max", "quantile"):
-        if mode == "min_max":
-            lo, hi = entry.get("min"), entry.get("max")
-        else:
-            lo = entry.get("q01", entry.get("low"))
-            hi = entry.get("q99", entry.get("high"))
-        if lo is None or hi is None:
-            expected_bounds = "'min' and 'max'" if mode == "min_max" else "'q01' and 'q99'"
-            raise ValueError(f"Normalization mode {mode!r} for {key!r} requires both {expected_bounds} bounds.")
-        return {
-            "mode": "min_max",  # same arithmetic; quantile only changes the bounds
-            "min": torch.as_tensor(lo, dtype=torch.float32),
-            "max": torch.as_tensor(hi, dtype=torch.float32),
-        }
-    else:
-        raise ValueError(
-            f"Unsupported normalization mode for {key!r}: {mode!r}. Expected one of mean_std / min_max / quantile."
-        )
-
-
-def _apply_norm(
-    x: torch.Tensor,
-    stats: dict[str, torch.Tensor] | None,
-    inverse: bool,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """Apply (un)normalization using the given stats. No-op if ``stats`` is None.
-
-    Broadcasts over leading dims; stats vectors align with the last dim. When
-    ``x`` has more last-dim entries than the stats (π0.5 pads actions to
-    ``max_action_dim``), only the first ``len(stats)`` entries are transformed
-    and the padded tail is left untouched.
-    """
-    if stats is None:
-        return x
-    mode = stats["mode"]
-    if mode == "mean_std":
-        mean = stats["mean"].to(device=x.device, dtype=x.dtype)
-        std = stats["std"].to(device=x.device, dtype=x.dtype)
-        valid = mean.shape[0]
-        head = x[..., :valid]
-        head = head * std + mean if inverse else (head - mean) / (std + eps)
-        if valid == x.shape[-1]:
-            return head
-        return torch.cat([head, x[..., valid:]], dim=-1)
-    elif mode == "min_max":
-        lo = stats["min"].to(device=x.device, dtype=x.dtype)
-        hi = stats["max"].to(device=x.device, dtype=x.dtype)
-        valid = lo.shape[0]
-        head = x[..., :valid]
-        denom = (hi - lo).clamp_min(eps)
-        head = (head + 1.0) * 0.5 * denom + lo if inverse else 2.0 * (head - lo) / denom - 1.0
-        if valid == x.shape[-1]:
-            return head
-        return torch.cat([head, x[..., valid:]], dim=-1)
-    else:
-        raise ValueError(f"Unsupported normalization mode: {mode!r}. Expected one of mean_std / min_max.")
-
-
-# ──────────────────────────────────────────────────────────────────────
-# AdaRMS — the π0.5-specific norm in the action expert
-# ──────────────────────────────────────────────────────────────────────
 class Pi05AdaRMSNorm(nn.Module):
     """Adaptive RMSNorm conditioned on the flow-matching timestep.
 
@@ -605,7 +511,7 @@ class Pi05ForActionPrediction(nn.Module):
     def __init__(self, config, quant_config=None, prefix: str = ""):
         super().__init__()
         # ``quant_config`` is accepted for interface compatibility but unused —
-        # π0.5 runs in full precision for flow-matching parity.
+        # quant_config is not plumbed through; the weight dtype comes from the pipeline.
         del quant_config
         self.config = config
 
@@ -635,18 +541,6 @@ class Pi05ForActionPrediction(nn.Module):
         # π0-only continuous-state path.
         self.time_mlp_in = nn.Linear(self.expert_width, self.expert_width)
         self.time_mlp_out = nn.Linear(self.expert_width, self.expert_width)
-
-        # π0.5 checkpoints commonly carry quantile stats; see _build_norm_buffers.
-        self._action_norm = _build_norm_buffers(getattr(config, "norm_stats", None), "action")
-        if self._action_norm is None:
-            logger.info(
-                "π0.5: no action normalization stats on config.norm_stats — "
-                "returned actions are in the model's normalized space."
-            )
-
-    # ── Action normalization ─────────────────────────────────────────
-    def _unnormalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        return _apply_norm(actions, self._action_norm, inverse=True)
 
     # ── Prefix embedding ─────────────────────────────────────────────
     def embed_prefix(

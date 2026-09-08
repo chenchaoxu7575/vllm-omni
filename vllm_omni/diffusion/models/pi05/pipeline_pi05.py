@@ -22,6 +22,7 @@ relative-action checkpoint's ``norm_stats`` are computed in relative space.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import fields as dataclass_fields
 
@@ -33,10 +34,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
-from vllm_omni.diffusion.models.pi05.processor_pi05 import (
-    Pi05RelativeActions,
-    build_model_inputs,
-)
+from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -53,6 +51,20 @@ SUPPORTED_DTYPES = (torch.float32, torch.bfloat16)
 # The two lists guard different entry points — what the checkpoint declares
 # versus the dtype actually cast to — so they must not drift apart.
 assert {str(dtype).split(".")[-1] for dtype in SUPPORTED_DTYPES} == set(SUPPORTED_DTYPE_NAMES)
+
+
+def _checkpoint_declared_keys(model_dir: str) -> set[str]:
+    """The keys the checkpoint's config.json actually carries."""
+    path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(path):
+        return set()
+    with open(path, encoding="utf-8") as f:
+        return set(json.load(f))
+
+
+def _comparable(value):
+    """Compare yaml and checkpoint values without tripping on list/tuple."""
+    return list(value) if isinstance(value, (list, tuple)) else value
 
 
 def _pi05_post_process(x):
@@ -105,22 +117,7 @@ class Pi05Pipeline(nn.Module):
         self.tokenizer = self._load_tokenizer()
         self.model = self._initialize_model()
 
-        # One object serving both pipeline directions, matching LeRobot's
-        # "same instance" pairing of Relative/AbsoluteActionsProcessorStep.
-        self.relative_actions = Pi05RelativeActions(
-            enabled=self.config.use_relative_actions,
-            exclude_joints=self.config.relative_exclude_joints,
-            action_names=self.config.action_feature_names,
-            max_action_dim=self.config.max_action_dim,
-        )
-        if self.relative_actions.enabled:
-            logger.info(
-                "Pi05Pipeline: relative actions enabled — %d of %d action dims are "
-                "state-relative (excluded joints: %s).",
-                self.relative_actions.num_relative_dims,
-                self.config.max_action_dim,
-                self.config.relative_exclude_joints,
-            )
+        self.processor = Pi05Processor(self.config, self.tokenizer, self._device)
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -142,40 +139,30 @@ class Pi05Pipeline(nn.Module):
         )
 
     def _build_config(self, od_config: OmniDiffusionConfig) -> Pi05Config:
-        """Build Pi05Config from deploy-yaml model_config, falling back to the
-        checkpoint's config.json (raw LeRobot format).
-
-        Explicit deploy values override checkpoint defaults, while omitted
-        fields retain the checkpoint's complete runtime schema. Relative-action
-        semantics remain checkpoint-owned because changing them would reinterpret
-        the trained output distribution.
-        """
+        """Read the config from the checkpoint, then let the deploy yaml override it."""
         checkpoint_config = Pi05Config.from_pretrained(self.model_dir) if self.model_dir else None
-        if od_config.model_config:
-            deploy_raw = dict(od_config.model_config)
-            if checkpoint_config is None:
-                return Pi05Config.from_model_config(deploy_raw)
-
-            merged = {
-                item.name: getattr(checkpoint_config, item.name) for item in dataclass_fields(Pi05Config) if item.init
-            }
-            merged.update(deploy_raw)
-            for schema_key in ("input_features", "output_features", "norm_stats", "state_norm_stats"):
-                if not deploy_raw.get(schema_key):
-                    merged[schema_key] = getattr(checkpoint_config, schema_key)
-
-            if checkpoint_config.use_relative_actions and not deploy_raw.get("use_relative_actions"):
-                logger.warning(
-                    "Pi05Pipeline: checkpoint declares use_relative_actions=True; honouring the "
-                    "checkpoint because its normalization statistics are in relative action space."
-                )
-                merged["use_relative_actions"] = True
-                merged["relative_exclude_joints"] = checkpoint_config.relative_exclude_joints
-                merged["action_feature_names"] = checkpoint_config.action_feature_names
-            return Pi05Config.from_model_config(merged)
-        if checkpoint_config is not None:
+        if checkpoint_config is None:
+            return Pi05Config.from_model_config(od_config.model_config)
+        if not od_config.model_config:
             return checkpoint_config
-        return Pi05Config()
+
+        resolved = {
+            item.name: getattr(checkpoint_config, item.name) for item in dataclass_fields(Pi05Config) if item.init
+        }
+        # Only a key the checkpoint actually declares can disagree with the yaml.
+        # Comparing against the dataclass default instead would report every
+        # serving-only field, such as policy_server_config, on every start.
+        declared_keys = _checkpoint_declared_keys(self.model_dir)
+        for key, value in od_config.model_config.items():
+            if key in resolved and key in declared_keys and _comparable(value) != _comparable(resolved[key]):
+                logger.warning(
+                    "Pi05Pipeline: the deploy config sets %s=%r, overriding %r from the checkpoint.",
+                    key,
+                    value,
+                    resolved[key],
+                )
+        resolved.update(od_config.model_config)
+        return Pi05Config.from_model_config(resolved)
 
     def _resolve_tokenizer_source(self) -> str:
         """Prefer the checkpoint dir if it ships tokenizer files; else PaliGemma."""
@@ -281,11 +268,7 @@ class Pi05Pipeline(nn.Module):
                 error="Pi05Pipeline.forward requires sampling_params.extra_args['robot_obs'].",
             )
 
-        # Serving input steps. Note: no state tensor comes back — π0.5 serializes
-        # the (normalized, discretized) state into lang_tokens.
-        images, image_masks, lang_tokens, lang_masks = build_model_inputs(
-            robot_obs, self.config, self.tokenizer, self._device
-        )
+        images, image_masks, lang_tokens, lang_masks = self.processor.build_model_inputs(robot_obs)
 
         num_steps = getattr(req.sampling_params, "num_inference_steps", None)
         if num_steps is not None and (
@@ -303,14 +286,4 @@ class Pi05Pipeline(nn.Module):
             num_steps=num_steps,
         )
 
-        # Output step 1: unnormalize.
-        actions = self.model._unnormalize_actions(actions)
-        # Output step 2: relative → absolute, against the RAW state (the same
-        # state the prompt encoded, before normalization).
-        if self.relative_actions.enabled:
-            actions = self.relative_actions.to_absolute(actions, robot_obs.get("state"))
-
-        # Output step 3: to_cpu. (B=1, horizon, action_dim) → (horizon, action_dim).
-        actions_np = actions.squeeze(0)[..., : self.config.action_dim].float().cpu().numpy()
-
-        return DiffusionOutput(output={"actions": actions_np})
+        return DiffusionOutput(output={"actions": self.processor.build_model_outputs(actions, robot_obs)})
