@@ -46,8 +46,6 @@ test_params = [
         server_args=[
             "--deploy-config",
             "vllm_omni/deploy/pi05.yaml",
-            "--served-model-name",
-            "pi05",
             "--enforce-eager",
             "--disable-log-stats",
         ],
