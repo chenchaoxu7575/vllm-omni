@@ -33,7 +33,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.pi05.config import resolve_excluded_action_indices
@@ -542,8 +541,7 @@ class Pi05Processor:
             logger.info("π0.5: no action normalization stats; returned actions stay in normalized space.")
         if self.relative_actions.enabled:
             logger.info(
-                "π0.5: relative actions enabled — %d of %d action dims are state-relative "
-                "(excluded joints: %s).",
+                "π0.5: relative actions enabled — %d of %d action dims are state-relative (excluded joints: %s).",
                 self.relative_actions.num_relative_dims,
                 config.max_action_dim,
                 config.relative_exclude_joints,

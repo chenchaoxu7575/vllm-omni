@@ -254,7 +254,9 @@ class Pi05Config:
             if key == "image_resolution":
                 declared = list(declared)
             if declared != value:
-                raise ValueError(f"policy_server_config.{key}={declared!r} does not match the resolved value {value!r}.")
+                raise ValueError(
+                    f"policy_server_config.{key}={declared!r} does not match the resolved value {value!r}."
+                )
 
     def _validate_relative_actions(self) -> None:
         """Resolve the excluded joints at load, so a bad name fails before serving."""

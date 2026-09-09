@@ -38,26 +38,23 @@ from vllm_omni.diffusion.models.pi05.config import (
     resolve_excluded_action_indices,
 )
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
-    DEFAULT_MAX_TOKEN_LEN,
-    OPENPI_ATTENTION_MASK_VALUE,
     GemmaVariantConfig,
     Pi05AdaRMSNorm,
     Pi05ForActionPrediction,
     create_sinusoidal_pos_embedding,
     get_gemma_config,
     make_att_2d_masks,
-    prepare_attention_masks_4d,
 )
 from vllm_omni.diffusion.models.pi05.processor_pi05 import (
     Pi05ImageProcessor,
     Pi05Processor,
     Pi05RelativeActions,
+    _assemble_model_inputs,
+    apply_norm,
     as_state_vector,
     build_norm_stats,
-    _assemble_model_inputs,
     build_pi05_prompt,
     discretize_state,
-    apply_norm,
     resize_with_pad,
 )
 
@@ -555,7 +552,9 @@ def test_prefix_length_is_fixed_by_max_cameras(views, expected):
         "images": {key: np.zeros((4, 4, 3), dtype=np.uint8) for key in keys},
     }
 
-    images, masks, lang_tokens, _ = _assemble_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"), None)
+    images, masks, lang_tokens, _ = _assemble_model_inputs(
+        observation, config, _FakeTokenizer(), torch.device("cpu"), None
+    )
 
     assert len(images) == views
     assert all(bool(mask) for mask in masks)
@@ -669,12 +668,12 @@ def test_build_model_inputs_preserves_missing_middle_camera_slot(explicit_none):
         "state": np.zeros(32, dtype=np.float32),
     }
 
-    images, masks, _, _ = _assemble_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"), None)
+    slots, masks, _, _ = _assemble_model_inputs(observation, config, _FakeTokenizer(), torch.device("cpu"), None)
 
     assert [bool(mask.item()) for mask in masks] == [True, False, True]
-    assert torch.all(images[0] == -1.0)
-    assert torch.all(images[1] == -1.0), "missing left camera must retain an empty slot"
-    assert torch.all(images[2] == 1.0), "right camera must remain in slot 2"
+    assert torch.all(slots[0] == -1.0)
+    assert torch.all(slots[1] == -1.0), "missing left camera must retain an empty slot"
+    assert torch.all(slots[2] == 1.0), "right camera must remain in slot 2"
 
 
 def test_build_model_inputs_requires_configured_camera():
