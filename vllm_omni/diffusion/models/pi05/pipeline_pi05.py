@@ -130,8 +130,8 @@ class Pi05Pipeline(nn.Module):
         if os.path.isdir(model):
             return model
         # Via repo_utils' shared HfApi rather than huggingface_hub directly, so
-        # the download carries vLLM's user agent like every other repo access.
-        from vllm.transformers_utils.repo_utils import hf_api
+        # the download carries vLLM-Omni's user agent like every other repo access.
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
         return hf_api().snapshot_download(
             repo_id=model,
