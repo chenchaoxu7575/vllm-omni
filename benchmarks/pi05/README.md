@@ -35,26 +35,40 @@ python benchmarks/pi05/bench_pi05.py --enforce-eager --bs 1 --views 3 --warmup 5
 
 ## Experimental P0 options
 
-The benchmark supports independent `--vision-precision` (`fp32`, `bf16_autocast`,
-`selective_bf16`) and `--batch-cameras` / `--no-batch-cameras` options to the model
-benchmark. The corresponding stage `custom_pipeline_args` keys are
+The model benchmark supports independent `--vision-precision` (`fp32`,
+`bf16_autocast`, `selective_bf16`) and `--batch-cameras` / `--no-batch-cameras`
+options. The corresponding stage `custom_pipeline_args` keys are
 `pi05_vision_precision` and `pi05_batch_cameras`; CLI values override them.
 Defaults preserve R0's FP32 vision/projector and sequential cameras. Both BF16
 experiments restore FP32 image features before the prefix LM, preserving R0's
-prefix residual dtype. Selective BF16 retains FP32 patch/position embeddings;
-autocast retains all FP32 vision/projector weights. Changing either precision or
-camera batching can change rounding; action parity and task quality need to be
-evaluated separately from latency.
+prefix residual dtype. Selective BF16 retains FP32 patch/position embedding
+weights and casts their combined output to BF16 before the vision encoder; the
+remaining vision tower, including its encoder and final LayerNorm parameters,
+and the projector use BF16 weights. Autocast instead retains all FP32
+vision/projector weights and uses BF16 autocast for their forward pass. Neither
+option changes the LM/expert norm weights or their residual precision policy.
+Changing either precision or camera batching can change rounding; action parity
+and task quality need to be evaluated separately from latency.
 The 1/2-camera cases retain three image slots with false masks for missing views.
 
 Three independent runtime flags are also available, all disabled by default:
-`--precompute-adarms` prepares the default denoising schedule's timestep/conditioning
-projections after checkpoint load; `--hoist-denoise-invariants` computes mask,
-position IDs, and RoPE once per request; `--prefix-kv-only` omits the final prefix
-hidden-state work when action generation only consumes KV. Their stage
+`--precompute-adarms` prepares timestep embeddings, the time MLP, and every
+AdaRMS modulation projection for batch size 1 and the configured default
+denoising schedule (10 steps in the supplied deploy config), after checkpoint
+load and before capture. Other step counts or batch sizes use live projections;
+normal writes to tracked conditioning weights invalidate the table. Such
+requests bypass the captured denoise step; compatible prefix graphs can still
+replay. `--hoist-denoise-invariants` computes denoise masks, position IDs, and
+RoPE once per request and shares one prefix RoPE table across its layers;
+`--prefix-kv-only` omits the final prefix layer's Q/attention/MLP and final norm
+when action generation only consumes KV. Their stage
 `custom_pipeline_args` keys are `pi05_precompute_adarms`,
 `pi05_hoist_denoise_invariants`, and `pi05_prefix_kv_only`. Each flag also has a
 `--no-...` form for ablation. General prefix forward keeps its full hidden output.
+
+These options are fixed during pipeline initialization, before graph capture;
+use a new pipeline to change them. Request masks, positions, and prefix KV are
+rebuilt for each observation, not retained as history across requests.
 
 `--execution-mode eager|fused|graph` selects the implementation independently from
 these numerical/algorithm settings. `--enforce-eager` remains an alias for eager;
@@ -80,6 +94,9 @@ latency only at the same model/serving boundary, with matching inputs, denoising
 steps, warmup, GPU, and precision policy.
 
 ## Reference results
+
+These historical RTX 5080 measurements use R0's default vision/runtime settings;
+they do not measure the experimental P0 options above.
 
 ### Client E2E latency
 
