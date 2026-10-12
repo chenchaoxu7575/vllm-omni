@@ -49,6 +49,7 @@ from transformers.models.gemma.modeling_gemma import (
     apply_rotary_pos_emb,
 )
 
+from vllm_omni.diffusion.models.pi05 import exact_qk_pi05 as qk_kernels
 from vllm_omni.diffusion.models.pi05 import modeling_pi05 as M
 from vllm_omni.diffusion.models.pi05 import precision_kernels_pi05 as kernels
 
@@ -520,20 +521,29 @@ def test_exact_norm_cuda_graph_refreshes_inputs(width):
         assert all(torch.equal(a, b) for a, b in zip(actual, expected))
 
 
-def _exact_softmax_inputs(mask_kind="holes"):
+_EXACT_SOFTMAX_SHAPES = [(50, 1018), (968, 968)]
+
+
+def _exact_softmax_inputs(mask_kind="holes", shape=(50, 1018)):
+    queries, keys = shape
     generator = torch.Generator(device="cuda").manual_seed(193)
-    scores = torch.randn(1, 8, 50, 1018, device="cuda", generator=generator).to(torch.bfloat16)
-    mask = torch.zeros(1, 1, 50, 1018, device="cuda")
+    scores = torch.randn(1, 8, queries, keys, device="cuda", generator=generator).to(torch.bfloat16)
+    mask = torch.zeros(1, 1, queries, keys, device="cuda")
     if mask_kind == "holes":
         mask[..., :968:3] = torch.finfo(torch.float32).min
     elif mask_kind == "causal":
-        blocked = torch.arange(50, device="cuda")[None, :] > torch.arange(50, device="cuda")[:, None]
-        mask[..., 968:].masked_fill_(blocked, torch.finfo(torch.float32).min)
+        blocked = torch.arange(queries, device="cuda")[None, :] > torch.arange(queries, device="cuda")[:, None]
+        mask[..., keys - queries :].masked_fill_(blocked, torch.finfo(torch.float32).min)
     elif mask_kind == "all_masked":
         mask.fill_(torch.finfo(torch.float32).min)
     elif mask_kind == "soft_bias":
         mask = torch.randn(mask.shape, device="cuda", generator=generator)
     return scores, mask
+
+
+def _require_audited_softmax(shape):
+    if not kernels._supported_torch_reduction() or (shape == (968, 968) and torch.version.cuda != "13.2"):
+        pytest.skip("Softmax geometry not audited for the installed Torch release/CUDA build")
 
 
 def _exact_softmax_reference(scores, mask, scale=1.0 / 16, output_dtype=None):
@@ -544,10 +554,10 @@ def _exact_softmax_reference(scores, mask, scale=1.0 / 16, output_dtype=None):
 
 
 @pytest.mark.parametrize("mask_kind", ["all_valid", "holes", "causal", "all_masked", "soft_bias"])
-def test_exact_softmax_cuda_matches_eager_bitwise(mask_kind):
-    if not kernels._supported_torch_reduction():
-        pytest.skip("Softmax reduction not audited for the installed Torch release/backend")
-    scores, mask = _exact_softmax_inputs(mask_kind)
+@pytest.mark.parametrize("shape", _EXACT_SOFTMAX_SHAPES)
+def test_exact_softmax_cuda_matches_eager_bitwise(mask_kind, shape):
+    _require_audited_softmax(shape)
+    scores, mask = _exact_softmax_inputs(mask_kind, shape)
     assert kernels.can_use_exact_scaled_masked_softmax(scores, mask, 1.0 / 16)
     actual = kernels.scaled_masked_softmax(scores, mask, 1.0 / 16)
     assert torch.equal(actual, _exact_softmax_reference(scores, mask))
@@ -583,6 +593,24 @@ def test_exact_softmax_cuda_unsupported_cases_fall_back(monkeypatch, kind):
     assert torch.equal(actual, _exact_softmax_reference(scores, mask, scale, output_dtype))
 
 
+@pytest.mark.parametrize("kind", ["broadcast_mask", "cuda_build"])
+def test_exact_prefix_softmax_unsupported_cases_fall_back(monkeypatch, kind):
+    scores, mask = _exact_softmax_inputs(shape=(968, 968))
+    if kind == "broadcast_mask":
+        mask = mask[..., :1, :].contiguous()
+    else:
+        monkeypatch.setattr(torch.version, "cuda", "13.1")
+    assert not kernels.can_use_exact_scaled_masked_softmax(scores, mask, 1.0 / 16)
+    actual = kernels.scaled_masked_softmax(scores, mask, 1.0 / 16)
+    assert torch.equal(actual, _exact_softmax_reference(scores, mask))
+
+
+def test_exact_prefix_softmax_rejects_mismatched_expert_mask():
+    scores, _ = _exact_softmax_inputs(shape=(968, 968))
+    _, expert_mask = _exact_softmax_inputs()
+    assert not kernels.can_use_exact_scaled_masked_softmax(scores, expert_mask, 1.0 / 16)
+
+
 def test_exact_softmax_cuda_grad_uses_eager():
     scores, mask = _exact_softmax_inputs("soft_bias")
     scores.requires_grad_()
@@ -597,12 +625,12 @@ def test_exact_softmax_cuda_grad_uses_eager():
 
 
 @torch.no_grad()
-def test_exact_softmax_cuda_graph_refreshes_scores_and_mask():
-    if not kernels._supported_torch_reduction():
-        pytest.skip("Softmax reduction not audited for the installed Torch release/backend")
-    first, first_mask = _exact_softmax_inputs("holes")
+@pytest.mark.parametrize("shape", _EXACT_SOFTMAX_SHAPES)
+def test_exact_softmax_cuda_graph_refreshes_scores_and_mask(shape):
+    _require_audited_softmax(shape)
+    first, first_mask = _exact_softmax_inputs("holes", shape)
     second = -first
-    _, second_mask = _exact_softmax_inputs("causal")
+    _, second_mask = _exact_softmax_inputs("causal", shape)
     scores, mask = first.clone(), first_mask.clone()
     assert kernels.can_use_exact_scaled_masked_softmax(scores, mask, 1.0 / 16)
     stream = torch.cuda.Stream()
@@ -621,13 +649,14 @@ def test_exact_softmax_cuda_graph_refreshes_scores_and_mask():
         assert torch.equal(actual, _exact_softmax_reference(scores, mask))
 
 
-def test_exact_softmax_cuda_attention_preserves_qk_pv():
-    if not kernels._supported_torch_reduction():
-        pytest.skip("Softmax reduction not audited for the installed Torch release/backend")
-    query = _randn(1, 8, 50, 256, dtype=torch.bfloat16, seed=191)
-    key = _randn(1, 1, 1018, 256, dtype=torch.bfloat16, seed=192)
-    value = _randn(1, 1, 1018, 256, dtype=torch.bfloat16, seed=193)
-    _, mask = _exact_softmax_inputs()
+@pytest.mark.parametrize("shape", _EXACT_SOFTMAX_SHAPES)
+def test_exact_softmax_cuda_attention_preserves_qk_pv(shape):
+    _require_audited_softmax(shape)
+    queries, keys = shape
+    query = _randn(1, 8, queries, 256, dtype=torch.bfloat16, seed=191)
+    key = _randn(1, 1, keys, 256, dtype=torch.bfloat16, seed=192)
+    value = _randn(1, 1, keys, 256, dtype=torch.bfloat16, seed=193)
+    _, mask = _exact_softmax_inputs(shape=shape)
     expected = M._attend(query, key, value, mask, 8, 1.0 / 16)
     actual = M._attend(query, key, value, mask, 8, 1.0 / 16, exact_bf16_softmax=True)
     assert torch.equal(actual, expected)
@@ -701,3 +730,78 @@ def test_accurate_expert_qkv_dispatch_and_graph_refresh():
                 "separate projections + RoPE",
                 "Unsupported runtime/device uses the original cuBLAS path.",
             )
+
+
+def _exact_qk_inputs(seed):
+    # Dyadic operands keep all partial sums exactly representable in FP32.
+    # This pins mapping/output rounding independently of a cuBLAS GEMM's
+    # arbitrary-input reduction. Real-checkpoint parity covers serving values.
+    generator = _generator(seed)
+    query = torch.randint(-4, 5, (1, 8, 50, 256), device=DEVICE, generator=generator).to(torch.bfloat16) / 16
+    key = torch.randint(-4, 5, (1, 1, 1018, 256), device=DEVICE, generator=generator).to(torch.bfloat16) / 16
+    return query, key
+
+
+def _require_audited_qk(query, key):
+    if not qk_kernels.can_use_exact_bf16_qk(query, key):
+        pytest.skip("Requires audited Torch 2.13/CUDA 13.2 on SM90 or SM120 with Gluon.")
+
+
+def _exact_qk(query, key):
+    output = qk_kernels.exact_bf16_qk(query, key, h100_score_kernel=M._attn_scores_kernel)
+    assert output is not None
+    return output
+
+
+@torch.no_grad()
+def test_exact_qk_cuda_scores_and_attention():
+    query, key = _exact_qk_inputs(26)
+    _require_audited_qk(query, key)
+    expected_scores = query @ M._repeat_kv(key, 8).transpose(2, 3)
+    actual_scores = _exact_qk(query, key)
+    assert actual_scores.dtype == torch.bfloat16
+    assert actual_scores.shape == (1, 8, 50, 1018)
+    assert torch.equal(actual_scores, expected_scores)
+    value = _randn(1, 1, 1018, 256, dtype=torch.bfloat16, seed=27)
+    _, mask = _exact_softmax_inputs("holes")
+    expected = M._attend(query, key, value, mask, 8, 1.0 / 16)
+    actual = M._attend(query, key, value, mask, 8, 1.0 / 16, exact_bf16_qk=True, exact_bf16_softmax=True)
+    assert torch.equal(actual, expected)
+
+
+@torch.no_grad()
+def test_exact_qk_cuda_graph_refresh_and_output_ownership():
+    first, second = _exact_qk_inputs(0), _exact_qk_inputs(26)
+    _require_audited_qk(*first)
+    # Nonzero aligned storage offsets model K/V cache slices; sentinels also
+    # detect any unintended writes to caller-owned inputs.
+    storage = [torch.full((value.numel() + 4,), float("nan"), dtype=value.dtype, device=DEVICE) for value in first]
+    query, key = [buffer[2:-2].view_as(value) for buffer, value in zip(storage, first)]
+    query.copy_(first[0])
+    key.copy_(first[1])
+    assert qk_kernels.can_use_exact_bf16_qk(query, key)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            _exact_qk(query, key)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _exact_qk(query, key)
+    captured_ptr = captured.data_ptr()
+    for request_query, request_key in (first, second, first):
+        query.copy_(request_query)
+        key.copy_(request_key)
+        graph.replay()
+        expected = request_query @ M._repeat_kv(request_key, 8).transpose(2, 3)
+        assert captured.data_ptr() == captured_ptr and torch.equal(captured, expected)
+        actual = captured.clone()
+        assert torch.equal(actual, _exact_qk(query, key))
+        for buffer in storage:
+            assert torch.isnan(buffer[:2]).all() and torch.isnan(buffer[-2:]).all()
+        assert torch.equal(query, request_query) and torch.equal(key, request_key)
+    retained = _exact_qk(*first)
+    expected_retained = retained.clone()
+    _exact_qk(*second)
+    assert torch.equal(retained, expected_retained)

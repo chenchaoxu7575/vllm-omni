@@ -8,7 +8,7 @@ lane, then descending warp shuffles. It is intentionally limited to the two
 Pi0.5 widths and sufficiently many rows. Other versions, layouts and dtypes
 use the actual PyTorch operations, rather than assuming the reduction is stable
 across releases. Softmax additionally follows PersistentSoftmax.cuh for the
-default action-expert attention shape. This module does not modify model dispatch.
+default prefix and action-expert attention shapes. This module does not modify model dispatch.
 """
 
 from __future__ import annotations
@@ -64,12 +64,17 @@ def can_use_exact_scaled_masked_softmax(
     *,
     output_dtype: torch.dtype | None = None,
 ) -> bool:
-    """Limit the audited persistent-softmax tree to default BF16 expert scores."""
+    """Limit the audited persistent-softmax tree to validated BF16 geometries."""
     if not HAS_TRITON or not _supported_torch_reduction():
         return False
+    if scores.shape == (1, 8, 968, 968):
+        # The prefix geometry has only been validated with this CUDA build.
+        if torch.version.cuda != "13.2":
+            return False
+    elif scores.shape != (1, 8, 50, 1018):
+        return False
     if (
-        scores.shape != (1, 8, 50, 1018)
-        or scores.device.type != "cuda"
+        scores.device.type != "cuda"
         or scores.dtype != torch.bfloat16
         or not scores.is_contiguous()
         or output_dtype not in (None, torch.bfloat16)
@@ -79,7 +84,7 @@ def can_use_exact_scaled_masked_softmax(
         return False
     if (
         mask is None
-        or mask.shape != (1, 1, 50, 1018)
+        or mask.shape != (1, 1, *scores.shape[-2:])
         or mask.device != scores.device
         or mask.dtype != torch.float32
         or not mask.is_contiguous()
@@ -218,13 +223,15 @@ def scaled_masked_softmax(
             logits = logits + mask
         return torch.softmax(logits, dim=-1, dtype=torch.float32).to(output_dtype or scores.dtype)
     output = torch.empty_like(scores)
-    _exact_scaled_masked_softmax_kernel[(100,)](
+    queries, width = scores.shape[-2:]
+    rows = scores.numel() // width
+    _exact_scaled_masked_softmax_kernel[(triton.cdiv(rows, 4),)](
         scores,
         mask,
         output,
-        WIDTH=1018,
-        QUERIES=50,
-        ROWS=400,
+        WIDTH=width,
+        QUERIES=queries,
+        ROWS=rows,
         SCALE=1.0 / 16,
         num_warps=4,
         enable_fp_fusion=False,

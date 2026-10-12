@@ -57,9 +57,10 @@ and defaults to `legacy`.
 prefix and action expert when their projection weights are BF16, keeping vision
 and the Euler schedule unchanged.
 This option covers LM activation precision; full pipeline parity requires separate validation.
-Norm fusion is audited for Torch 2.13.0; the fused expert softmax additionally
-requires BF16 `[1,8,50,1018]` scores. Unsupported cases use PyTorch.
+Norm and softmax fusion are audited for Torch 2.13.0; softmax requires BF16
+`[1,8,50,1018]` expert scores or `[1,8,968,968]` prefix scores (CUDA 13.2). Unsupported cases use PyTorch.
 The validated 50-token expert also uses fused QKV GEMMs on CUDA 13.2 / SM90.
+Its exact BF16 QK path supports CUDA 13.2 / SM90 and SM120 (the latter requires Triton 3.7.1 Gluon); other cases retain cuBLAS.
 
 Three independent runtime flags are also available, all disabled by default:
 `--precompute-adarms` prepares timestep embeddings, the time MLP, and every

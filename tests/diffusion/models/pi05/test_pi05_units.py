@@ -31,6 +31,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.pi05 import exact_qk_pi05 as exact_qk
 from vllm_omni.diffusion.models.pi05 import modeling_pi05
 from vllm_omni.diffusion.models.pi05 import precision_kernels_pi05 as kernels
 from vllm_omni.diffusion.models.pi05.config import (
@@ -2097,6 +2098,203 @@ def test_exact_softmax_attend_opt_in_keeps_default_path(monkeypatch, dtype):
     actual = modeling_pi05._attend(query, key, value, mask, 2, 1.0 / 16, exact_bf16_softmax=True)
     assert calls == [((1, 2, 3, 7), (1, 1, 3, 7), {"output_dtype": dtype})]
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("candidate_available", [False, True])
+def test_exact_qk_attention_dispatch_preserves_pv_and_default(monkeypatch, candidate_available):
+    """Observe routing with real CPU attention math; this does not test a CUDA kernel."""
+    query = torch.randn(1, 2, 3, 8).to(torch.bfloat16)
+    key = torch.randn(1, 1, 7, 8).to(torch.bfloat16)
+    value = torch.randn_like(key)
+    mask = torch.randn(1, 1, 3, 9)
+    original_matmul = torch.matmul
+    qk_calls, matmul_shapes = [], []
+
+    def candidate(q, k, *, num_kv_groups, h100_score_kernel):
+        assert q is query and k is key and num_kv_groups == 2
+        assert h100_score_kernel is vars(modeling_pi05).get("_attn_scores_kernel")
+        qk_calls.append(True)
+        if candidate_available:
+            return original_matmul(q, modeling_pi05._repeat_kv(k, num_kv_groups).transpose(2, 3))
+        return None
+
+    def matmul(left, right):
+        matmul_shapes.append((left.shape, right.shape))
+        return original_matmul(left, right)
+
+    monkeypatch.setattr(modeling_pi05, "try_exact_bf16_qk", candidate)
+    monkeypatch.setattr(torch, "matmul", matmul)
+    expected = modeling_pi05._attend(query, key, value, mask, 2, 1.0 / 16)
+    assert not qk_calls and len(matmul_shapes) == 2
+    matmul_shapes.clear()
+    actual = modeling_pi05._attend(query, key, value, mask, 2, 1.0 / 16, exact_bf16_softmax=True, exact_bf16_qk=True)
+    assert qk_calls == [True]
+    assert len(matmul_shapes) == (1 if candidate_available else 2)
+    assert matmul_shapes[-1] == ((1, 2, 3, 7), (1, 2, 7, 8))
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("capability", [(9, 0), (12, 0), (8, 0)])
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        None,
+        "no_triton",
+        "torch",
+        "cuda",
+        "hip",
+        "no_gluon",
+        "old_triton",
+        "cpu",
+        "device",
+        "dtype",
+        "query_shape",
+        "key_shape",
+        "groups",
+        "query_stride",
+        "key_stride",
+        "noncontiguous",
+        "query_alignment",
+        "key_alignment",
+        "gradient",
+    ],
+)
+def test_exact_qk_guard(monkeypatch, capability, unsupported):
+    """CUDA metadata only; no JIT or GPU memory is used by these guard checks."""
+
+    def tensor(shape, strides):
+        return SimpleNamespace(
+            shape=shape,
+            dtype=torch.bfloat16,
+            device=torch.device("cuda:1"),
+            is_contiguous=lambda: True,
+            stride=lambda: strides,
+            data_ptr=lambda: 4096,
+            requires_grad=False,
+        )
+
+    query = tensor((1, 8, 50, 256), (102400, 12800, 256, 1))
+    key = tensor((1, 1, 1018, 256), (260608, 260608, 256, 1))
+    groups = 8
+    monkeypatch.setattr(exact_qk, "HAS_TRITON", True)
+    monkeypatch.setattr(exact_qk, "HAS_GLUON", True)
+    monkeypatch.setattr(exact_qk, "triton", SimpleNamespace(__version__="3.7.1"))
+    monkeypatch.setattr(torch, "__version__", "2.13.0+cu132")
+    monkeypatch.setattr(torch.version, "cuda", "13.2")
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+    if unsupported == "no_triton":
+        monkeypatch.setattr(exact_qk, "HAS_TRITON", False)
+    elif unsupported == "torch":
+        monkeypatch.setattr(torch, "__version__", "2.13.1")
+    elif unsupported == "cuda":
+        monkeypatch.setattr(torch.version, "cuda", "13.1")
+    elif unsupported == "hip":
+        monkeypatch.setattr(torch.version, "hip", "7.0")
+    elif unsupported == "no_gluon":
+        monkeypatch.setattr(exact_qk, "HAS_GLUON", False)
+    elif unsupported == "old_triton":
+        monkeypatch.setattr(exact_qk, "triton", SimpleNamespace(__version__="3.6.0"))
+    elif unsupported == "cpu":
+        query.device = key.device = torch.device("cpu")
+    elif unsupported == "device":
+        key.device = torch.device("cuda:0")
+    elif unsupported == "dtype":
+        key.dtype = torch.float32
+    elif unsupported == "query_shape":
+        query.shape = (1, 8, 49, 256)
+    elif unsupported == "key_shape":
+        key.shape = (1, 1, 1017, 256)
+    elif unsupported == "groups":
+        groups = 4
+    elif unsupported == "query_stride":
+        query.stride = lambda: (102400, 256, 2048, 1)
+    elif unsupported == "key_stride":
+        key.stride = lambda: (260608, 260608, 1, 1018)
+    elif unsupported == "noncontiguous":
+        key.is_contiguous = lambda: False
+    elif unsupported == "query_alignment":
+        query.data_ptr = lambda: 4098
+    elif unsupported == "key_alignment":
+        key.data_ptr = lambda: 4098
+    elif unsupported == "gradient":
+        key.requires_grad = True
+    expected = capability in ((9, 0), (12, 0)) and (
+        unsupported is None or (capability == (9, 0) and unsupported in ("no_gluon", "old_triton"))
+    )
+    with torch.enable_grad():
+        assert exact_qk.can_use_exact_bf16_qk(query, key, groups) == expected
+        if not expected:
+            assert exact_qk.exact_bf16_qk(query, key, num_kv_groups=groups) is None
+
+
+def test_exact_qk_missing_gluon_import_preserves_torch_fallback(monkeypatch):
+    import builtins
+    import importlib.util
+
+    import vllm.triton_utils as triton_utils
+
+    original_import = builtins.__import__
+
+    def without_gluon(name, *args, **kwargs):
+        if name.startswith("triton.experimental"):
+            raise ImportError("Gluon intentionally unavailable in this import test")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(triton_utils, "HAS_TRITON", True)
+    monkeypatch.setattr(builtins, "__import__", without_gluon)
+    spec = importlib.util.spec_from_file_location("pi05_qk_without_gluon", exact_qk.__file__)
+    isolated = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated)
+    assert not isolated.HAS_GLUON
+    assert not hasattr(isolated, "_native_k8_kernel")
+    query = torch.randn(1, 2, 3, 8, requires_grad=True)
+    key = torch.randn(1, 1, 7, 8, requires_grad=True)
+    value = torch.randn_like(key, requires_grad=True)
+    mask = torch.zeros(1, 1, 3, 7)
+    monkeypatch.setattr(modeling_pi05, "try_exact_bf16_qk", isolated.exact_bf16_qk)
+    expected = modeling_pi05._attend(query, key, value, mask, 2, 1.0 / 16)
+    actual = modeling_pi05._attend(query, key, value, mask, 2, 1.0 / 16, exact_bf16_qk=True)
+    assert torch.equal(actual, expected)
+    gradient = torch.randn_like(actual)
+    actual_grads = torch.autograd.grad(actual, (query, key, value), gradient, retain_graph=True)
+    expected_grads = torch.autograd.grad(expected, (query, key, value), gradient)
+    assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads))
+
+
+@pytest.mark.parametrize("shape", [(50, 1018), (968, 968)])
+@pytest.mark.parametrize("unsupported", [None, "cuda_build", "other_geometry", "broadcast_mask", "gradient"])
+def test_exact_softmax_geometry_guard(monkeypatch, shape, unsupported):
+    """Metadata-only CUDA dispatch checks; numerical fallback tests use real tensors."""
+    device = torch.device("cuda:0")
+
+    def tensor(dimensions):
+        return SimpleNamespace(
+            shape=dimensions,
+            dtype=torch.bfloat16,
+            device=device,
+            is_contiguous=lambda: True,
+            requires_grad=False,
+        )
+
+    scores, mask = tensor((1, 8, *shape)), tensor((1, 1, *shape))
+    mask.dtype = torch.float32
+    monkeypatch.setattr(kernels, "HAS_TRITON", True)
+    monkeypatch.setattr(torch, "__version__", "2.13.0+cu132")
+    monkeypatch.setattr(torch.version, "cuda", "13.2")
+    monkeypatch.setattr(torch.version, "hip", None)
+    if unsupported == "cuda_build":
+        monkeypatch.setattr(torch.version, "cuda", "13.1")
+    elif unsupported == "other_geometry":
+        other_shape = (968, 968) if shape == (50, 1018) else (50, 1018)
+        mask.shape = (1, 1, *other_shape)
+    elif unsupported == "broadcast_mask":
+        mask.shape = (1, 1, 1, shape[-1])
+    elif unsupported == "gradient":
+        scores.requires_grad = True
+    expected = unsupported is None or (shape == (50, 1018) and unsupported == "cuda_build")
+    with torch.enable_grad():
+        assert kernels.can_use_exact_scaled_masked_softmax(scores, mask, 1.0 / 16) == expected
 
 
 @pytest.mark.parametrize(

@@ -54,6 +54,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
 from vllm_omni.diffusion.models.pi05.config import SUPPORTED_LM_PRECISIONS
+from vllm_omni.diffusion.models.pi05.exact_qk_pi05 import exact_bf16_qk as try_exact_bf16_qk
 from vllm_omni.diffusion.models.pi05.precision_kernels_pi05 import residual_rms_norm, scaled_masked_softmax
 from vllm_omni.diffusion.models.pi05.runtime_pi05 import Pi05RuntimeOptions
 from vllm_omni.diffusion.models.pi05.vision_pi05 import Pi05VisionOptions, configure_vision_precision
@@ -279,7 +280,15 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 def _attend(
-    query_states, key_states, value_states, attention_mask, num_kv_groups, scaling, *, exact_bf16_softmax=False
+    query_states,
+    key_states,
+    value_states,
+    attention_mask,
+    num_kv_groups,
+    scaling,
+    *,
+    exact_bf16_softmax=False,
+    exact_bf16_qk=False,
 ):
     """Manual eager attention: ``softmax(Q Kᵀ · scale + mask) · V``.
 
@@ -289,7 +298,16 @@ def _attend(
     """
     k = _repeat_kv(key_states, num_kv_groups)
     v = _repeat_kv(value_states, num_kv_groups)
-    attn_weights = torch.matmul(query_states, k.transpose(2, 3))
+    attn_weights = None
+    if exact_bf16_qk:
+        attn_weights = try_exact_bf16_qk(
+            query_states,
+            key_states,
+            num_kv_groups=num_kv_groups,
+            h100_score_kernel=globals().get("_attn_scores_kernel"),
+        )
+    if attn_weights is None:
+        attn_weights = torch.matmul(query_states, k.transpose(2, 3))
     if exact_bf16_softmax:
         mask = None if attention_mask is None else attention_mask[:, :, :, : k.shape[-2]]
         attn_weights = scaled_masked_softmax(attn_weights, mask, scaling, output_dtype=query_states.dtype)
@@ -1309,6 +1327,7 @@ def _fused_prefix_forward(
             attention_mask,
             num_kv_groups=attn.num_key_value_groups,
             scaling=1.0 / math.sqrt(head_dim),
+            exact_bf16_softmax=accurate_bf16,
         )
         attn_out = attn.o_proj(att.transpose(1, 2).reshape(1, seq_len, num_heads * head_dim))[0]
         if accurate_bf16:
@@ -1390,8 +1409,8 @@ def _fused_denoise_forward(
             )
             qkv_inputs = (x_normed, attn, cos[0], sin[0], q, key[prefix_len:], value[prefix_len:])
             _fused_qkv_rope(*qkv_inputs, triton_gemm=_can_use_accurate_expert_triton_qkv(*qkv_inputs))
-            # Keep the eager [batch, heads, query, key] GEMM layout. Flattening
-            # heads can select another cuBLAS algorithm and BF16 rounding path.
+            # Unsupported QK cases and PV keep eager's four-dimensional GEMM
+            # layout; flattening heads can change cuBLAS's BF16 rounding path.
             attention = _attend(
                 q[None],
                 key[None, None],
@@ -1400,6 +1419,7 @@ def _fused_denoise_forward(
                 num_heads,
                 1.0 / math.sqrt(head_dim),
                 exact_bf16_softmax=True,
+                exact_bf16_qk=True,
             )
             att = attention.transpose(1, 2).reshape(seq_len, num_heads * head_dim)
             _fused_linear_residual(
