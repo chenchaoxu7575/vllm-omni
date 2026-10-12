@@ -273,7 +273,7 @@ def test_lm_precision_controls_prefix_and_expert_norm_residual_dtype(mode, dtype
     backbone = model.paligemma_with_expert
     expected_dtype = torch.bfloat16 if mode == "lerobot_bf16" and dtype == torch.bfloat16 else torch.float32
     observed = []
-    handles = []
+    handles: list[torch.utils.hooks.RemovableHandle] = []
 
     def record(_module, args, result):
         values = result if isinstance(result, tuple) else (result,)
@@ -2244,6 +2244,7 @@ def test_exact_qk_missing_gluon_import_preserves_torch_fallback(monkeypatch):
     monkeypatch.setattr(triton_utils, "HAS_TRITON", True)
     monkeypatch.setattr(builtins, "__import__", without_gluon)
     spec = importlib.util.spec_from_file_location("pi05_qk_without_gluon", exact_qk.__file__)
+    assert spec is not None and spec.loader is not None
     isolated = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(isolated)
     assert not isolated.HAS_GLUON
