@@ -33,7 +33,9 @@ class Pi05VisionOptions:
 def _cast_vision_embeddings(_module, _inputs, output):
     # OpenPI's patched SigLIP makes this cast immediately before its encoder.
     # A hook preserves the stock module tree and checkpoint parameter names.
-    return output.to(torch.bfloat16)
+    # The patch embedding transpose otherwise makes each encoder LayerNorm
+    # copy its input. Materialize the token-major layout once at this boundary.
+    return output.to(torch.bfloat16).contiguous()
 
 
 def configure_vision_precision(paligemma: nn.Module, precision: str) -> None:

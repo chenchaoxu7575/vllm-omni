@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """π0.5's optimized path (fused Triton kernels under CUDA graphs) against the eager baseline.
 
-Loads the real checkpoint once per serving dtype through ``Pi05Pipeline`` with
+Loads the real checkpoint once per dtype/LM-policy pair through ``Pi05Pipeline`` with
 ``enforce_eager=False`` and runs ``sample_actions`` on simulated robot
 observations with 1, 2 and 3 camera views, at the configured denoising-step
 count and at a per-request override. Each case runs on the eager baseline,
@@ -17,7 +17,11 @@ Needs a CUDA GPU and the real checkpoint::
 
 ``PI05_PARITY_MODEL_PATH`` points at a local checkpoint to skip the HF download.
 ``PI05_CUDA_GRAPH_PARITY_DTYPES`` (comma separated, default
-``float32,bfloat16``) selects the serving dtypes.
+``float32,bfloat16``) selects the serving dtypes. Each selected dtype retains
+the legacy policy; BF16 additionally covers ``lerobot_bf16`` with KV-only
+prefix capture. Vision and the other runtime flags remain identical. Direct
+prefix tests cover full-hidden and KV-only calls for every fixture. Use
+``-k lerobot_bf16`` to select only the new BF16 decoder policy.
 """
 
 from __future__ import annotations
@@ -47,6 +51,9 @@ pytestmark = [
 
 MODEL_PATH = os.environ.get("PI05_PARITY_MODEL_PATH", "lerobot/pi05_base")
 DTYPES = os.environ.get("PI05_CUDA_GRAPH_PARITY_DTYPES", "float32,bfloat16").split(",")
+DTYPE_POLICIES = [(dtype, "legacy") for dtype in DTYPES]
+if "bfloat16" in DTYPES:
+    DTYPE_POLICIES.append(("bfloat16", "lerobot_bf16"))
 DEPLOY_CONFIG = Path(__file__).parents[4] / "vllm_omni" / "deploy" / "pi05.yaml"
 
 NUM_VIEWS = (1, 2, 3)
@@ -114,12 +121,21 @@ def _sample(model, inputs, num_steps: int | None, seed: int) -> torch.Tensor:
     return _sample_on_device(model, inputs, num_steps, seed).cpu()
 
 
-@pytest.fixture(scope="module", params=DTYPES)
+@pytest.fixture(
+    scope="module",
+    params=DTYPE_POLICIES,
+    ids=lambda pair: f"dtype={pair[0]}-lm={pair[1]}",
+)
 def pipeline(request):
+    dtype, lm_precision = request.param
     od_config = OmniDiffusionConfig(
         model=_resolve_checkpoint_dir(),
-        dtype=request.param,
+        dtype=dtype,
         model_config=_deploy_model_config(),
+        custom_pipeline_args={
+            "pi05_lm_precision": lm_precision,
+            "pi05_prefix_kv_only": lm_precision == "lerobot_bf16",
+        },
         enforce_eager=False,
     )
     # Constructed the way DiffusersLoader does it: under the serving dtype as
@@ -127,6 +143,7 @@ def pipeline(request):
     # Requests then run under the float32 default.
     with set_default_torch_dtype(od_config.dtype):
         pipe = Pi05Pipeline(od_config=od_config)
+    assert pipe.model.paligemma_with_expert.lm_precision == lm_precision
     yield pipe
     # pytest still holds the fixture value during teardown, so release the
     # weights explicitly before the next dtype loads its copy.
@@ -208,7 +225,10 @@ def test_optimized_path_matches_eager(outputs, pipeline, num_views, num_steps):
     max_rel, max_abs = TOLERANCE[pipeline._torch_dtype]
     rel = ((actual - reference).norm() / reference.norm()).item()
     abs_diff = (actual - reference).abs().max().item()
-    print(f"\n{pipeline._torch_dtype} views={num_views} steps={num_steps}: rel L2 {rel:.3e}, max |diff| {abs_diff:.3e}")
+    print(
+        f"\ndtype={pipeline._torch_dtype} lm={pipeline.config.lm_precision} "
+        f"views={num_views} steps={num_steps}: rel L2 {rel:.3e}, max |diff| {abs_diff:.3e}"
+    )
     assert rel <= max_rel and abs_diff <= max_abs, (
         f"optimized path moved the chunk by rel L2 {rel:.3e}, max |diff| {abs_diff:.3e}; "
         f"allowed {max_rel:.1e}, {max_abs:.1e}"
@@ -254,28 +274,44 @@ def test_reported_deterministic_failing_case_for_regression(pipeline):
 def test_prefix_forward_is_bit_exact(pipeline, num_views):
     """Every denoising step attends over the prefix K/V and amplifies any
     rounding difference in it into the whole chunk, so the fused prefix pass
-    equals the eager one bit for bit: its K/V cache slots and its output."""
+    equals the eager one bit for bit: its K/V cache slots and its output.
+    KV-only calls keep those same K/V slots while discarding final hidden work."""
     model = pipeline.model
     images, image_masks, lang_tokens, lang_masks = pipeline.processor.build_model_inputs(
         _robot_obs(pipeline.config, num_views, seed=0)
     )
-    results = []
+    results = {}
     with torch.inference_mode():
         embs, pad_masks, att_masks = model.embed_prefix(images, image_masks, lang_tokens, lang_masks)
         prefix_len = embs.shape[1]
-        for fused_kernels in (False, True):
-            kv_cache = model.new_kv_cache(1, prefix_len)
-            with _path(model, graphs=None, fused_kernels=fused_kernels):
-                (out, _), _ = model.paligemma_with_expert.forward(
-                    attention_mask=prepare_attention_masks_4d(make_att_2d_masks(pad_masks, att_masks)),
-                    position_ids=torch.cumsum(pad_masks, dim=1) - 1,
-                    past_key_values=kv_cache,
-                    inputs_embeds=[embs, None],
-                    use_cache=True,
+        for kv_only in (False, True):
+            for fused_kernels in (False, True):
+                kv_cache = model.new_kv_cache(1, prefix_len)
+                with _path(model, graphs=None, fused_kernels=fused_kernels):
+                    (out, _), _ = model.paligemma_with_expert.forward(
+                        attention_mask=prepare_attention_masks_4d(make_att_2d_masks(pad_masks, att_masks)),
+                        position_ids=torch.cumsum(pad_masks, dim=1) - 1,
+                        past_key_values=kv_cache,
+                        inputs_embeds=[embs, None],
+                        use_cache=True,
+                        prefix_kv_only=kv_only,
+                    )
+                results[(kv_only, fused_kernels)] = (
+                    out,
+                    kv_cache.key[:, :, :, :prefix_len],
+                    kv_cache.value[:, :, :, :prefix_len],
                 )
-            results.append((out, kv_cache.key[:, :, :, :prefix_len], kv_cache.value[:, :, :, :prefix_len]))
-    for name, eager, fused in zip(("output", "prefix K", "prefix V"), *results):
-        assert torch.equal(fused, eager), f"fused prefix {name} differs from eager"
+    full_eager = results[(False, False)]
+    assert full_eager[0] is not None
+    for (kv_only, fused_kernels), actual in results.items():
+        if kv_only:
+            assert actual[0] is None
+        else:
+            assert torch.equal(actual[0], full_eager[0]), "fused full prefix output differs from eager"
+        for name, expected, output in zip(("K", "V"), full_eager[1:], actual[1:]):
+            assert torch.equal(output, expected), (
+                f"prefix {name} differs from full eager (KV-only={kv_only}, fused={fused_kernels})"
+            )
 
 
 def test_cases_differ_from_each_other(outputs):

@@ -53,6 +53,8 @@ from transformers.models.paligemma.modeling_paligemma import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
+from vllm_omni.diffusion.models.pi05.config import SUPPORTED_LM_PRECISIONS
+from vllm_omni.diffusion.models.pi05.precision_kernels_pi05 import residual_rms_norm, scaled_masked_softmax
 from vllm_omni.diffusion.models.pi05.runtime_pi05 import Pi05RuntimeOptions
 from vllm_omni.diffusion.models.pi05.vision_pi05 import Pi05VisionOptions, configure_vision_precision
 
@@ -276,7 +278,9 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(b, nh * n_rep, s, d)
 
 
-def _attend(query_states, key_states, value_states, attention_mask, num_kv_groups, scaling):
+def _attend(
+    query_states, key_states, value_states, attention_mask, num_kv_groups, scaling, *, exact_bf16_softmax=False
+):
     """Manual eager attention: ``softmax(Q Kᵀ · scale + mask) · V``.
 
     The mask is sliced to ``key_states.shape[-2]`` so the same
@@ -285,10 +289,15 @@ def _attend(query_states, key_states, value_states, attention_mask, num_kv_group
     """
     k = _repeat_kv(key_states, num_kv_groups)
     v = _repeat_kv(value_states, num_kv_groups)
-    attn_weights = torch.matmul(query_states, k.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask[:, :, :, : k.shape[-2]]
-    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_weights = torch.matmul(query_states, k.transpose(2, 3))
+    if exact_bf16_softmax:
+        mask = None if attention_mask is None else attention_mask[:, :, :, : k.shape[-2]]
+        attn_weights = scaled_masked_softmax(attn_weights, mask, scaling, output_dtype=query_states.dtype)
+    else:
+        attn_weights = attn_weights * scaling
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask[:, :, :, : k.shape[-2]]
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
     return torch.matmul(attn_weights, v)
 
 
@@ -937,6 +946,50 @@ def _fused_rms_norm(
     )
 
 
+def _can_use_accurate_expert_triton_qkv(
+    x: torch.Tensor,
+    attn: nn.Module,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+) -> bool:
+    """Select the QKV GEMM validated on H100 with the default BF16 expert.
+
+    Other runtimes and geometries keep eager's cuBLAS projections. Checkpoint
+    parity is empirical; arbitrary weights need not produce identical GEMMs.
+    """
+    if (
+        not HAS_TRITON
+        or str(torch.__version__).split("+")[0] != "2.13.0"
+        or torch.version.cuda != "13.2"
+        or torch.version.hip is not None
+        or x.device.type != "cuda"
+        or x.shape != (50, 1024)
+    ):
+        return False
+    tensors_and_shapes = (
+        (x, (50, 1024)),
+        (cos, (50, 256)),
+        (sin, (50, 256)),
+        (q_out, (8, 50, 256)),
+        (k_out, (50, 256)),
+        (v_out, (50, 256)),
+        (attn.q_proj.weight, (2048, 1024)),
+        (attn.k_proj.weight, (256, 1024)),
+        (attn.v_proj.weight, (256, 1024)),
+    )
+    if any(
+        value.shape != shape or value.dtype != torch.bfloat16 or value.device != x.device or not value.is_contiguous()
+        for value, shape in tensors_and_shapes
+    ):
+        return False
+    if any(proj.bias is not None for proj in (attn.q_proj, attn.k_proj, attn.v_proj)):
+        return False
+    return torch.cuda.get_device_capability(x.device) == (9, 0)
+
+
 def _fused_qkv_rope(
     x: torch.Tensor,
     attn: nn.Module,
@@ -1077,15 +1130,20 @@ def _fused_linear_residual(
     residual: torch.Tensor,
     out: torch.Tensor,
     gate: torch.Tensor | None = None,
+    *,
+    triton_gemm: bool = True,
 ) -> None:
-    """``out = residual + [gate ·] linear(x)``; ``out`` may be ``residual``."""
+    """``out = residual + [gate ·] linear(x)``; ``out`` may be ``residual``.
+
+    ``triton_gemm=False`` keeps eager's projection and fuses its epilogue.
+    """
     n_rows, n_in = x.shape
     n_out = linear.out_features
     dtype = linear.weight.dtype
-    fused_gemm = _triton_gemms(dtype)
+    fused_gemm = triton_gemm and _triton_gemms(dtype)
     if not fused_gemm:
         x = linear(x[None])[0]
-    tiles = _tiles("linear", dtype)
+    tiles = _tiles("linear", dtype) if fused_gemm else _EPILOGUE_TILES
     _linear_residual_kernel[(triton.cdiv(n_rows, tiles.block_m), triton.cdiv(n_out, tiles.block_n))](
         x,
         linear.weight,
@@ -1188,15 +1246,16 @@ def _fused_prefix_forward(
     *,
     prefix_kv_only: bool = False,
     rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+    accurate_bf16: bool = False,
 ) -> torch.Tensor | None:
     """``PaliGemmaWithActionExpertPi05.forward``'s prefix pass, batch 1, with fused kernels.
 
-    Bit-exact with the eager pass: every denoising step attends over the
-    prefix K/V and amplifies any rounding difference in it, so the norms,
-    residual adds, GEMMs and attention are the torch ops eager runs. Fused are
-    only RoPE, which writes the layer's K/V straight into ``kv_cache``, and the
-    GELU. ``prefix_kv_only`` explicitly discards the unused final hidden
-    state and skips the last layer's Q/attention/MLP plus final norm.
+    GEMMs remain separate PyTorch projections. The legacy path retains its
+    PyTorch residual/norm operations; ``accurate_bf16`` additionally fuses these
+    with the audited PyTorch reduction order, falling back to PyTorch outside
+    supported layouts/releases. RoPE writes directly into ``kv_cache`` and
+    GELU preserves eager rounding. ``prefix_kv_only`` skips the unused final
+    Q/attention/MLP and final norm.
     """
     lm = paligemma.model.language_model
     x_in = inputs_embeds[0]
@@ -1206,8 +1265,13 @@ def _fused_prefix_forward(
     num_heads = first_attn.config.num_attention_heads
     head_dim = first_attn.head_dim
     device = x_in.device
+    accurate_bf16 = accurate_bf16 and x_in.dtype == torch.bfloat16 and proj_dtype == torch.bfloat16
 
-    hidden_states = torch.empty(seq_len, width, dtype=torch.promote_types(x_in.dtype, proj_dtype), device=device)
+    hidden_states = (
+        None
+        if accurate_bf16
+        else torch.empty(seq_len, width, dtype=torch.promote_types(x_in.dtype, proj_dtype), device=device)
+    )
     x_normed = torch.empty(seq_len, width, dtype=proj_dtype, device=device)
     q = torch.empty(num_heads, seq_len, head_dim, dtype=proj_dtype, device=device)
     # Every eager layer builds this same table, in its V projection's dtype.
@@ -1216,7 +1280,11 @@ def _fused_prefix_forward(
     residual, mlp_out = x_in, None
     for layer_idx, layer in enumerate(lm.layers):
         attn = layer.self_attn
-        if mlp_out is None:
+        if accurate_bf16:
+            residual, x_normed = residual_rms_norm(
+                residual, layer.input_layernorm.weight, add=mlp_out, eps=layer.input_layernorm.eps
+            )
+        elif mlp_out is None:
             x_normed.copy_(layer.input_layernorm(residual))
         else:
             torch.add(mlp_out, residual, out=hidden_states)
@@ -1243,13 +1311,21 @@ def _fused_prefix_forward(
             scaling=1.0 / math.sqrt(head_dim),
         )
         attn_out = attn.o_proj(att.transpose(1, 2).reshape(1, seq_len, num_heads * head_dim))[0]
-        torch.add(attn_out, residual, out=hidden_states)
-        x_normed.copy_(layer.post_attention_layernorm(hidden_states))
-        residual = hidden_states
+        if accurate_bf16:
+            residual, x_normed = residual_rms_norm(
+                residual, layer.post_attention_layernorm.weight, add=attn_out, eps=layer.post_attention_layernorm.eps
+            )
+        else:
+            torch.add(attn_out, residual, out=hidden_states)
+            x_normed.copy_(layer.post_attention_layernorm(hidden_states))
+            residual = hidden_states
         gate = layer.mlp.gate_proj(x_normed[None])
         _fused_gelu_mul(gate, layer.mlp.up_proj(x_normed[None]), gate)
         mlp_out = layer.mlp.down_proj(gate)[0]
 
+    if accurate_bf16:
+        _, normalized = residual_rms_norm(residual, lm.norm.weight, add=mlp_out, eps=lm.norm.eps)
+        return normalized[None]
     torch.add(mlp_out, residual, out=hidden_states)
     return lm.norm(hidden_states[None])
 
@@ -1265,21 +1341,24 @@ def _fused_denoise_forward(
     *,
     rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     adarms_modulations: torch.Tensor | None = None,
+    accurate_bf16: bool = False,
 ) -> torch.Tensor:
     """The suffix pass and output head of ``denoise_step``, batch 1, with fused kernels.
 
     Per layer: AdaRMS norm, QKV projection + RoPE writing the suffix K/V
     behind the cached prefix, attention over the whole cache row, and the
     ``o_proj`` and MLP GEMMs with their gated residuals and GELU; then the final
-    AdaRMS norm fused with ``action_out_proj``. In bfloat16 the GEMMs run in
-    Triton with what follows them fused in; in float32 they stay on cuBLAS and
-    only what follows them is fused. Returns ``v_t``.
+    AdaRMS norm and ``action_out_proj``. The legacy path fuses BF16 GEMMs in
+    Triton. ``accurate_bf16`` keeps cuBLAS projections except for the audited
+    H100 QKV geometry, and preserves eager's batched attention layout, with
+    exact AdaRMS and fused RoPE, gated residuals and gate/up GELU. Returns ``v_t``.
     """
     expert = gemma_expert.model
     x_in = suffix_embs[0]
     seq_len, width = x_in.shape
     first_layer = expert.layers[0]
     proj_dtype = first_layer.self_attn.q_proj.weight.dtype
+    accurate_bf16 = accurate_bf16 and x_in.dtype == torch.bfloat16 and proj_dtype == torch.bfloat16
     num_heads = first_layer.self_attn.config.num_attention_heads
     head_dim = first_layer.self_attn.head_dim
     prefix_len = kv_cache.prefix_len
@@ -1289,7 +1368,7 @@ def _fused_denoise_forward(
     hidden_states = torch.empty(seq_len, width, dtype=torch.promote_types(x_in.dtype, proj_dtype), device=device)
     x_normed = torch.empty(seq_len, width, dtype=proj_dtype, device=device)
     q = torch.empty(num_heads, seq_len, head_dim, dtype=proj_dtype, device=device)
-    scores = torch.empty(num_heads * seq_len, n_keys, dtype=proj_dtype, device=device)
+    scores = None if accurate_bf16 else torch.empty(num_heads * seq_len, n_keys, dtype=proj_dtype, device=device)
     att = torch.empty(seq_len, num_heads * head_dim, dtype=proj_dtype, device=device)
     mlp_hidden = torch.empty(seq_len, first_layer.mlp.gate_proj.out_features, dtype=proj_dtype, device=device)
     cos, sin = expert.rotary_emb(x_normed, position_ids) if rotary_emb is None else rotary_emb
@@ -1305,10 +1384,32 @@ def _fused_denoise_forward(
             if adarms_modulations is None
             else adarms_modulations[2 * layer_idx, 0]
         )
-        _fused_rms_norm(residual, layer.input_layernorm, x_normed, modulation=modulation)
-        _fused_qkv_rope(x_normed, attn, cos[0], sin[0], q, key[prefix_len:], value[prefix_len:])
-        _fused_attention(q, key, value, mask, 1.0 / math.sqrt(head_dim), scores, att)
-        _fused_linear_residual(att, attn.o_proj, residual, hidden_states, gate=modulation[2 * width :])
+        if accurate_bf16:
+            _, x_normed = residual_rms_norm(
+                residual, modulation[:width], shift=modulation[width : 2 * width], eps=layer.input_layernorm.eps
+            )
+            qkv_inputs = (x_normed, attn, cos[0], sin[0], q, key[prefix_len:], value[prefix_len:])
+            _fused_qkv_rope(*qkv_inputs, triton_gemm=_can_use_accurate_expert_triton_qkv(*qkv_inputs))
+            # Keep the eager [batch, heads, query, key] GEMM layout. Flattening
+            # heads can select another cuBLAS algorithm and BF16 rounding path.
+            attention = _attend(
+                q[None],
+                key[None, None],
+                value[None, None],
+                attention_mask,
+                num_heads,
+                1.0 / math.sqrt(head_dim),
+                exact_bf16_softmax=True,
+            )
+            att = attention.transpose(1, 2).reshape(seq_len, num_heads * head_dim)
+            _fused_linear_residual(
+                att, attn.o_proj, residual, hidden_states, gate=modulation[2 * width :], triton_gemm=False
+            )
+        else:
+            _fused_rms_norm(residual, layer.input_layernorm, x_normed, modulation=modulation)
+            _fused_qkv_rope(x_normed, attn, cos[0], sin[0], q, key[prefix_len:], value[prefix_len:])
+            _fused_attention(q, key, value, mask, 1.0 / math.sqrt(head_dim), scores, att)
+            _fused_linear_residual(att, attn.o_proj, residual, hidden_states, gate=modulation[2 * width :])
         residual = hidden_states
 
         modulation = (
@@ -1316,16 +1417,39 @@ def _fused_denoise_forward(
             if adarms_modulations is None
             else adarms_modulations[2 * layer_idx + 1, 0]
         )
-        _fused_rms_norm(hidden_states, layer.post_attention_layernorm, x_normed, modulation=modulation)
+        if accurate_bf16:
+            _, x_normed = residual_rms_norm(
+                hidden_states,
+                modulation[:width],
+                shift=modulation[width : 2 * width],
+                eps=layer.post_attention_layernorm.eps,
+            )
+        else:
+            _fused_rms_norm(hidden_states, layer.post_attention_layernorm, x_normed, modulation=modulation)
         _fused_linear_gelu_mul(x_normed, layer.mlp, mlp_hidden)
-        _fused_linear_residual(
-            mlp_hidden, layer.mlp.down_proj, hidden_states, hidden_states, gate=modulation[2 * width :]
-        )
+        if accurate_bf16:
+            _fused_linear_residual(
+                mlp_hidden,
+                layer.mlp.down_proj,
+                hidden_states,
+                hidden_states,
+                gate=modulation[2 * width :],
+                triton_gemm=False,
+            )
+        else:
+            _fused_linear_residual(
+                mlp_hidden, layer.mlp.down_proj, hidden_states, hidden_states, gate=modulation[2 * width :]
+            )
 
-    v_t = torch.empty(1, seq_len, action_out_proj.out_features, dtype=action_out_proj.weight.dtype, device=device)
     modulation = (
         _adarms_modulation(expert.norm, adarms_cond) if adarms_modulations is None else adarms_modulations[-1, 0]
     )
+    if accurate_bf16:
+        _, normalized = residual_rms_norm(
+            hidden_states, modulation[:width], shift=modulation[width : 2 * width], eps=expert.norm.eps
+        )
+        return action_out_proj(normalized[None].to(action_out_proj.weight.dtype))
+    v_t = torch.empty(1, seq_len, action_out_proj.out_features, dtype=action_out_proj.weight.dtype, device=device)
     _fused_final_head(hidden_states, expert.norm, modulation, action_out_proj, v_t[0])
     return v_t
 
@@ -1402,6 +1526,24 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         # optimized path; ``False`` is the eager baseline.
         self.fused_kernels = False
         self.vision_options = Pi05VisionOptions()
+        self.lm_precision = "legacy"
+
+    def prepare_lm_inputs(self, inputs_embeds: torch.Tensor, language_model: nn.Module) -> torch.Tensor:
+        """Apply the decoder-entry cast used by LeRobot's PiGemmaModel.
+
+        This controls both prefix and expert residual streams. Norms retain
+        their FP32 arithmetic and return the input dtype, so casting here also
+        preserves LeRobot's BF16 norm, gate and residual rounding points.
+        Vision embeddings, action projections and the Euler update keep their
+        existing dtypes. This option alone is not whole-model LeRobot parity.
+        """
+        if (
+            getattr(self, "lm_precision", "legacy") == "lerobot_bf16"
+            and len(language_model.layers) > 0
+            and language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16
+        ):
+            return inputs_embeds.to(torch.bfloat16)
+        return inputs_embeds
 
     def _install_adarms_norms(self, action_expert_config) -> None:
         """Replace every action-expert RMSNorm with a conditioned AdaRMS norm."""
@@ -1485,7 +1627,7 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
             )
 
         if inputs_embeds[1] is None:
-            hidden_states = inputs_embeds[0]
+            hidden_states = self.prepare_lm_inputs(inputs_embeds[0], pali_lm)
             if (
                 use_cache
                 and attention_mask is not None
@@ -1502,6 +1644,7 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
                     past_key_values,
                     prefix_kv_only=prefix_kv_only,
                     rotary_emb=rotary_emb,
+                    accurate_bf16=self.lm_precision == "lerobot_bf16",
                 )
                 return [hidden_states, None], past_key_values
             for layer_idx in range(num_layers):
@@ -1525,7 +1668,7 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
                 "PaliGemmaWithActionExpertPi05.forward only supports prefix-only "
                 "or suffix-only dispatch; got both inputs_embeds populated."
             )
-        hidden_states = inputs_embeds[1]
+        hidden_states = self.prepare_lm_inputs(inputs_embeds[1], expert_lm)
         for layer_idx in range(num_layers):
             hidden_states = _compute_layer_suffix_only(
                 layer_idx,
@@ -1567,6 +1710,9 @@ class Pi05ForActionPrediction(nn.Module):
         # quant_config is not plumbed through; the weight dtype comes from the pipeline.
         del quant_config
         self.config = config
+        lm_precision = getattr(config, "lm_precision", "legacy")
+        if not isinstance(lm_precision, str) or lm_precision not in SUPPORTED_LM_PRECISIONS:
+            raise ValueError(f"Unsupported Pi0.5 lm_precision: {lm_precision!r}.")
 
         self.action_dim = getattr(config, "max_action_dim", DEFAULT_ACTION_DIM)
         self.max_state_dim = getattr(config, "max_state_dim", self.action_dim)
@@ -1582,6 +1728,7 @@ class Pi05ForActionPrediction(nn.Module):
 
         # Dual backbone
         self.paligemma_with_expert = PaliGemmaWithActionExpertPi05(vlm_config, expert_config)
+        self.paligemma_with_expert.lm_precision = lm_precision
 
         # Action chunk projections.
         self.action_in_proj = nn.Linear(self.action_dim, self.expert_width)
@@ -1973,6 +2120,11 @@ class Pi05ForActionPrediction(nn.Module):
             position_ids = context.position_ids
             rotary_emb = (context.cos, context.sin)
 
+        # The fused expert bypasses backbone.forward, so apply the same
+        # decoder-entry cast before selecting either execution path.
+        suffix_embs = self.paligemma_with_expert.prepare_lm_inputs(
+            suffix_embs, self.paligemma_with_expert.gemma_expert.model
+        )
         if (
             _fused_kernels_serve(self.paligemma_with_expert, past_key_values, batch_size)
             and past_key_values.fits(batch_size, prefix_len)
@@ -1988,6 +2140,7 @@ class Pi05ForActionPrediction(nn.Module):
                 self.action_out_proj,
                 rotary_emb=rotary_emb,
                 adarms_modulations=adarms_modulations,
+                accurate_bf16=self.paligemma_with_expert.lm_precision == "lerobot_bf16",
             )
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(

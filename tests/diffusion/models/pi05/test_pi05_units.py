@@ -24,6 +24,7 @@ behaviour still produces a well-shaped, finite action chunk:
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -31,6 +32,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.models.pi05 import modeling_pi05
+from vllm_omni.diffusion.models.pi05 import precision_kernels_pi05 as kernels
 from vllm_omni.diffusion.models.pi05.config import (
     Pi05Config,
     UnsupportedCheckpointCapabilityError,
@@ -172,7 +174,7 @@ def test_p0_cannot_change_vision_options_after_graph_install():
         model.configure_vision(Pi05VisionOptions(precision="selective_bf16"))
 
 
-def _p0_runtime_model(dtype):
+def _p0_runtime_model(dtype, lm_precision="legacy"):
     """Real small Gemma/SigLIP with nonzero conditioning, preserving model APIs."""
     from types import SimpleNamespace
 
@@ -234,12 +236,145 @@ def _p0_runtime_model(dtype):
                 tokenizer_max_length=4,
                 image_resolution=(8, 8),
                 num_inference_steps=10,
+                lm_precision=lm_precision,
             )
         )
     _set_inference_dtype(model, dtype)
     model.eval()
     model.kv_cache = model.new_kv_cache(batch_size=1)
     return model
+
+
+@pytest.mark.parametrize("value", ["bf16", None, False, ["lerobot_bf16"]])
+def test_lm_precision_rejects_unknown_values(value):
+    with pytest.raises(ValueError, match="lm_precision"):
+        Pi05Config(lm_precision=value)
+
+
+@pytest.mark.parametrize("mode", ["legacy", "lerobot_bf16"])
+def test_lm_precision_pipeline_argument_reaches_config(mode):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    pipeline = object.__new__(Pi05Pipeline)
+    pipeline.model_dir = None
+    args = SimpleNamespace(model_config={}, custom_pipeline_args={"pi05_lm_precision": mode})
+    assert pipeline._build_config(args).lm_precision == mode
+    assert args.model_config == {}  # Resolving an option must not mutate the caller.
+    assert Pi05Config().lm_precision == "legacy"
+
+
+@pytest.mark.parametrize("mode", ["legacy", "lerobot_bf16"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_lm_precision_controls_prefix_and_expert_norm_residual_dtype(mode, dtype):
+    model = _p0_runtime_model(dtype, mode)
+    backbone = model.paligemma_with_expert
+    expected_dtype = torch.bfloat16 if mode == "lerobot_bf16" and dtype == torch.bfloat16 else torch.float32
+    observed = []
+    handles = []
+
+    def record(_module, args, result):
+        values = result if isinstance(result, tuple) else (result,)
+        observed.append((args[0].dtype, tuple(value.dtype for value in values if value is not None)))
+
+    for lm in (backbone.paligemma.model.language_model, backbone.gemma_expert.model):
+        for layer in lm.layers:
+            handles.extend(
+                norm.register_forward_hook(record) for norm in (layer.input_layernorm, layer.post_attention_layernorm)
+            )
+        handles.append(lm.norm.register_forward_hook(record))
+
+    prefix = torch.randn(1, 16, 16)
+    suffix = torch.randn(1, 4, 16)
+    cond = torch.randn(1, 16)  # The factory uses nonzero AdaRMS weights and biases.
+    cache = model.new_kv_cache(batch_size=1)
+    try:
+        prefix_output, _ = backbone.forward(
+            inputs_embeds=[prefix, None],
+            attention_mask=torch.zeros(1, 1, 16, 16),
+            position_ids=torch.arange(16)[None],
+            past_key_values=cache,
+            use_cache=True,
+        )
+        suffix_output, _ = backbone.forward(
+            inputs_embeds=[None, suffix],
+            attention_mask=torch.zeros(1, 1, 4, 20),
+            position_ids=torch.arange(16, 20)[None],
+            past_key_values=cache,
+            adarms_cond=cond,
+        )
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert prefix_output[0].dtype == suffix_output[1].dtype == expected_dtype
+    assert len(observed) == 10
+    assert all(input_dtype == expected_dtype for input_dtype, _ in observed)
+    assert all(all(output_dtype == expected_dtype for output_dtype in outputs) for _, outputs in observed)
+    assert prefix.dtype == suffix.dtype == cond.dtype == torch.float32
+    assert model.action_in_proj.weight.dtype == model.action_out_proj.weight.dtype == torch.float32
+    prefix_rope = model.prepare_prefix_rotary(prefix, torch.arange(16)[None])
+    context = model.prepare_denoise_context(torch.ones(1, 16, dtype=torch.bool))
+    assert prefix_rope[0].dtype == prefix_rope[1].dtype == dtype
+    assert context.cos.dtype == context.sin.dtype == dtype
+
+
+def test_legacy_lm_precision_keeps_original_prefix_hidden_and_kv_exact():
+    model = _p0_runtime_model(torch.bfloat16)
+    backbone = model.paligemma_with_expert
+    prefix = torch.randn(1, 16, 16)
+    mask = torch.zeros(1, 1, 16, 16)
+    positions = torch.arange(16)[None]
+    hidden = prefix
+    expected_kv = []
+    for index in range(2):
+        hidden, kv = modeling_pi05._compute_layer_prefix_only(index, hidden, mask, positions, backbone.paligemma)
+        expected_kv.append(kv)
+    hidden = backbone.paligemma.model.language_model.norm(hidden)
+    cache = model.new_kv_cache(batch_size=1)
+    output, _ = backbone.forward(
+        inputs_embeds=[prefix, None],
+        attention_mask=mask,
+        position_ids=positions,
+        past_key_values=cache,
+        use_cache=True,
+    )
+    torch.testing.assert_close(output[0], hidden, rtol=0, atol=0)
+    for index, (key, value) in enumerate(expected_kv):
+        torch.testing.assert_close(cache.key[index, :, :, :16], key, rtol=0, atol=0)
+        torch.testing.assert_close(cache.value[index, :, :, :16], value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_lm_precision_leaves_vision_timestep_and_fp32_execution_unchanged(dtype):
+    import copy
+
+    torch.manual_seed(421)
+    legacy = _p0_runtime_model(dtype)
+    aligned = copy.deepcopy(legacy)
+    aligned.paligemma_with_expert.lm_precision = "lerobot_bf16"
+    inputs = dict(
+        images=[torch.randn(1, 3, 8, 8) for _ in range(3)],
+        image_masks=[torch.tensor([True]), torch.tensor([False]), torch.tensor([True])],
+        lang_tokens=torch.tensor([[1, 2, 3, 4]]),
+        lang_masks=torch.tensor([[True, True, False, False]]),
+    )
+    for actual, expected in zip(aligned.embed_prefix(**inputs), legacy.embed_prefix(**inputs)):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for model in (legacy, aligned):
+        model.configure_runtime(Pi05RuntimeOptions(precompute_adarms=True))
+        model.prepare_runtime_caches()
+    for actual, expected in zip(aligned.runtime_step_table(10, 1), legacy.runtime_step_table(10, 1)):
+        for name in ("timestep", "time_cond", "modulations"):
+            torch.testing.assert_close(getattr(actual, name), getattr(expected, name), rtol=0, atol=0)
+    noise = torch.randn(1, 4, 4)
+    original = legacy.sample_actions(**inputs, noise=noise)
+    result = aligned.sample_actions(**inputs, noise=noise)
+    if dtype == torch.float32:
+        torch.testing.assert_close(result, original, rtol=0, atol=0)
+    else:
+        assert not torch.equal(result, original), "The BF16 decoder-entry policy must actually affect execution."
+    assert result.dtype == torch.float32  # FP32 Euler integration and action output are preserved.
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -396,6 +531,7 @@ def test_p0_pipeline_ordinary_conversion_before_capture_is_unchanged():
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("num_steps", [1, 4, 10])
+@pytest.mark.parametrize("lm_precision", ["legacy", "lerobot_bf16"])
 @pytest.mark.parametrize(
     "flags",
     [
@@ -405,10 +541,10 @@ def test_p0_pipeline_ordinary_conversion_before_capture_is_unchanged():
         {"precompute_adarms": True, "hoist_denoise_invariants": True, "prefix_kv_only": True},
     ],
 )
-def test_p0_runtime_flags_preserve_actions_across_requests(dtype, num_steps, flags):
+def test_p0_runtime_flags_preserve_actions_across_requests(dtype, num_steps, lm_precision, flags):
     import copy
 
-    model = _p0_runtime_model(dtype)
+    model = _p0_runtime_model(dtype, lm_precision)
     optimized = copy.deepcopy(model)
     optimized.configure_runtime(Pi05RuntimeOptions(**flags))
     optimized.prepare_runtime_caches()
@@ -438,8 +574,9 @@ def test_p0_runtime_flags_preserve_actions_across_requests(dtype, num_steps, fla
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_p0_prefix_kv_only_keeps_general_forward_and_skips_unused_modules(dtype, monkeypatch):
-    model = _p0_runtime_model(dtype)
+@pytest.mark.parametrize("lm_precision", ["legacy", "lerobot_bf16"])
+def test_p0_prefix_kv_only_keeps_general_forward_and_skips_unused_modules(dtype, lm_precision, monkeypatch):
+    model = _p0_runtime_model(dtype, lm_precision)
     backbone = model.paligemma_with_expert
     embs = torch.randn(1, 16, 16)
     position_ids = torch.arange(16)[None, :]
@@ -1848,3 +1985,191 @@ def test_request_denoising_steps_must_be_a_positive_integer(bad):
     with pytest.raises(ValueError, match="num_inference_steps must be a positive integer"):
         _spy_pipeline(spy).forward(_spy_request(bad))
     assert spy.seen == []
+
+
+def _exact_norm_reference(x, weight, add=None, shift=None, eps=1e-6):
+    residual = x if add is None else x + add
+    value = residual.float()
+    value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + eps)
+    value = value * (1.0 + weight.float())
+    if shift is not None:
+        value = value + shift.float()
+    return residual, value.to(residual.dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(3, 17), (15, 1024), (2, 16, 2048)])
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_exact_norm_cpu_fallback(dtype, shape, adaptive):
+    generator = torch.Generator().manual_seed(419)
+    x = torch.randn(shape, generator=generator).to(dtype)
+    add = torch.randn(shape, generator=generator).to(dtype)
+    weight = torch.randn(shape[-1], generator=generator) * 0.2
+    shift = torch.randn(shape[-1], generator=generator) * 0.2 if adaptive else None
+    assert not kernels.can_use_exact_rms_norm(x, weight, add=add, shift=shift)
+    actual = kernels.residual_rms_norm(x, weight, add=add, shift=shift)
+    expected = _exact_norm_reference(x, weight, add, shift)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+
+
+def test_exact_norm_fallback_preserves_autograd_and_input_ownership():
+    x = torch.randn(16, 17, requires_grad=True)
+    weight = torch.randn(17, requires_grad=True)
+    residual, actual = kernels.residual_rms_norm(x, weight)
+    _, expected = _exact_norm_reference(x, weight)
+    assert residual is x
+    assert torch.equal(actual, expected)
+    actual_grads = torch.autograd.grad(actual.sum(), (x, weight), retain_graph=True)
+    expected_grads = torch.autograd.grad(expected.sum(), (x, weight))
+    assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads))
+
+
+@pytest.mark.parametrize("version", ["2.11.0+cu128", "2.13.1", "2.14.0.dev20261012", "3.0.0"])
+def test_exact_norm_unknown_torch_release_uses_fallback(monkeypatch, version):
+    monkeypatch.setattr(torch, "__version__", version)
+    assert not kernels._supported_torch_reduction()
+
+
+def test_exact_norm_amd_uses_fallback(monkeypatch):
+    monkeypatch.setattr(torch, "__version__", "2.13.0+rocm7.0")
+    monkeypatch.setattr(torch.version, "hip", "7.0")
+    assert not kernels._supported_torch_reduction()
+
+
+def test_exact_norm_batched_modulation_fallback():
+    x = torch.randn(2, 16, 1024).to(torch.bfloat16)
+    scale = torch.randn(2, 1, 1024)
+    shift = torch.randn_like(scale)
+    actual = kernels.residual_rms_norm(x, scale, shift=shift)
+    expected = _exact_norm_reference(x, scale, shift=shift)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("mask_kind", ["none", "broadcast", "strided"])
+@pytest.mark.parametrize("output_dtype", [None, torch.float32])
+def test_exact_softmax_cpu_fallback(dtype, mask_kind, output_dtype):
+    generator = torch.Generator().manual_seed(193)
+    scores = torch.randn(2, 3, 5, 17, generator=generator).to(dtype)
+    mask = None if mask_kind == "none" else torch.randn(2, 1, 5, 17, generator=generator)
+    if mask_kind == "strided":
+        mask = torch.stack((mask, mask), dim=-1)[..., 0]
+        assert not mask.is_contiguous()
+    assert not kernels.can_use_exact_scaled_masked_softmax(scores, mask, 0.3, output_dtype=output_dtype)
+    expected = scores * 0.3
+    if mask is not None:
+        expected = expected + mask
+    expected = torch.softmax(expected, dim=-1, dtype=torch.float32).to(output_dtype or dtype)
+    actual = kernels.scaled_masked_softmax(scores, mask, 0.3, output_dtype=output_dtype)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_exact_softmax_fallback_preserves_autograd(dtype):
+    scores = torch.randn(1, 2, 3, 11).to(dtype).requires_grad_()
+    mask = torch.randn(1, 1, 3, 11, requires_grad=True)
+    actual = kernels.scaled_masked_softmax(scores, mask, 1.0 / 16)
+    expected = torch.softmax(scores * (1.0 / 16) + mask, dim=-1, dtype=torch.float32).to(dtype)
+    grad = torch.randn_like(actual)
+    actual_grads = torch.autograd.grad(actual, (scores, mask), grad, retain_graph=True)
+    expected_grads = torch.autograd.grad(expected, (scores, mask), grad)
+    assert torch.equal(actual, expected)
+    assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_exact_softmax_attend_opt_in_keeps_default_path(monkeypatch, dtype):
+    query = torch.randn(1, 2, 3, 8).to(dtype)
+    key = torch.randn(1, 1, 7, 8).to(dtype)
+    value = torch.randn_like(key)
+    # An oversized mask must still be sliced at the KV boundary.
+    mask = torch.randn(1, 1, 3, 9)
+    calls = []
+    original = modeling_pi05.scaled_masked_softmax
+
+    def record(scores, sliced_mask, scale, **kwargs):
+        calls.append((scores.shape, sliced_mask.shape, kwargs))
+        return original(scores, sliced_mask, scale, **kwargs)
+
+    monkeypatch.setattr(modeling_pi05, "scaled_masked_softmax", record)
+    expected = modeling_pi05._attend(query, key, value, mask, 2, 1.0 / 16)
+    assert not calls
+    actual = modeling_pi05._attend(query, key, value, mask, 2, 1.0 / 16, exact_bf16_softmax=True)
+    assert calls == [((1, 2, 3, 7), (1, 1, 3, 7), {"output_dtype": dtype})]
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        None,
+        "torch",
+        "cuda",
+        "hip",
+        "sm",
+        "cpu",
+        "dtype",
+        "rows",
+        "width",
+        "stride",
+        "bias",
+        "weight",
+        "device",
+        "heads",
+        "rope",
+    ],
+)
+def test_accurate_expert_qkv_guard(monkeypatch, unsupported):
+    """Metadata-only checks; these stand-ins never execute CUDA or GEMM math."""
+    device = torch.device("cuda:1")
+
+    def tensor(shape):
+        return SimpleNamespace(shape=shape, dtype=torch.bfloat16, device=device, is_contiguous=lambda: True)
+
+    x, cos, sin = tensor((50, 1024)), tensor((50, 256)), tensor((50, 256))
+    q, k, v = tensor((8, 50, 256)), tensor((50, 256)), tensor((50, 256))
+    attn = SimpleNamespace(
+        **{
+            name: SimpleNamespace(weight=tensor(shape), bias=None)
+            for name, shape in (("q_proj", (2048, 1024)), ("k_proj", (256, 1024)), ("v_proj", (256, 1024)))
+        }
+    )
+    monkeypatch.setattr(modeling_pi05, "HAS_TRITON", True)
+    monkeypatch.setattr(torch, "__version__", "2.13.0+cu132")
+    monkeypatch.setattr(torch.version, "cuda", "13.2")
+    monkeypatch.setattr(torch.version, "hip", None)
+    queried_devices = []
+
+    def capability(requested_device):
+        queried_devices.append(requested_device)
+        return (12, 0) if unsupported == "sm" else (9, 0)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
+    if unsupported == "torch":
+        monkeypatch.setattr(torch, "__version__", "2.13.1+cu132")
+    elif unsupported == "cuda":
+        monkeypatch.setattr(torch.version, "cuda", "13.3")
+    elif unsupported == "hip":
+        monkeypatch.setattr(torch.version, "hip", "7.0")
+    elif unsupported == "cpu":
+        x.device = torch.device("cpu")
+    elif unsupported == "dtype":
+        x.dtype = torch.float32
+    elif unsupported == "rows":
+        x.shape = (49, 1024)
+    elif unsupported == "width":
+        x.shape = (50, 2048)
+    elif unsupported == "stride":
+        k.is_contiguous = lambda: False
+    elif unsupported == "bias":
+        attn.k_proj.bias = tensor((256,))
+    elif unsupported == "weight":
+        attn.v_proj.weight.shape = (512, 1024)
+    elif unsupported == "device":
+        attn.q_proj.weight.device = torch.device("cuda:0")
+    elif unsupported == "heads":
+        q.shape = (4, 50, 256)
+    elif unsupported == "rope":
+        cos.dtype = torch.float32
+    assert modeling_pi05._can_use_accurate_expert_triton_qkv(x, attn, cos, sin, q, k, v) == (unsupported is None)
+    assert queried_devices == ([device] if unsupported in (None, "sm") else [])

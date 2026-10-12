@@ -40,8 +40,8 @@ The model benchmark supports independent `--vision-precision` (`fp32`,
 options. The corresponding stage `custom_pipeline_args` keys are
 `pi05_vision_precision` and `pi05_batch_cameras`; CLI values override them.
 Defaults preserve R0's FP32 vision/projector and sequential cameras. Both BF16
-experiments restore FP32 image features before the prefix LM, preserving R0's
-prefix residual dtype. Selective BF16 retains FP32 patch/position embedding
+experiments restore FP32 image features before the prefix LM, preserving the
+default legacy residual policy. Selective BF16 retains FP32 patch/position embedding
 weights and casts their combined output to BF16 before the vision encoder; the
 remaining vision tower, including its encoder and final LayerNorm parameters,
 and the projector use BF16 weights. Autocast instead retains all FP32
@@ -50,6 +50,16 @@ option changes the LM/expert norm weights or their residual precision policy.
 Changing either precision or camera batching can change rounding; action parity
 and task quality need to be evaluated separately from latency.
 The 1/2-camera cases retain three image slots with false masks for missing views.
+
+`--lm-precision legacy|lerobot_bf16` maps to `custom_pipeline_args.pi05_lm_precision`
+and defaults to `legacy`.
+`lerobot_bf16` applies LeRobot's BF16 decoder-entry and residual policy to both
+prefix and action expert when their projection weights are BF16, keeping vision
+and the Euler schedule unchanged.
+This option covers LM activation precision; full pipeline parity requires separate validation.
+Norm fusion is audited for Torch 2.13.0; the fused expert softmax additionally
+requires BF16 `[1,8,50,1018]` scores. Unsupported cases use PyTorch.
+The validated 50-token expert also uses fused QKV GEMMs on CUDA 13.2 / SM90.
 
 Three independent runtime flags are also available, all disabled by default:
 `--precompute-adarms` prepares timestep embeddings, the time MLP, and every
@@ -82,7 +92,8 @@ python benchmarks/pi05/bench_pi05.py --dtype bfloat16 --bs 1 --views 1 2 3 \
 # Full P0 candidate; use --no-<flag> for individual ablations, and compare the
 # same options under --execution-mode eager / fused / graph.
 python benchmarks/pi05/bench_pi05.py --dtype bfloat16 --bs 1 --views 1 2 3 \
-  --vision-precision selective_bf16 --batch-cameras --precompute-adarms \
+  --vision-precision selective_bf16 --lm-precision lerobot_bf16 \
+  --batch-cameras --precompute-adarms \
   --hoist-denoise-invariants --prefix-kv-only --execution-mode graph \
   --warmup 20 --iters 30 --out pi05_p0_all_on/
 ```

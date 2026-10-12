@@ -50,6 +50,7 @@ from transformers.models.gemma.modeling_gemma import (
 )
 
 from vllm_omni.diffusion.models.pi05 import modeling_pi05 as M
+from vllm_omni.diffusion.models.pi05 import precision_kernels_pi05 as kernels
 
 pytestmark = [
     pytest.mark.core_model,
@@ -445,3 +446,258 @@ def test_final_head_matches_norm_and_action_out_proj(dtype):
         dtype,
         _MODULATION_NOTE,
     )
+
+
+def _exact_norm_reference(x, weight, add=None, shift=None, eps=1e-6):
+    residual = x if add is None else x + add
+    value = residual.float()
+    value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + eps)
+    value = value * (1.0 + weight.float())
+    if shift is not None:
+        value = value + shift.float()
+    return residual, value.to(residual.dtype)
+
+
+@pytest.mark.parametrize("shape", [(50, 1024), (968, 2048)])
+@pytest.mark.parametrize("adaptive", [False, True])
+@pytest.mark.parametrize("has_add", [False, True])
+def test_exact_norm_cuda_matches_eager_bitwise(shape, adaptive, has_add):
+    if not kernels.HAS_TRITON or not kernels._supported_torch_reduction():
+        pytest.skip("Fast reduction not audited for the installed Torch release/backend")
+    generator = torch.Generator(device="cuda").manual_seed(173)
+    x = torch.randn(shape, device="cuda", generator=generator).to(torch.bfloat16)
+    add = torch.randn(shape, device="cuda", generator=generator).to(torch.bfloat16) if has_add else None
+    weight = torch.randn(shape[-1], device="cuda", generator=generator) * 0.125
+    shift = torch.randn(shape[-1], device="cuda", generator=generator) * 0.125 if adaptive else None
+    assert kernels.can_use_exact_rms_norm(x, weight, add=add, shift=shift)
+    actual = kernels.residual_rms_norm(x, weight, add=add, shift=shift)
+    expected = _exact_norm_reference(x, weight, add, shift)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+
+
+@pytest.mark.parametrize("kind", ["short", "other_width", "strided", "fp32", "old_torch"])
+def test_exact_norm_cuda_unsupported_cases_fall_back(monkeypatch, kind):
+    shape = (15, 1024) if kind == "short" else (50, 17 if kind == "other_width" else 1024)
+    dtype = torch.float32 if kind == "fp32" else torch.bfloat16
+    x = torch.randn(*shape, device="cuda").to(dtype)
+    if kind == "strided":
+        x = torch.stack((x, x), dim=-1)[..., 0]
+        assert not x.is_contiguous()
+    if kind == "old_torch":
+        monkeypatch.setattr(torch, "__version__", "2.11.0+cu128")
+    weight = torch.randn(shape[-1], device="cuda")
+    assert not kernels.can_use_exact_rms_norm(x, weight)
+    actual = kernels.residual_rms_norm(x, weight)
+    expected = _exact_norm_reference(x, weight)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+
+
+@pytest.mark.parametrize("width", [1024, 2048])
+@torch.no_grad()
+def test_exact_norm_cuda_graph_refreshes_inputs(width):
+    if not kernels.HAS_TRITON or not kernels._supported_torch_reduction():
+        pytest.skip("Fast reduction not audited for the installed Torch release/backend")
+    first = torch.randn(50, width, device="cuda").to(torch.bfloat16)
+    second = torch.randn_like(first)
+    x = first.clone()
+    add = torch.randn_like(x)
+    weight = torch.randn(width, device="cuda")
+    shift = torch.randn_like(weight)
+    assert kernels.can_use_exact_rms_norm(x, weight, add=add, shift=shift)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            kernels.residual_rms_norm(x, weight, add=add, shift=shift)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = kernels.residual_rms_norm(x, weight, add=add, shift=shift)
+    for value in (first, second, first):
+        x.copy_(value)
+        graph.replay()
+        expected = _exact_norm_reference(x, weight, add, shift)
+        assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+
+
+def _exact_softmax_inputs(mask_kind="holes"):
+    generator = torch.Generator(device="cuda").manual_seed(193)
+    scores = torch.randn(1, 8, 50, 1018, device="cuda", generator=generator).to(torch.bfloat16)
+    mask = torch.zeros(1, 1, 50, 1018, device="cuda")
+    if mask_kind == "holes":
+        mask[..., :968:3] = torch.finfo(torch.float32).min
+    elif mask_kind == "causal":
+        blocked = torch.arange(50, device="cuda")[None, :] > torch.arange(50, device="cuda")[:, None]
+        mask[..., 968:].masked_fill_(blocked, torch.finfo(torch.float32).min)
+    elif mask_kind == "all_masked":
+        mask.fill_(torch.finfo(torch.float32).min)
+    elif mask_kind == "soft_bias":
+        mask = torch.randn(mask.shape, device="cuda", generator=generator)
+    return scores, mask
+
+
+def _exact_softmax_reference(scores, mask, scale=1.0 / 16, output_dtype=None):
+    logits = scores * scale
+    if mask is not None:
+        logits = logits + mask
+    return torch.softmax(logits, dim=-1, dtype=torch.float32).to(output_dtype or scores.dtype)
+
+
+@pytest.mark.parametrize("mask_kind", ["all_valid", "holes", "causal", "all_masked", "soft_bias"])
+def test_exact_softmax_cuda_matches_eager_bitwise(mask_kind):
+    if not kernels._supported_torch_reduction():
+        pytest.skip("Softmax reduction not audited for the installed Torch release/backend")
+    scores, mask = _exact_softmax_inputs(mask_kind)
+    assert kernels.can_use_exact_scaled_masked_softmax(scores, mask, 1.0 / 16)
+    actual = kernels.scaled_masked_softmax(scores, mask, 1.0 / 16)
+    assert torch.equal(actual, _exact_softmax_reference(scores, mask))
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["shape", "score_stride", "mask_stride", "fp32", "mask_bf16", "no_mask", "scale", "output_fp32", "old_torch"],
+)
+def test_exact_softmax_cuda_unsupported_cases_fall_back(monkeypatch, kind):
+    scores, mask = _exact_softmax_inputs()
+    scale, output_dtype = 1.0 / 16, None
+    if kind == "shape":
+        scores, mask = scores[..., :9].contiguous(), mask[..., :9].contiguous()
+    elif kind == "score_stride":
+        scores = torch.stack((scores, scores), dim=-1)[..., 0]
+    elif kind == "mask_stride":
+        mask = torch.stack((mask, mask), dim=-1)[..., 0]
+    elif kind == "fp32":
+        scores = scores.float()
+    elif kind == "mask_bf16":
+        mask = mask.to(torch.bfloat16)
+    elif kind == "no_mask":
+        mask = None
+    elif kind == "scale":
+        scale = 0.2
+    elif kind == "output_fp32":
+        output_dtype = torch.float32
+    elif kind == "old_torch":
+        monkeypatch.setattr(torch, "__version__", "2.11.0+cu128")
+    assert not kernels.can_use_exact_scaled_masked_softmax(scores, mask, scale, output_dtype=output_dtype)
+    actual = kernels.scaled_masked_softmax(scores, mask, scale, output_dtype=output_dtype)
+    assert torch.equal(actual, _exact_softmax_reference(scores, mask, scale, output_dtype))
+
+
+def test_exact_softmax_cuda_grad_uses_eager():
+    scores, mask = _exact_softmax_inputs("soft_bias")
+    scores.requires_grad_()
+    mask.requires_grad_()
+    assert not kernels.can_use_exact_scaled_masked_softmax(scores, mask, 1.0 / 16)
+    actual = kernels.scaled_masked_softmax(scores, mask, 1.0 / 16)
+    expected = _exact_softmax_reference(scores, mask)
+    gradient = torch.randn_like(actual)
+    actual_grads = torch.autograd.grad(actual, (scores, mask), gradient, retain_graph=True)
+    expected_grads = torch.autograd.grad(expected, (scores, mask), gradient)
+    assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads))
+
+
+@torch.no_grad()
+def test_exact_softmax_cuda_graph_refreshes_scores_and_mask():
+    if not kernels._supported_torch_reduction():
+        pytest.skip("Softmax reduction not audited for the installed Torch release/backend")
+    first, first_mask = _exact_softmax_inputs("holes")
+    second = -first
+    _, second_mask = _exact_softmax_inputs("causal")
+    scores, mask = first.clone(), first_mask.clone()
+    assert kernels.can_use_exact_scaled_masked_softmax(scores, mask, 1.0 / 16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            kernels.scaled_masked_softmax(scores, mask, 1.0 / 16)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = kernels.scaled_masked_softmax(scores, mask, 1.0 / 16)
+    for request_scores, request_mask in ((first, first_mask), (second, second_mask), (first, first_mask)):
+        scores.copy_(request_scores)
+        mask.copy_(request_mask)
+        graph.replay()
+        assert torch.equal(actual, _exact_softmax_reference(scores, mask))
+
+
+def test_exact_softmax_cuda_attention_preserves_qk_pv():
+    if not kernels._supported_torch_reduction():
+        pytest.skip("Softmax reduction not audited for the installed Torch release/backend")
+    query = _randn(1, 8, 50, 256, dtype=torch.bfloat16, seed=191)
+    key = _randn(1, 1, 1018, 256, dtype=torch.bfloat16, seed=192)
+    value = _randn(1, 1, 1018, 256, dtype=torch.bfloat16, seed=193)
+    _, mask = _exact_softmax_inputs()
+    expected = M._attend(query, key, value, mask, 8, 1.0 / 16)
+    actual = M._attend(query, key, value, mask, 8, 1.0 / 16, exact_bf16_softmax=True)
+    assert torch.equal(actual, expected)
+
+
+@torch.no_grad()
+def test_accurate_expert_qkv_dispatch_and_graph_refresh():
+    """Audit dispatch and graph ownership without claiming arbitrary-weight equality."""
+    tokens, width, mlp_width = SHAPES["suffix"]
+    dtype = torch.bfloat16
+    config = _gemma_config(width, mlp_width)
+    attn = _proj_dtype_module(_randomize(GemmaAttention(config, layer_idx=0), seed=12), dtype)
+    rotary = GemmaRotaryEmbedding(config).to(DEVICE)
+    first = _randn(tokens, width, dtype=dtype, seed=13)
+    second = _randn(tokens, width, dtype=dtype, seed=14)
+    positions = 376 + torch.arange(tokens, device=DEVICE)[None]
+    first_rope = rotary(first, positions)
+    second_rope = rotary(second, positions + 7)
+    x = first.clone()
+    cos, sin = (value[0].clone() for value in first_rope)
+    q_out = torch.empty(HEADS, tokens, HEAD_DIM, dtype=dtype, device=DEVICE)
+    key_cache = torch.full((tokens + 12, HEAD_DIM), float("nan"), dtype=dtype, device=DEVICE)
+    value_cache = torch.full_like(key_cache, float("nan"))
+    k_out, v_out = key_cache[7:-5], value_cache[7:-5]
+    args = (x, attn, cos, sin, q_out, k_out, v_out)
+    selected = M._can_use_accurate_expert_triton_qkv(*args)
+    expected_selection = (
+        str(torch.__version__).split("+")[0] == "2.13.0"
+        and torch.version.cuda == "13.2"
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(x.device) == (9, 0)
+    )
+    assert selected == expected_selection
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            M._fused_qkv_rope(*args, triton_gemm=selected)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        M._fused_qkv_rope(*args, triton_gemm=selected)
+    for request, rope in ((first, first_rope), (second, second_rope), (first, first_rope)):
+        x.copy_(request)
+        cos.copy_(rope[0][0])
+        sin.copy_(rope[1][0])
+        graph.replay()
+        actual = [value.clone() for value in (q_out, k_out, v_out)]
+        M._fused_qkv_rope(*args, triton_gemm=selected)
+        assert all(torch.equal(a, b) for a, b in zip(actual, (q_out, k_out, v_out)))
+        for cache in (key_cache, value_cache):
+            assert torch.isnan(cache[:7]).all() and torch.isnan(cache[-5:]).all()
+
+        shape = (1, tokens, -1, HEAD_DIM)
+        q = attn.q_proj(x[None]).view(shape).transpose(1, 2)
+        k = attn.k_proj(x[None]).view(shape).transpose(1, 2)
+        v = attn.v_proj(x[None])[0]
+        q, k = apply_rotary_pos_emb(q, k, cos[None], sin[None])
+        q64 = (x.double() @ attn.q_proj.weight.double().t()).view(shape).transpose(1, 2)
+        k64 = (x.double() @ attn.k_proj.weight.double().t()).view(shape).transpose(1, 2)
+        q64, k64 = apply_rotary_pos_emb(q64, k64, cos[None].double(), sin[None].double())
+        v64 = x.double() @ attn.v_proj.weight.double().t()
+        for result, eager, reference in zip(actual, (q[0], k[0, 0], v), (q64[0], k64[0, 0], v64)):
+            _check_gemm_epilogue(
+                "triton" if selected else "cublas",
+                dtype,
+                result,
+                eager,
+                reference,
+                "accurate expert QKV",
+                "separate projections + RoPE",
+                "Unsupported runtime/device uses the original cuBLAS path.",
+            )

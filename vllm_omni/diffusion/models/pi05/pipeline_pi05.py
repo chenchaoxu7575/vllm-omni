@@ -94,7 +94,7 @@ _LEROBOT_FLOAT32_IN_BFLOAT16 = (
 
 
 def _to_bfloat16_for_inference(model: Pi05ForActionPrediction) -> None:
-    """Apply LeRobot's mixed-precision inference layout explicitly."""
+    """Apply the mixed-precision weight layout; decoder activations are separate."""
     inner_model = model.paligemma_with_expert
     for name, param in inner_model.named_parameters():
         target_dtype = (
@@ -135,7 +135,7 @@ class Pi05Pipeline(nn.Module):
         self.model_dir = self._resolve_model_dir(od_config.model)
         self.config = self._build_config(od_config)
 
-        custom_args = od_config.custom_pipeline_args or {}
+        custom_args = getattr(od_config, "custom_pipeline_args", None) or {}
         self.vision_options = Pi05VisionOptions.from_pipeline_args(custom_args)
         self.runtime_options = Pi05RuntimeOptions.from_pipeline_args(custom_args)
         self.tokenizer_source = str(custom_args.get("tokenizer", self._resolve_tokenizer_source()))
@@ -195,10 +195,14 @@ class Pi05Pipeline(nn.Module):
 
     def _build_config(self, od_config: OmniDiffusionConfig) -> Pi05Config:
         """Read the config from the checkpoint, then let the deploy yaml override it."""
+        model_config = dict(od_config.model_config or {})
+        custom_args = getattr(od_config, "custom_pipeline_args", None) or {}
+        if "pi05_lm_precision" in custom_args:
+            model_config["lm_precision"] = custom_args["pi05_lm_precision"]
         checkpoint_config = Pi05Config.from_pretrained(self.model_dir) if self.model_dir else None
         if checkpoint_config is None:
-            return Pi05Config.from_model_config(od_config.model_config)
-        if not od_config.model_config:
+            return Pi05Config.from_model_config(model_config)
+        if not model_config:
             return checkpoint_config
 
         resolved = {
@@ -208,7 +212,7 @@ class Pi05Pipeline(nn.Module):
         # Comparing against the dataclass default instead would report every
         # serving-only field, such as policy_server_config, on every start.
         declared_keys = _checkpoint_declared_keys(self.model_dir)
-        for key, value in od_config.model_config.items():
+        for key, value in model_config.items():
             if key in resolved and key in declared_keys and _comparable(value) != _comparable(resolved[key]):
                 logger.warning(
                     "Pi05Pipeline: the deploy config sets %s=%r, overriding %r from the checkpoint.",
@@ -216,7 +220,7 @@ class Pi05Pipeline(nn.Module):
                     value,
                     resolved[key],
                 )
-        resolved.update(od_config.model_config)
+        resolved.update(model_config)
         return Pi05Config.from_model_config(resolved)
 
     def _resolve_tokenizer_source(self) -> str:
@@ -281,8 +285,10 @@ class Pi05Pipeline(nn.Module):
             model.eval()
             model.prepare_runtime_caches()
         logger.info(
-            "Pi05Pipeline: vision precision=%s, camera batching=%s, runtime=%s (experimental options).",
+            "Pi05Pipeline: vision precision=%s, LM precision=%s, camera batching=%s, "
+            "runtime=%s (experimental options).",
             self.vision_options.precision,
+            getattr(self.config, "lm_precision", "legacy"),
             self.vision_options.batch_cameras,
             self.runtime_options,
         )

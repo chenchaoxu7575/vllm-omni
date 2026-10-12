@@ -59,6 +59,7 @@ def build_model(
     vision_precision: str | None = None,
     batch_cameras: bool | None = None,
     *,
+    lm_precision: str | None = None,
     precompute_adarms: bool | None = None,
     hoist_denoise_invariants: bool | None = None,
     prefix_kv_only: bool | None = None,
@@ -77,6 +78,8 @@ def build_model(
     custom_args = dict(stage.get("custom_pipeline_args") or {})
     if vision_precision is not None:
         custom_args["pi05_vision_precision"] = vision_precision
+    if lm_precision is not None:
+        custom_args["pi05_lm_precision"] = lm_precision
     if batch_cameras is not None:
         custom_args["pi05_batch_cameras"] = batch_cameras
     for key, value in (
@@ -200,6 +203,7 @@ def environment(model, device: str) -> dict:
         "transformers": version("transformers"),
         "num_steps": NUM_STEPS,
         "vision_precision": model.paligemma_with_expert.vision_options.precision,
+        "lm_precision": model.paligemma_with_expert.lm_precision,
         "batch_cameras": model.paligemma_with_expert.vision_options.batch_cameras,
         "runtime_options": asdict(model.runtime_options),
         "precomputed_schedule_steps": len(schedule) if schedule is not None else 0,
@@ -262,6 +266,7 @@ def main() -> int:
     )
     parser.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     parser.add_argument("--vision-precision", choices=["fp32", "bf16_autocast", "selective_bf16"], default=None)
+    parser.add_argument("--lm-precision", choices=["legacy", "lerobot_bf16"], default=None)
     parser.add_argument("--batch-cameras", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--precompute-adarms", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--hoist-denoise-invariants", action=argparse.BooleanOptionalAction, default=None)
@@ -295,6 +300,7 @@ def main() -> int:
         args.enforce_eager,
         args.vision_precision,
         args.batch_cameras,
+        lm_precision=args.lm_precision,
         precompute_adarms=args.precompute_adarms,
         hoist_denoise_invariants=args.hoist_denoise_invariants,
         prefix_kv_only=args.prefix_kv_only,
