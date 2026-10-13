@@ -1,0 +1,117 @@
+{
+  "scope": "One selected same-view attention main-kernel launch per case; not complete API, full Attention, or model throughput.",
+  "workload": {
+    "camera_sequences": 11,
+    "camera_tokens_each": 39780,
+    "lidar_sequences": 1,
+    "lidar_tokens": 121136,
+    "query_heads": 4,
+    "kv_heads": 1,
+    "head_dim": 128,
+    "value_dim": 128,
+    "dtype": "bfloat16",
+    "causal": false,
+    "useful_qk_pv_flops": 65701607211008
+  },
+  "input_note": "Original reports replayed captured production tensors. The public repro uses random tensors with the same shapes and attention semantics; identical timings are not guaranteed.",
+  "metric_definitions": {
+    "useful_qk_pv_flops": "2 * query_heads * (head_dim + value_dim) * sum(sequence_length**2); excludes tile padding, scalar operations, softmax, exp, and reductions.",
+    "time": "gpu__time_duration.sum for the whole selected main-kernel launch, including non-matmul work; not an unprofiled benchmark timing.",
+    "nominal_peak": "989 TFLOP/s, H100 SXM BF16 dense theoretical peak.",
+    "clock_adjusted_peak": "dense BF16 .sum.peak_sustained ops/cycle * sm__cycles_elapsed.avg.per_second; theoretical peak at the measured SM clock, not measured achieved FLOP/s.",
+    "clock_average": "The metric averages across SM instances over the profiling interval; not an average across benchmark repetitions.",
+    "native_flops": "NCU counted dense BF16 HGMMA operations, including tile padding.",
+    "rounding": "Reconstructed rates use the exported duration and clock. NCU derived rate columns use higher-precision internal values, so tiny rounding differences are expected."
+  },
+  "environment": {
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "sm_count": 132,
+    "compute_capability": "9.0",
+    "python": "3.13",
+    "torch": "2.13.0+cu130",
+    "vllm": "0.31.0",
+    "triton": "3.7.1",
+    "nvidia-cutlass-dsl": "4.7.1",
+    "cuda": "13.0",
+    "ncu": "2025.3.1.0 (build 36398880)"
+  },
+  "collection": {
+    "replay_mode": "kernel",
+    "clock_control": "none",
+    "cache_control": "all",
+    "selected_main_launches_per_case": 1,
+    "historical_import_source": true,
+    "raw_export_command": "ncu --import REPORT.ncu-rep --page raw --csv > REPORT.raw.csv"
+  },
+  "cases": [
+    {
+      "case": "fa3_auto",
+      "raw_csv": "fa3_auto.raw.csv",
+      "raw_csv_sha256": "da571ae17763936cabe35670e86b14c3ff2444b46a3ea3ef514f849a7ec763a2",
+      "original_raw_csv_sha256": "3e59d6e4bb40d29196e807a20d1f2e110df7bfc36cef9853a0cfccfa2d50a9fb",
+      "original_report": {
+        "filename": "h100_fa3_auto_same_view_f6_ncu.ncu-rep",
+        "bytes": 3545416,
+        "sha256": "98258a3ebfdf17bada46bd5f87781483f9927efd8042fae61ae9f8000248ba0f"
+      },
+      "expected": {
+        "kernel_ms": 96.209536,
+        "useful_qk_pv_flops": 65701607211008,
+        "useful_tflops_per_second": 682.9011961039704,
+        "useful_over_nominal_peak_pct": 69.04966593568963,
+        "sm_clock_hz": 1657746000.0,
+        "dense_bf16_peak_ops_per_cycle": 540672,
+        "clock_adjusted_bf16_peak_tflops": 896.296845312,
+        "useful_over_clock_adjusted_peak_pct": 76.19140909351893,
+        "native_dense_bf16_flops": 65820206039040,
+        "native_padding_over_useful_pct": 0.1805113041620121
+      }
+    },
+    {
+      "case": "fa3_split1",
+      "raw_csv": "fa3_split1.raw.csv",
+      "raw_csv_sha256": "69f85e3bfd26448c0d74fb1fa2b56556c11017db576a2d0831b6cf81143010fa",
+      "original_raw_csv_sha256": "9d6fd7c3568458267dce65896ed27ed079ec638a1587774386d7ba7b143e1739",
+      "original_report": {
+        "filename": "h100_fa3_split1_same_view_f6_ncu.ncu-rep",
+        "bytes": 3976418,
+        "sha256": "5afce45860e2c71ff8c99e34b5cad40ae175f1ecc4631d97b163d684c7bb5da1"
+      },
+      "expected": {
+        "kernel_ms": 86.34080000000002,
+        "useful_qk_pv_flops": 65701607211008,
+        "useful_tflops_per_second": 760.956664879269,
+        "useful_over_nominal_peak_pct": 76.94202880477948,
+        "sm_clock_hz": 1606673000.0,
+        "dense_bf16_peak_ops_per_cycle": 540672,
+        "clock_adjusted_bf16_peak_tflops": 868.683104256,
+        "useful_over_clock_adjusted_peak_pct": 87.59887940159776,
+        "native_dense_bf16_flops": 65820206039040,
+        "native_padding_over_useful_pct": 0.1805113041620121
+      }
+    },
+    {
+      "case": "fa4_auto",
+      "raw_csv": "fa4_auto.raw.csv",
+      "raw_csv_sha256": "2c45b7fb4dfeef59a0c86ff77a8c78bbc4528a0861d9c0e5c251b0a27587843b",
+      "original_raw_csv_sha256": "c1f24ada629e38d12c03c7e1cdc5fec7cc2fddb5658c35a3f8a7cde636b82f75",
+      "original_report": {
+        "filename": "h100_fa4_auto_same_view_f6_ncu.ncu-rep",
+        "bytes": 2340784,
+        "sha256": "993b1dcb596abbdcb28b7dd599c9f7f6596a1976e2716bb8f366658d2d5d8baa"
+      },
+      "expected": {
+        "kernel_ms": 87.320704,
+        "useful_qk_pv_flops": 65701607211008,
+        "useful_tflops_per_second": 752.4172870961735,
+        "useful_over_nominal_peak_pct": 76.07859323520461,
+        "sm_clock_hz": 1600913000.0,
+        "dense_bf16_peak_ops_per_cycle": 540672,
+        "clock_adjusted_bf16_peak_tflops": 865.568833536,
+        "useful_over_clock_adjusted_peak_pct": 86.92749299006266,
+        "native_dense_bf16_flops": 65775628976128,
+        "native_padding_over_useful_pct": 0.1126635530882325
+      }
+    }
+  ]
+}

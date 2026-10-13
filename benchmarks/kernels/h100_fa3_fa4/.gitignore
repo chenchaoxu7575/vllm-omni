@@ -1,0 +1,6 @@
+/results/
+__pycache__/
+*.ncu-rep
+*.nsys-rep
+!/reference/*.raw.csv
+!/reference/reference.json

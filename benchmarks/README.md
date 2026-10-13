@@ -4,6 +4,12 @@ This directory contains benchmark suites for evaluating different model families
 
 ## Benchmark families
 
+### [H100 FA3 / FA4](kernels/h100_fa3_fa4/README.md) — Same-view Attention
+
+Standalone BF16 varlen attention reproduction comparing FA3 automatic splits,
+FA3 with one split, and FA4, with correctness checks, warmed-up timings, and NCU
+kernel utilization calculations.
+
 ### [Qwen2.5-Omni](qwen2_5_omni/README.md) — Embedding Wrapper Latency
 
 CPU-observed A/B timings for redundant text embedding removal, with real checkpoint
