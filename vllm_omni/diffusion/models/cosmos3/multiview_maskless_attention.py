@@ -82,7 +82,7 @@ def normalize_varlen_lse(lse: torch.Tensor, tokens: int, query_heads: int) -> to
     return lse.transpose(0, 1).float().contiguous()
 
 
-def _make_vllm_flash_attn_kernel(fa_version: int) -> PassKernel:
+def _make_vllm_flash_attn_kernel(fa_version: int, num_splits: int = 0) -> PassKernel:
     def kernel(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -107,6 +107,7 @@ def _make_vllm_flash_attn_kernel(fa_version: int) -> PassKernel:
             softmax_scale=softmax_scale,
             causal=False,
             fa_version=fa_version,
+            num_splits=num_splits,
         )
         return out, normalize_varlen_lse(lse, q.shape[0], q.shape[1])
 
@@ -145,6 +146,7 @@ def torch_reference_pass_kernel(
 for _version in (2, 3, 4):
     register_pass_kernel(f"fa{_version}", lambda version=_version: _make_vllm_flash_attn_kernel(version))
 register_pass_kernel("torch", lambda: torch_reference_pass_kernel)
+register_pass_kernel("fa3_single_split", lambda: _make_vllm_flash_attn_kernel(3, num_splits=1))
 
 
 @cache
@@ -366,6 +368,12 @@ def _maskless_attention_impl(
     kernel = get_pass_kernel(kernel_name)
     config = get_forward_context().omni_diffusion_config if is_forward_context_available() else None
     options = (config.custom_pipeline_args if config is not None else None) or {}
+    same_view_single_split = options.get("cosmos3_same_view_single_split", False)
+    if not isinstance(same_view_single_split, bool):
+        raise ValueError("cosmos3_same_view_single_split must be a bool")
+    same_view_kernel = (
+        get_pass_kernel("fa3_single_split") if same_view_single_split and kernel_name == "fa3" else kernel
+    )
     lse_fusion = options.get("cosmos3_lse_fusion", False)
     same_view_grouping = options.get("cosmos3_same_view_grouping", False)
     for name, enabled in (("cosmos3_lse_fusion", lse_fusion), ("cosmos3_same_view_grouping", same_view_grouping)):
@@ -410,12 +418,13 @@ def _maskless_attention_impl(
             validate_indexing([max_seqlen_k], kv_heads, head_dim)
             queries = _gather(q[0], q_rows)
             keys, values = _gather(key_streams[stream], k_rows), _gather(value_streams[stream], k_rows)
+            pass_kernel = same_view_kernel if index == 0 else kernel
             if same_view_grouping and index == 0 and len(meta_values) > META_SIZE:
                 out, lse = _grouped_same_view(
-                    kernel, queries, keys, values, cu_seqlens_q, cu_seqlens_k, tuple(meta_values[META_SIZE:])
+                    pass_kernel, queries, keys, values, cu_seqlens_q, cu_seqlens_k, tuple(meta_values[META_SIZE:])
                 )
             else:
-                out, lse = kernel(
+                out, lse = pass_kernel(
                     queries,
                     keys,
                     values,
