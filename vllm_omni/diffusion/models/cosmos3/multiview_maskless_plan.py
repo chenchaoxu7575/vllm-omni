@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import accumulate
 
 import torch
@@ -50,6 +50,10 @@ TENSORS_PER_PASS = 5
 #: slices instead of gathering), else ``-1``.
 META_MAX_SEQLEN_Q, META_MAX_SEQLEN_K, META_KEY_STREAM, META_Q_START, META_K_START, META_GEN_TOKENS = range(6)
 META_SIZE = 6
+# Optional same-view metadata follows the standard six fields. Each group is
+# (first_segment, last_segment, first_row, last_row, max_seqlen); groups retain
+# their original packed order and contain only camera or only LiDAR segments.
+SAME_VIEW_GROUP_FIELDS = 5
 #: A plan may end with one CPU int64 ``[R, STAGING_FIELDS]`` tensor of
 #: ``(stream, start, length)`` rows. The executor concatenates those contiguous
 #: ranges into one extra key stream, appended after the caller's streams, so a
@@ -309,6 +313,21 @@ def build_multiview_maskless_plan(
     )
     if passes[0].q_index.numel() != num_gen_tokens:
         raise RuntimeError("Cosmos3 maskless same-view pass must cover every GEN row.")
+    # Preserve one semantic same-view pass, including its seed-all-rows contract.
+    # The executor can optionally issue independent varlen calls for contiguous
+    # runs of camera/LiDAR segments without reading device metadata on the host.
+    sensor_types = [int(view[runs[0]]) == -2 for runs in group_runs]
+    if any(sensor_types) and not all(sensor_types):
+        lengths = [_sum_lengths(run_lengths, runs) for runs in group_runs]
+        offsets = [0, *accumulate(lengths)]
+        bounds = [0, *(i for i in range(1, len(sensor_types)) if sensor_types[i] != sensor_types[i - 1]), len(lengths)]
+        descriptors = [
+            value
+            for first, last in zip(bounds, bounds[1:])
+            for value in (first, last, offsets[first], offsets[last], max(lengths[first:last]))
+        ]
+        grouped_meta = torch.cat((passes[0].meta, torch.tensor(descriptors, dtype=torch.int64)))
+        passes = (replace(passes[0], meta=grouped_meta), *passes[1:])
     return MultiviewMasklessPlan(
         num_gen_tokens=num_gen_tokens,
         num_und_tokens=num_und_tokens,
