@@ -347,6 +347,9 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
     from .guardrails import check_video_safety, is_guardrails_enabled
 
     video_processor = VideoProcessor(vae_scale_factor=16)
+    chunked_postprocess = as_bool(
+        (od_config.custom_pipeline_args or {}).get("cosmos3_output_chunked_postprocess", False), False
+    )
 
     def post_process_func(output: dict[str, Any], output_type: str = "np", sampling_params=None):
         if output_type == "latent":
@@ -385,6 +388,19 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
             view = video.narrow(2, frame_start, frames_per_view).detach().cpu()
             if guardrails_enabled:
                 view = check_video_safety(view)
+            if chunked_postprocess and output_type == "np" and not guardrails_enabled:
+                if processed_video is None:
+                    processed_video = np.empty((1, video.shape[2], video.shape[3], video.shape[4], 3), dtype=np.float32)
+                # Keep the two rounded operations in the input dtype, as in
+                # VideoProcessor.denormalize. Convert and interleave directly
+                # into the final array instead of stacking a full camera copy.
+                for start in range(0, frames_per_view, 16):
+                    count = min(16, frames_per_view - start)
+                    chunk = view.narrow(2, start, count).mul(0.5)
+                    chunk.add_(0.5).clamp_(0, 1)
+                    destination = processed_video[:, frame_start + start : frame_start + start + count]
+                    torch.from_numpy(destination).copy_(chunk.permute(0, 2, 3, 4, 1))
+                continue
             processed_view = video_processor.postprocess_video(view, output_type=output_type)
             if processed_video is None:
                 if output_type == "pil":
@@ -1379,6 +1395,13 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 "payload": payload,
                 "metadata": {
                     **lidar_metadata,
+                    **(
+                        {"internal": {"cosmos3_output_bf16_shm": True}}
+                        if as_bool(
+                            (self.od_config.custom_pipeline_args or {}).get("cosmos3_output_bf16_shm", False), False
+                        )
+                        else {}
+                    ),
                     "multiview": {
                         "cameras": [view["camera_key"] for view in views],
                         "frames_per_view": num_frames,
