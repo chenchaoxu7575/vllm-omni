@@ -18,11 +18,13 @@ import logging
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from functools import cache
+from functools import cache, lru_cache
 from typing import Any
 
 import torch
 import torch.nn.functional as F
+
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
 from .multiview_flex_attention import MultiviewAttentionContext
 from .multiview_maskless_plan import (
@@ -32,6 +34,8 @@ from .multiview_maskless_plan import (
     META_MAX_SEQLEN_K,
     META_MAX_SEQLEN_Q,
     META_Q_START,
+    META_SIZE,
+    SAME_VIEW_GROUP_FIELDS,
     STAGING_FIELDS,
     TENSORS_PER_PASS,
     MultiviewMasklessPlan,
@@ -236,6 +240,69 @@ def _chunk_rows(rows: Rows, chunk: slice) -> Rows:
     return rows[chunk]
 
 
+def _merge_pass(
+    acc: torch.Tensor,
+    acc_lse: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    rows: Rows,
+    first_pass: bool,
+    result: torch.Tensor | None = None,
+) -> None:
+    """Fuse row gathering, the existing FP32 recurrence, and output writes."""
+    if first_pass:
+        merged, merged_lse = out, lse
+    else:
+        merged, merged_lse = merge_rows(_gather(acc, rows), _gather(acc_lse, rows), out, lse)
+    _scatter(acc, rows, merged)
+    _scatter(acc_lse, rows, merged_lse)
+    if result is not None:
+        # The final pass need not cover all queries. Copy the full accumulator,
+        # including rows that were last updated by an earlier pass.
+        result.copy_(acc)
+
+
+_compiled_merge_pass = torch.compile(_merge_pass, fullgraph=True, dynamic=True)
+
+
+@lru_cache(maxsize=16)
+def _same_view_groups(
+    cu_q: torch.Tensor, cu_k: torch.Tensor, descriptors: tuple[int, ...]
+) -> tuple[tuple[slice, torch.Tensor, torch.Tensor, int], ...]:
+    """Prepare rebased device offsets once per plan; cache size bounds retention."""
+    groups = []
+    for i in range(0, len(descriptors), SAME_VIEW_GROUP_FIELDS):
+        first, last, start, stop, maximum = descriptors[i : i + SAME_VIEW_GROUP_FIELDS]
+        groups.append((slice(start, stop), cu_q[first : last + 1] - start, cu_k[first : last + 1] - start, maximum))
+    return tuple(groups)
+
+
+def _grouped_same_view(
+    kernel: PassKernel,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    descriptors: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Camera/LiDAR queries are disjoint: concatenate their outputs, never LSE-merge them."""
+    outputs, lses = [], []
+    for rows, group_cu_q, group_cu_k, maximum in _same_view_groups(cu_q, cu_k, descriptors):
+        out, lse = kernel(
+            q[rows],
+            k[rows],
+            v[rows],
+            cu_seqlens_q=group_cu_q,
+            cu_seqlens_k=group_cu_k,
+            max_seqlen_q=maximum,
+            max_seqlen_k=maximum,
+        )
+        outputs.append(out)
+        lses.append(lse)
+    return torch.cat(outputs), torch.cat(lses)
+
+
 def _append_staged_stream(
     key_streams: list[torch.Tensor], value_streams: list[torch.Tensor], staging: torch.Tensor
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -297,6 +364,14 @@ def _maskless_attention_impl(
     if kv_heads <= 0 or heads % kv_heads:
         raise ValueError("Maskless attention requires an integral GQA ratio.")
     kernel = get_pass_kernel(kernel_name)
+    config = get_forward_context().omni_diffusion_config if is_forward_context_available() else None
+    options = (config.custom_pipeline_args if config is not None else None) or {}
+    lse_fusion = options.get("cosmos3_lse_fusion", False)
+    same_view_grouping = options.get("cosmos3_same_view_grouping", False)
+    for name, enabled in (("cosmos3_lse_fusion", lse_fusion), ("cosmos3_same_view_grouping", same_view_grouping)):
+        if not isinstance(enabled, bool):
+            raise ValueError(f"custom_pipeline_args[{name!r}] must be a bool.")
+    fused_merge = lse_fusion and q.device.type == "cuda"
     merge = _merge_rows_for(q.device)
     # Preserve the caller's tensor mode: HSDP/offload use no_grad() and need
     # outputs with version counters.  Only the passes and the accumulators are
@@ -335,15 +410,20 @@ def _maskless_attention_impl(
             validate_indexing([max_seqlen_k], kv_heads, head_dim)
             queries = _gather(q[0], q_rows)
             keys, values = _gather(key_streams[stream], k_rows), _gather(value_streams[stream], k_rows)
-            out, lse = kernel(
-                queries,
-                keys,
-                values,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-            )
+            if same_view_grouping and index == 0 and len(meta_values) > META_SIZE:
+                out, lse = _grouped_same_view(
+                    kernel, queries, keys, values, cu_seqlens_q, cu_seqlens_k, tuple(meta_values[META_SIZE:])
+                )
+            else:
+                out, lse = kernel(
+                    queries,
+                    keys,
+                    values,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                )
             del queries, keys, values
             rows = q_index.numel()
             if out.shape != (rows, heads, head_dim) or lse.shape != (rows, heads):
@@ -351,18 +431,31 @@ def _maskless_attention_impl(
                     f"Maskless pass kernel returned output {tuple(out.shape)} and LSE {tuple(lse.shape)} "
                     f"for {rows} rows × {heads} heads × {head_dim}."
                 )
-            for start in range(0, rows, MERGE_CHUNK_SIZE):
-                chunk = slice(start, start + MERGE_CHUNK_SIZE)
-                target = _chunk_rows(q_rows, chunk)
-                if index == 0:
-                    _scatter(acc, target, out[chunk])
-                    _scatter(acc_lse, target, lse[chunk])
-                else:
-                    merged, merged_lse = merge(_gather(acc, target), _gather(acc_lse, target), out[chunk], lse[chunk])
-                    _scatter(acc, target, merged)
-                    _scatter(acc_lse, target, merged_lse)
+            if fused_merge:
+                _compiled_merge_pass(
+                    acc,
+                    acc_lse,
+                    out,
+                    lse,
+                    q_rows,
+                    index == 0,
+                    result_rows if index == num_passes - 1 and acc is not result_rows else None,
+                )
+            else:
+                for start in range(0, rows, MERGE_CHUNK_SIZE):
+                    chunk = slice(start, start + MERGE_CHUNK_SIZE)
+                    target = _chunk_rows(q_rows, chunk)
+                    if index == 0:
+                        _scatter(acc, target, out[chunk])
+                        _scatter(acc_lse, target, lse[chunk])
+                    else:
+                        merged, merged_lse = merge(
+                            _gather(acc, target), _gather(acc_lse, target), out[chunk], lse[chunk]
+                        )
+                        _scatter(acc, target, merged)
+                        _scatter(acc_lse, target, merged_lse)
             del out, lse
-        if acc is not result_rows:
+        if acc is not result_rows and not fused_merge:
             for start in range(0, planned_tokens, MERGE_CHUNK_SIZE):
                 chunk = slice(start, start + MERGE_CHUNK_SIZE)
                 result_rows[chunk].copy_(acc[chunk])
