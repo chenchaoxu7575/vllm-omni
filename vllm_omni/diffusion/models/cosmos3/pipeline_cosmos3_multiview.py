@@ -459,6 +459,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             raise ValueError("custom_pipeline_args.cosmos3_vae_prepare_parallel must be a bool.")
         if vae_prepare_parallel and not vae_encode_parallel:
             raise ValueError("cosmos3_vae_prepare_parallel requires cosmos3_vae_encode_parallel.")
+        vae_decode_parallel = (getattr(od_config, "custom_pipeline_args", None) or {}).get(
+            "cosmos3_vae_decode_parallel", False
+        )
+        if not isinstance(vae_decode_parallel, bool):
+            raise ValueError("custom_pipeline_args.cosmos3_vae_decode_parallel must be a bool.")
         multiview_config = _validated_multiview_deployment_config(od_config.tf_model_config)
         resolved_backend = self._resolve_attention_backend()
         validate_multiview_parallel_config(
@@ -476,6 +481,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         self.multiview_config = multiview_config
         self.vae_encode_parallel = vae_encode_parallel
         self.vae_prepare_parallel = vae_prepare_parallel
+        self.vae_decode_parallel = vae_decode_parallel
         self._encoder_modules = []
         self._vae_modules = ["vae"]
         self.lidar_encoder = None
@@ -755,7 +761,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         *,
         num_views: int,
         latent_frames_per_view: int,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         if (
             num_views <= 0
             or latent_frames_per_view <= 0
@@ -766,6 +772,20 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 "Cosmos3 multiview latents must be camera-major before decode: "
                 f"shape={tuple(camera_major_latents.shape)}, V={num_views}, F={latent_frames_per_view}."
             )
+        if getattr(self, "vae_decode_parallel", False):
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group, get_sp_group
+
+                sp, cfg = get_sp_group(), get_cfg_group()
+                if sp.world_size * cfg.world_size > 1:
+                    distributed_decode = getattr(getattr(self, "vae", None), "is_distributed_enabled", None)
+                    if callable(distributed_decode) and distributed_decode():
+                        raise ValueError("Camera decode parallelism requires independent VAE replicas.")
+                    return self._decode_and_gather_camera_views(
+                        camera_major_latents, num_views, latent_frames_per_view, sp, cfg
+                    )
         decoded_output = None
         for view in range(num_views):
             decoded_view = self._decode_latents(
@@ -787,6 +807,103 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
 
         assert decoded_output is not None
         return decoded_output
+
+    def _decode_and_gather_camera_views(
+        self,
+        latents: torch.Tensor,
+        num_views: int,
+        latent_frames_per_view: int,
+        sp,
+        cfg,
+    ) -> torch.Tensor | None:
+        """Decode one camera per rank per round, gathering pixels only to CP0/CFG0.
+
+        Each DP replica and TP lane uses its existing SP/CFG groups. Only its
+        output rank returns a full CPU video; other ranks return None. A rank
+        retains at most one local video and one receive buffer on the device.
+        """
+        import torch.distributed as dist
+
+        rank = cfg.rank_in_group * sp.world_size + sp.rank_in_group
+        size = sp.world_size * cfg.world_size
+
+        def collect_reports(report):
+            sp_reports = [None] * sp.world_size
+            dist.all_gather_object(sp_reports, report, group=sp.cpu_group)
+            cfg_reports = [None] * cfg.world_size
+            dist.all_gather_object(cfg_reports, sp_reports, group=cfg.cpu_group)
+            return [item for reports in cfg_reports for item in reports]
+
+        inputs = collect_reports((tuple(latents.shape), latents.dtype, num_views, latent_frames_per_view))
+        if any(value != inputs[0] for value in inputs):
+            raise ValueError("Parallel camera decode requires matching latent geometry on every CP/CFG rank.")
+        output = receive = None
+        expected = None
+        for start in range(0, num_views, size):
+            view = start + rank
+            decoded = None
+            error = None
+            try:
+                if view < num_views:
+                    decoded = self._decode_latents(
+                        latents.narrow(2, view * latent_frames_per_view, latent_frames_per_view)
+                    ).contiguous()
+                    if decoded.ndim != 5 or decoded.shape[0] != 1 or any(dim <= 0 for dim in decoded.shape):
+                        raise ValueError(f"Camera {view} decode returned invalid shape {tuple(decoded.shape)}.")
+                    if decoded.device != latents.device:
+                        raise ValueError(f"Camera {view} decode returned {decoded.device}, expected {latents.device}.")
+                if latents.device.type == "cuda":
+                    torch.accelerator.synchronize(latents.device)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            reports = collect_reports((error, None if decoded is None else (tuple(decoded.shape), decoded.dtype)))
+            failures = [(owner, item[0]) for owner, item in enumerate(reports) if item[0] is not None]
+            if failures:
+                raise RuntimeError(f"Parallel camera decode failed: {failures}.")
+            metadata = [item[1] for item in reports[: min(size, num_views - start)]]
+            if expected is None:
+                expected = metadata[0]
+            if any(value != expected for value in metadata):
+                raise ValueError("Parallel camera decodes must have matching shapes and dtypes.")
+            shape, dtype = expected
+            try:
+                if sp.rank_in_group == 0 and receive is None:
+                    receive = torch.empty(shape, dtype=dtype, device=latents.device)
+                if rank == 0 and output is None:
+                    output = torch.empty((*shape[:2], num_views * shape[2], *shape[3:]), dtype=dtype, device="cpu")
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            failures = [(owner, message) for owner, message in enumerate(collect_reports(error)) if message]
+            if failures:
+                raise RuntimeError(f"Parallel camera decode buffer allocation failed: {failures}.")
+
+            for current in range(start, min(start + size, num_views)):
+                owner_cfg, owner_sp = divmod(current % size, sp.world_size)
+                video = decoded if current == view else receive
+                # Gather to CP0 inside the owner's CFG slice, then to CFG0.
+                # Other ranks never receive this camera's large pixel tensor.
+                if cfg.rank_in_group == owner_cfg and owner_sp != 0:
+                    if sp.rank_in_group == owner_sp:
+                        dist.send(video, dst=sp.ranks[0], group=sp.device_group)
+                    elif sp.rank_in_group == 0:
+                        dist.recv(video, src=sp.ranks[owner_sp], group=sp.device_group)
+                if sp.rank_in_group == 0 and owner_cfg != 0:
+                    if cfg.rank_in_group == owner_cfg:
+                        dist.send(video, dst=cfg.ranks[0], group=cfg.device_group)
+                    elif cfg.rank_in_group == 0:
+                        dist.recv(video, src=cfg.ranks[owner_cfg], group=cfg.device_group)
+                if rank == 0:
+                    try:
+                        output.narrow(2, current * shape[2], shape[2]).copy_(video)
+                    except Exception as exc:
+                        # Finish the round's receives before all ranks report a
+                        # host-copy failure, so no sender is left waiting.
+                        error = f"{type(exc).__name__}: {exc}"
+            failures = [(owner, message) for owner, message in enumerate(collect_reports(error)) if message]
+            if failures:
+                raise RuntimeError(f"Parallel camera decode output copy failed: {failures}.")
+            del video, decoded
+        return output
 
     def _mask_transfer_noise(
         self, noise: torch.Tensor, velocity_mask: torch.Tensor, shared_kwargs: dict[str, Any]
@@ -1229,7 +1346,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             latents,
             num_views=num_views,
             latent_frames_per_view=latent_frames_per_view,
-        ).clamp_(-1, 1)
+        )
+        if video is not None:
+            video.clamp_(-1, 1)
         payload = {"video": video}
         lidar_metadata = {}
         if lidar_request is not None and lidar_request.get("return_output", False):
@@ -1250,6 +1369,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                     "range_projection": dict(lidar_config["range_projection"]),
                 }
             }
+        if video is None:
+            return DiffusionOutput(
+                output=None,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
         return DiffusionOutput(
             output={
                 "payload": payload,
