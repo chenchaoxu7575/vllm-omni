@@ -68,6 +68,7 @@ from .transfer import (
 )
 from .transformer_cosmos3 import _tf_config_get
 from .utils import VIDEO_RES_SIZE_INFO
+from .vae_owner import VaeOwnerExchange, VaeWork, plan_vae_work
 
 logger = init_logger(__name__)
 
@@ -480,6 +481,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         )
         if not isinstance(vae_decode_parallel, bool):
             raise ValueError("custom_pipeline_args.cosmos3_vae_decode_parallel must be a bool.")
+        vae_lidar_owner = (getattr(od_config, "custom_pipeline_args", None) or {}).get("cosmos3_vae_lidar_owner", False)
+        if not isinstance(vae_lidar_owner, bool):
+            raise ValueError("custom_pipeline_args.cosmos3_vae_lidar_owner must be a bool.")
+        if vae_lidar_owner and not (vae_prepare_parallel and vae_encode_parallel and vae_decode_parallel):
+            raise ValueError("cosmos3_vae_lidar_owner requires all three cosmos3_vae parallel switches.")
         multiview_config = _validated_multiview_deployment_config(od_config.tf_model_config)
         resolved_backend = self._resolve_attention_backend()
         validate_multiview_parallel_config(
@@ -498,6 +504,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         self.vae_encode_parallel = vae_encode_parallel
         self.vae_prepare_parallel = vae_prepare_parallel
         self.vae_decode_parallel = vae_decode_parallel
+        self.vae_lidar_owner = vae_lidar_owner
         self._encoder_modules = []
         self._vae_modules = ["vae"]
         self.lidar_encoder = None
@@ -1001,6 +1008,160 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         latents = condition_mask * condition_latents + (1.0 - condition_mask) * noise
         return latents, 1.0 - condition_mask, condition_latents
 
+    def _owner_encode_inputs(
+        self,
+        views,
+        height,
+        width,
+        num_frames,
+        frame_rate,
+        has_vision,
+        condition_indexes,
+        condition_video_as_image,
+        completion,
+        selected_hints,
+        lidar_request,
+    ):
+        from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group, get_sp_group
+
+        sp, cfg = get_sp_group(), get_cfg_group()
+        distributed_decode = getattr(self.vae, "is_distributed_enabled", None)
+        if callable(distributed_decode) and distributed_decode():
+            raise ValueError("VAE owner scheduling requires independent VAE replicas.")
+        camera_shape = (
+            1,
+            self.transformer.latent_channel_size,
+            (num_frames - 1) // self.vae_scale_factor_temporal + 1,
+            height // self.vae_scale_factor_spatial,
+            width // self.vae_scale_factor_spatial,
+        )
+        fields = (["vision"] if has_vision and condition_indexes else []) + (["control"] if selected_hints else [])
+        # Inputs of different source sizes/durations are normalized by the existing
+        # media preparation contract. Cost and receive geometry use that actual
+        # model input, not the source file's unresized geometry.
+        items = [
+            VaeWork(str(i), "camera", num_frames, height, width, encode_fraction=len(fields) / 2)
+            for i in range(len(views))
+        ]
+        specs = {str(i): [(field, camera_shape, self.sampling_dtype) for field in fields] for i in range(len(views))}
+        sweeps = count = 0
+        if lidar_request is not None:
+            config = self.lidar_encoder.config
+            sweeps = required_lidar_sweeps(num_frames, frame_rate, config["fps"])
+            h, w = config["network_config"]["resolution"]
+            sh, sw = config["spatial_compression"]
+            lidar_shape = (1, config["latent_channels"], sweeps, h // sh, w // sw)
+            specs["lidar"] = [("control", lidar_shape, self.dtype)]
+            if lidar_request.get("condition_path") is not None:
+                count = lidar_request.get("num_conditional_sweeps", COSMOS3_MULTIVIEW_DEFAULT_LIDAR_CONDITION_SWEEPS)
+                if not 0 < count < sweeps:
+                    raise ValueError("LiDAR conditional sweeps must leave at least one generated sweep.")
+                specs["lidar"].append(("vision", (*lidar_shape[:2], count, *lidar_shape[3:]), self.sampling_dtype))
+            items.append(
+                VaeWork(
+                    "lidar",
+                    "lidar",
+                    sweeps,
+                    h,
+                    w,
+                    encode_fraction=1 + count / sweeps,
+                    decode=lidar_request.get("return_output", False),
+                )
+            )
+        owners, order = plan_vae_work(items, sp.world_size, cfg.world_size)
+        exchange = VaeOwnerExchange(
+            self.device, sp, cfg, (tuple(v["camera_key"] for v in views), items, owners, order, specs)
+        )
+        buffers = {
+            (key, field): torch.empty(shape, dtype=dtype, device=self.device)
+            for key in order
+            for field, shape, dtype in specs[key]
+            if owners[key] != exchange.rank
+        }
+        values = {}
+        for key in order:
+            for field, shape, dtype in specs[key]:
+                if owners[key] == exchange.rank:
+                    if key == "lidar":
+                        if field == "control":
+                            frames = load_lidar_frames(lidar_request["control_path"], num_sweeps=sweeps)
+                            value = self.lidar_encoder(frames).to(device=self.device, dtype=dtype)
+                        else:
+                            value = self._encode_lidar_condition(lidar_request, sweeps, lidar_shape)
+                    else:
+                        pixels = self._prepare_camera_major_pixels(
+                            views[int(key) : int(key) + 1],
+                            field=field,
+                            height=height,
+                            width=width,
+                            num_frames=num_frames,
+                            keep_first=field == "vision" and condition_video_as_image,
+                            require_complete=field == "vision" and completion,
+                        )
+                        value = self._encode_video_tensor(pixels)
+                    if tuple(value.shape) != shape or value.dtype != dtype:
+                        raise ValueError(f"VAE output geometry differs from planned geometry for {key}/{field}.")
+                    value = value.contiguous()
+                else:
+                    value = buffers[key, field]
+                exchange.transfer(value, owners[key])
+                values[key, field] = value
+        exchange.finish()
+        cameras = {field: torch.cat([values[str(i), field] for i in range(len(views))], dim=2) for field in fields}
+        return cameras, values.get(("lidar", "control")), values.get(("lidar", "vision")), (owners, order)
+
+    def _owner_decode_outputs(self, targets, num_views, frames, owner_plan, lidar_request):
+        from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group, get_sp_group
+
+        sp, cfg = get_sp_group(), get_cfg_group()
+        owners, order = owner_plan
+        latents = targets[0]
+        shape = (
+            latents.shape[0],
+            3,
+            (frames - 1) * self.vae_scale_factor_temporal + 1,
+            latents.shape[3] * self.vae_scale_factor_spatial,
+            latents.shape[4] * self.vae_scale_factor_spatial,
+        )
+        specs = {str(i): (shape, self.vae.dtype) for i in range(num_views)}
+        if lidar_request is not None and lidar_request.get("return_output", False):
+            projection = self.lidar_decoder.config["range_projection"]
+            h, w = projection["native_height"], projection["semantic_width"]
+            specs["lidar"] = ((targets[1].shape[0], 3, targets[1].shape[2], h, w), torch.float32)
+        # Receives must be queued before the output rank starts its own decode.
+        # Otherwise its first producer event delays every remote transfer.
+        order = sorted((key for key in order if key in specs), key=lambda key: owners[key] == 0)
+        exchange = VaeOwnerExchange(self.device, sp, cfg, (owners, order, specs))
+        video = lidar = None
+        if exchange.rank == 0:
+            video = torch.empty(
+                (*shape[:2], num_views * shape[2], *shape[3:]), dtype=self.vae.dtype, device="cpu", pin_memory=True
+            )
+            if "lidar" in specs:
+                lidar = torch.empty(specs["lidar"][0], dtype=torch.float32, device="cpu", pin_memory=True)
+        buffers = {}
+        for key in order:
+            owner_cfg, _ = divmod(owners[key], sp.world_size)
+            receiver = exchange.rank == 0 or (cfg.rank_in_group == owner_cfg and sp.rank_in_group == 0)
+            if receiver and exchange.rank != owners[key]:
+                buffers[key] = torch.empty(specs[key][0], dtype=specs[key][1], device=self.device)
+        for key in order:
+            value = buffers.get(key)
+            if exchange.rank == owners[key]:
+                value = (
+                    self.lidar_decoder(targets[1])
+                    if key == "lidar"
+                    else self._decode_latents(latents.narrow(2, int(key) * frames, frames))
+                ).contiguous()
+                if tuple(value.shape) != specs[key][0] or value.dtype != specs[key][1]:
+                    raise ValueError(f"Decoded VAE geometry differs from planned geometry for {key}.")
+            destination = None
+            if exchange.rank == 0:
+                destination = lidar if key == "lidar" else video.narrow(2, int(key) * shape[2], shape[2])
+            exchange.transfer(value, owners[key], gather=True, destination=destination)
+        exchange.finish(cpu=True)
+        return video, lidar
+
     def _encode_lidar_condition(
         self, lidar_request: Mapping[str, Any], num_sweeps: int, target_shape: Sequence[int]
     ) -> torch.Tensor:
@@ -1095,9 +1256,29 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             condition_indexes = expand_multiview_condition_frame_indexes(local_indexes, num_views, latent_t)
 
         prepare_parallel = getattr(self, "vae_prepare_parallel", False)
-        encoded_target = None
+        owner_plan = None
+        owner_cameras = {}
+        owner_lidar_control = owner_lidar_condition = None
+        if getattr(self, "vae_lidar_owner", False):
+            import torch.distributed as dist
+
+            if self.device.type == "cuda" and dist.is_initialized():
+                owner_cameras, owner_lidar_control, owner_lidar_condition, owner_plan = self._owner_encode_inputs(
+                    views,
+                    height,
+                    width,
+                    num_frames,
+                    frame_rate,
+                    has_vision,
+                    condition_indexes,
+                    condition_video_as_image,
+                    completion,
+                    selected_hints,
+                    lidar_request,
+                )
+        encoded_target = owner_cameras.get("vision")
         target_pixels = None
-        if has_vision:
+        if has_vision and (owner_plan is None or not condition_indexes):
             # With no conditioning positions, preserve the baseline media
             # validation without performing an otherwise-unused VAE encode.
             prepare_target = (
@@ -1157,7 +1338,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             if control_pixels is not None
             else None
         )
-        if selected_hints and prepare_parallel:
+        if owner_plan is not None:
+            control_latents = owner_cameras.get("control")
+        elif selected_hints and prepare_parallel:
             control_latents = self._prepare_and_encode_camera_views(
                 views,
                 field="control",
@@ -1166,7 +1349,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 num_frames=num_frames,
                 keep_first=False,
             )
-        del target_pixels, control_pixels, encoded_target
+        del target_pixels, control_pixels, encoded_target, owner_cameras
         if control_latents is not None and control_latents.shape != latents.shape:
             raise ValueError(
                 "Cosmos3 multiview WSM and target latent shapes must match: "
@@ -1199,9 +1382,12 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         if lidar_request is not None:
             lidar_config = deployment["lidar"]
             sweeps = required_lidar_sweeps(num_frames, frame_rate, lidar_config["fps"])
-            lidar_frames = load_lidar_frames(lidar_request["control_path"], num_sweeps=sweeps)
-            lidar_control_latents = self.lidar_encoder(lidar_frames).to(device=self.device, dtype=self.dtype)
-            del lidar_frames
+            if owner_plan is not None:
+                lidar_control_latents = owner_lidar_control
+            else:
+                lidar_frames = load_lidar_frames(lidar_request["control_path"], num_sweeps=sweeps)
+                lidar_control_latents = self.lidar_encoder(lidar_frames).to(device=self.device, dtype=self.dtype)
+                del lidar_frames
             # Continue the request RNG after camera noise; reseeding would
             # reuse its initial stream and discard caller-supplied RNG state.
             lidar_noise = randn_tensor(
@@ -1211,7 +1397,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 dtype=self.sampling_dtype,
             )
             if lidar_request.get("condition_path") is not None:
-                lidar_condition_latents = self._encode_lidar_condition(lidar_request, sweeps, lidar_noise.shape)
+                lidar_condition_latents = (
+                    owner_lidar_condition
+                    if owner_plan is not None
+                    else self._encode_lidar_condition(lidar_request, sweeps, lidar_noise.shape)
+                )
                 lidar_condition_frames = int(lidar_condition_latents.shape[2])
                 # As in the reference, the sample starts clean on the measured prefix.
                 lidar_noise[:, :, :lidar_condition_frames] = lidar_condition_latents
@@ -1232,6 +1422,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                         seconds_per_frame=lidar_config["temporal_compression_factor"] / lidar_config["fps"],
                     )
                 )
+        del owner_lidar_control, owner_lidar_condition
         layout = MultiviewLayout(
             cross_view_past_window_seconds=self.multiview_cross_view_past_window_seconds,
             backend=self.multiview_backend,
@@ -1358,17 +1549,29 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         final_targets = unpack_state(packed, shared_kwargs["packed_shapes"])
         del condition_latents, control_latents, lidar_control_latents, lidar_condition_latents, shared_kwargs
         latents = final_targets[0]
-        video = self._decode_multiview_latents(
-            latents,
-            num_views=num_views,
-            latent_frames_per_view=latent_frames_per_view,
-        )
+        owner_lidar_output = None
+        if owner_plan is not None:
+            video, owner_lidar_output = self._owner_decode_outputs(
+                final_targets,
+                num_views,
+                latent_frames_per_view,
+                owner_plan,
+                lidar_request,
+            )
+        else:
+            video = self._decode_multiview_latents(
+                latents,
+                num_views=num_views,
+                latent_frames_per_view=latent_frames_per_view,
+            )
         if video is not None:
             video.clamp_(-1, 1)
         payload = {"video": video}
+        if owner_plan is not None and video is None:
+            return DiffusionOutput(output=None, stage_durations=getattr(self, "stage_durations", None))
         lidar_metadata = {}
         if lidar_request is not None and lidar_request.get("return_output", False):
-            lidar_output = self.lidar_decoder(final_targets[1])
+            lidar_output = owner_lidar_output if owner_plan is not None else self.lidar_decoder(final_targets[1])
             payload["lidar"] = lidar_output
             lidar_config = self.lidar_decoder.config
             lidar_metadata = {
