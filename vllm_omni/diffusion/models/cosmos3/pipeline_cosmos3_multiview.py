@@ -1108,7 +1108,13 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 values[key, field] = value
         exchange.finish()
         cameras = {field: torch.cat([values[str(i), field] for i in range(len(views))], dim=2) for field in fields}
-        return cameras, values.get(("lidar", "control")), values.get(("lidar", "vision")), (owners, order)
+        lidar_control = values.get(("lidar", "control"))
+        if lidar_control is not None:
+            # The LiDAR encoder returns channels-last storage. Preserve that
+            # contract after contiguous wire transport: patchify/projection
+            # otherwise selects a different GEMM layout and changes rounding.
+            lidar_control = lidar_control.contiguous(memory_format=torch.channels_last_3d)
+        return cameras, lidar_control, values.get(("lidar", "vision")), (owners, order)
 
     def _owner_decode_outputs(self, targets, num_views, frames, owner_plan, lidar_request):
         from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group, get_sp_group
