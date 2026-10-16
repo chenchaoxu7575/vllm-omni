@@ -109,7 +109,16 @@ class VaeOwnerExchange:
                     elif cfg.rank_in_group == 0:
                         launch(dist.irecv(tensor, src=cfg.ranks[owner_cfg], group=cfg.device_group))
                 if self.rank == 0:
-                    destination.copy_(tensor, non_blocking=True)
+                    if destination.is_contiguous():
+                        destination.copy_(tensor, non_blocking=True)
+                    else:
+                        # A camera slice of [B,C,V*F,H,W] is not contiguous.
+                        # Copy contiguous pixel spans directly into pinned host
+                        # storage: a strided D2H copy may need a temporary and
+                        # host-side reordering, preventing asynchronous delivery.
+                        for batch in range(destination.shape[0]):
+                            for channel in range(destination.shape[1]):
+                                destination[batch, channel].copy_(tensor[batch, channel], non_blocking=True)
             if tensor is not None:
                 tensor.record_stream(self.stream)
                 self.buffers.append(tensor)
