@@ -569,6 +569,60 @@ def prepare_maskless_context(
 
 
 
+def prepare_long_first_same_view_context(
+    context: MultiviewAttentionContext, *, head_dim: int, dtype: torch.dtype
+) -> MultiviewAttentionContext:
+    """Schedule longer independent same-view sequences first, preserving KV order."""
+    config = get_forward_context().omni_diffusion_config if is_forward_context_available() else None
+    options = (config.custom_pipeline_args if config is not None else None) or {}
+    enabled = options.get("cosmos3_same_view_long_first", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("cosmos3_same_view_long_first must be a bool")
+    if not enabled:
+        return context
+    if not all(options.get(name, False) is True for name in ("cosmos3_lse_fusion", "cosmos3_same_view_single_split")):
+        raise ValueError("Long-first same-view scheduling requires LSE fusion and same-view single split.")
+    runtime = context.maskless
+    if runtime is None or runtime.kernel != "fa3" or head_dim != 128 or dtype != torch.bfloat16:
+        return context
+    device = runtime.plan[0].device
+    if device.type != "cuda" or torch.cuda.get_device_capability(device) != (9, 0):
+        return context
+    key = ("same_view_long_first", context.layout, runtime.plan[0].data_ptr())
+    cached = context.mask_cache.get(key)
+    if cached is None:
+        cached = _sort_same_view_sequences(runtime)
+        context.mask_cache[key] = cached
+    return replace(context, maskless=cached)
+
+
+def _sort_same_view_sequences(runtime: MasklessRuntime) -> MasklessRuntime:
+    """Reorder complete descriptors; never reorder a sequence's key/value rows."""
+    from .multiview_maskless_plan import contiguous_start
+
+    q_index, k_index = (tensor.cpu() for tensor in runtime.plan[:2])
+    cu_q, cu_k = (tensor.cpu().tolist() for tensor in runtime.plan[2:4])
+    order = sorted(range(len(cu_k) - 1), key=lambda i: cu_k[i + 1] - cu_k[i], reverse=True)
+    if order == list(range(len(order))):
+        return runtime
+    device = runtime.plan[0].device
+    plan = list(runtime.plan)
+    for slot, indices, offsets, start_meta in (
+        (0, q_index, cu_q, META_Q_START),
+        (1, k_index, cu_k, META_K_START),
+    ):
+        selected = torch.cat([indices[offsets[i] : offsets[i + 1]] for i in order])
+        lengths = [offsets[i + 1] - offsets[i] for i in order]
+        plan[slot] = selected.to(device)
+        plan[slot + 2] = torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=device
+        )
+        if slot == 0:
+            plan[4] = plan[4].clone()
+        plan[4][start_meta] = contiguous_start(selected)
+    return MasklessRuntime(plan, runtime.num_passes, runtime.kernel)
+
+
 def prepare_last_layer_same_view_context(
     context: MultiviewAttentionContext, *, head_dim: int, dtype: torch.dtype
 ) -> MultiviewAttentionContext | None:
