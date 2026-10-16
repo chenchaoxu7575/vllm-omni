@@ -308,6 +308,13 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             from .multiview_maskless_attention import prepare_maskless_context
 
             context = prepare_maskless_context(context, num_und_tokens=int(text_ids.shape[1]), device=camera.device)
+        final_context = None
+        if layout.backend == "maskless":
+            from .multiview_maskless_attention import prepare_last_layer_same_view_context
+
+            final_context = prepare_last_layer_same_view_context(
+                context, head_dim=self.head_dim, dtype=camera.dtype
+            )
         # Compact prompt-dependent dimensions cross the compiled GEN boundary
         # as dynamic tensors, so neither new prompts nor the two CFG branches
         # recompile the GEN layers. Triton pads the UND stream outside the graph.
@@ -336,6 +343,7 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
                     items, streams, timestep, camera, noisy_frame_mask, rig_view_ids, lidar_condition_frames
                 ),
                 multiview_layout=context,
+                final_multiview_layout=final_context,
             )
             outputs = []
             for item, latent, part in zip(
