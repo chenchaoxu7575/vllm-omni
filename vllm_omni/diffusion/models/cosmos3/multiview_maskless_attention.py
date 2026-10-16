@@ -351,7 +351,7 @@ def _maskless_attention_impl(
         raise ValueError("Maskless attention needs matching non-empty key and value stream lists.")
     first_meta = plan[TENSORS_PER_PASS - 1]
     planned_tokens = int(first_meta[META_GEN_TOKENS])
-    if q.shape[1] != planned_tokens or plan[0].numel() != planned_tokens:
+    if q.shape[1] != planned_tokens or plan[0].numel() > planned_tokens:
         raise ValueError(
             "Cosmos3 maskless packed GEN length does not match the request plan: "
             f"attention={q.shape[1]}, plan={planned_tokens}."
@@ -379,6 +379,11 @@ def _maskless_attention_impl(
     for name, enabled in (("cosmos3_lse_fusion", lse_fusion), ("cosmos3_same_view_grouping", same_view_grouping)):
         if not isinstance(enabled, bool):
             raise ValueError(f"custom_pipeline_args[{name!r}] must be a bool.")
+    trimmed_queries = plan[0].numel() < planned_tokens
+    if trimmed_queries and not (
+        options.get("cosmos3_last_layer_same_view_trim", False) and same_view_single_split and lse_fusion
+    ):
+        raise ValueError("A trimmed last-layer plan requires LSE fusion and same-view single split.")
     fused_merge = lse_fusion and q.device.type == "cuda"
     merge = _merge_rows_for(q.device)
     # Preserve the caller's tensor mode: HSDP/offload use no_grad() and need
@@ -398,6 +403,12 @@ def _maskless_attention_impl(
         else:
             acc = torch.empty((planned_tokens, heads, head_dim), dtype=torch.float32, device=q.device)
         acc_lse = torch.empty((planned_tokens, heads), dtype=torch.float32, device=q.device)
+        if trimmed_queries:
+            # Omitted final-layer control rows are dead after this layer. Give
+            # their later passes finite seeds; target rows are overwritten by
+            # the unchanged first-pass output before any LSE merge.
+            acc.zero_()
+            acc_lse.zero_()
         for index in range(num_passes):
             q_index, k_index, cu_seqlens_q, cu_seqlens_k, meta = plan[
                 index * TENSORS_PER_PASS : (index + 1) * TENSORS_PER_PASS
@@ -555,6 +566,78 @@ def prepare_maskless_context(
     plan = get_maskless_plan(context, num_und_tokens=num_und_tokens, device=device)
     runtime = MasklessRuntime(plan.flatten(), len(plan.passes), kernel or resolve_maskless_kernel())
     return replace(context, maskless=runtime)
+
+
+
+def prepare_last_layer_same_view_context(
+    context: MultiviewAttentionContext, *, head_dim: int, dtype: torch.dtype
+) -> MultiviewAttentionContext | None:
+    """Drop only whole control query tiles in the terminal GEN layer.
+
+    K/V and subsequent pass ordering stay intact. Align in 128-token units,
+    which contain whole FA3 d128 query tiles for every supported GQA ratio.
+    Keeping a mixed boundary tile preserves each retained row's MMA position.
+    Planning uses the layout, independent of camera count and CP/CFG rank.
+    """
+    config = get_forward_context().omni_diffusion_config if is_forward_context_available() else None
+    options = (config.custom_pipeline_args if config is not None else None) or {}
+    enabled = options.get("cosmos3_last_layer_same_view_trim", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("cosmos3_last_layer_same_view_trim must be a bool")
+    if not enabled:
+        return None
+    if not all(options.get(name, False) is True for name in ("cosmos3_lse_fusion", "cosmos3_same_view_single_split")):
+        raise ValueError("Last-layer same-view trimming requires LSE fusion and same-view single split.")
+    runtime = context.maskless
+    if runtime is None or runtime.kernel != "fa3" or head_dim != 128 or dtype != torch.bfloat16:
+        return None
+    device = runtime.plan[0].device
+    if device.type != "cuda" or torch.cuda.get_device_capability(device) != (9, 0):
+        return None
+    key = ("last_layer_same_view_trim", context.layout, runtime.plan[0].data_ptr())
+    cached = context.mask_cache.get(key)
+    if cached is not None:
+        return replace(context, maskless=cached)
+    cached = _trim_same_view_queries(runtime, context.layout)
+    context.mask_cache[key] = cached
+    return replace(context, maskless=cached)
+
+
+def _trim_same_view_queries(runtime: MasklessRuntime, layout: Any) -> MasklessRuntime:
+    """Host planner; its CPU form also validates arbitrary layout geometry."""
+    device = runtime.plan[0].device
+    target = torch.empty(layout.gen_tokens, dtype=torch.bool)
+    start = 0
+    for item in layout.items:
+        target[start : start + item.num_tokens] = not item.is_control
+        start += item.num_tokens
+    q_index = runtime.plan[0].cpu()
+    offsets = runtime.plan[2].cpu().tolist()
+    selected, lengths = [], []
+    for lo, hi in zip(offsets, offsets[1:]):
+        segment = q_index[lo:hi]
+        keep = []
+        for begin in range(0, hi - lo, 128):
+            tile = segment[begin : begin + 128]
+            if target[tile].any():
+                keep.append(tile)
+        # Control-only view: preserve it to keep the varlen KV pairing valid.
+        retained = torch.cat(keep) if keep else segment
+        selected.append(retained)
+        lengths.append(retained.numel())
+    if sum(lengths) == q_index.numel() or max(lengths) <= 64:
+        return runtime
+    from .multiview_maskless_plan import contiguous_start
+
+    plan = list(runtime.plan)
+    selected_index = torch.cat(selected)
+    plan[0] = selected_index.to(device)
+    plan[2] = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
+    plan[4] = plan[4].clone()
+    plan[4][META_MAX_SEQLEN_Q] = max(lengths)
+    plan[4][META_Q_START] = contiguous_start(selected_index)
+    cached = MasklessRuntime(plan, runtime.num_passes, runtime.kernel)
+    return cached
 
 
 def maskless_multiview_attention(
