@@ -337,6 +337,16 @@ def _maskless_attention_impl(
     lse_fusion = options.get("cosmos3_lse_fusion", False)
     if not isinstance(lse_fusion, bool):
         raise ValueError("custom_pipeline_args['cosmos3_lse_fusion'] must be a bool.")
+    direct_store_enabled = options.get("cosmos3_lse_direct_store", False)
+    if not isinstance(direct_store_enabled, bool):
+        raise ValueError("cosmos3_lse_direct_store must be a bool")
+    if direct_store_enabled and not lse_fusion:
+        raise ValueError("Direct LSE store requires cosmos3_lse_fusion.")
+    direct_merge = None
+    if direct_store_enabled and q.device.type == "cuda":
+        from .multiview_lse_store import direct_store
+
+        direct_merge = direct_store
     trimmed_queries = plan[0].numel() < planned_tokens
     if trimmed_queries and not (
         options.get("cosmos3_last_layer_same_view_trim", False) and same_view_single_split and lse_fusion
@@ -404,7 +414,14 @@ def _maskless_attention_impl(
                     f"Maskless pass kernel returned output {tuple(out.shape)} and LSE {tuple(lse.shape)} "
                     f"for {rows} rows × {heads} heads × {head_dim}."
                 )
-            if fused_merge:
+            final_result = result_rows if index == num_passes - 1 and acc is not result_rows else None
+            stored = direct_merge is not None and direct_merge(
+                acc, acc_lse, out, lse, q_index,
+                start=int(meta_values[META_Q_START]), seed=index == 0, result=final_result,
+            )
+            if stored:
+                pass
+            elif fused_merge:
                 _compiled_merge_pass(
                     acc,
                     acc_lse,
