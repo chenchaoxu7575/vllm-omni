@@ -468,3 +468,50 @@ def test_cuda_maskless_matches_dense_and_sparse(fa_version: int, dtype: torch.dt
         torch.testing.assert_close(maskless.double(), dense_reference(spec, *qkv), atol=tolerance, rtol=tolerance)
         triton = padded_multiview_flex_attention(*qkv, MultiviewAttentionContext(replace(spec, backend="triton"), {}))
         torch.testing.assert_close(maskless, triton, atol=tolerance, rtol=tolerance)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("enabled,fusion", [(True, False), (1, True), ("true", True)])
+def test_direct_lse_store_requires_boolean_and_fusion(monkeypatch, enabled, fusion):
+    from types import SimpleNamespace
+
+    spec = layout(views=1, lidar=False)
+    num_und = sum(spec.caption_lengths)
+    context = prepared_context(spec, num_und)
+    monkeypatch.setattr(m, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        m,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            omni_diffusion_config=SimpleNamespace(
+                custom_pipeline_args={
+                    "cosmos3_lse_direct_store": enabled,
+                    "cosmos3_lse_fusion": fusion,
+                }
+            )
+        ),
+    )
+    with pytest.raises(ValueError, match="Direct LSE store requires|cosmos3_lse_direct_store must"):
+        m.maskless_multiview_attention(*tensors(spec, num_und), context)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("views,lidar,heads", [(1, False, 2), (3, False, 4), (2, True, 8)])
+def test_direct_lse_store_cpu_fallback(monkeypatch, views, lidar, heads):
+    from types import SimpleNamespace
+
+    spec = layout(views=views, lidar=lidar)
+    num_und = sum(spec.caption_lengths)
+    context = prepared_context(spec, num_und)
+    args = tensors(spec, num_und, heads=heads)
+    options = {"cosmos3_lse_fusion": True}
+    monkeypatch.setattr(m, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        m,
+        "get_forward_context",
+        lambda: SimpleNamespace(omni_diffusion_config=SimpleNamespace(custom_pipeline_args=options)),
+    )
+    expected = m.maskless_multiview_attention(*args, context)
+    options["cosmos3_lse_direct_store"] = True
+    actual = m.maskless_multiview_attention(*args, context)
+    assert torch.equal(expected.contiguous().view(torch.uint8), actual.contiguous().view(torch.uint8))
