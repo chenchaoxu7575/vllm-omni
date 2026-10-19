@@ -175,6 +175,7 @@ class SharedVideo:
         if len(self._events) != len(self.frames) or self._thread is not None:
             raise RuntimeError("Incomplete or already finalized SHM output")
 
+        @torch.inference_mode()
         def finish():
             try:
                 for index, event in enumerate(self._events):
