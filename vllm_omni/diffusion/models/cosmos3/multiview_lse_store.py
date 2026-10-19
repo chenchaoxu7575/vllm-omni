@@ -12,7 +12,7 @@ from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
 if HAS_TRITON:
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["START"])
     def _direct_store_kernel(
         ACC,
         ACC_LSE,
@@ -23,7 +23,8 @@ if HAS_TRITON:
         SLOTS,
         HEADS: tl.constexpr,
         DIM: tl.constexpr,
-        START: tl.constexpr,
+        START,
+        SLICE_START: tl.constexpr,
         SEED: tl.constexpr,
         FINAL: tl.constexpr,
         BLOCK: tl.constexpr,
@@ -32,7 +33,7 @@ if HAS_TRITON:
         slot = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         valid = slot < SLOTS
         row, head = slot // HEADS, slot % HEADS
-        if START >= 0:
+        if SLICE_START:
             destination = row + START
         else:
             destination = tl.load(INDEX + row, valid, other=0)
@@ -101,6 +102,7 @@ def direct_store(acc, acc_lse, out, lse, index, *, start, seed, result=None):
             heads,
             dim,
             start,
+            start >= 0,
             seed,
             full_final,
             16,
