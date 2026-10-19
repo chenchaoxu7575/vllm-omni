@@ -31,9 +31,13 @@ def prepare_workers(requested=0, local_ranks=None):
     cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
     budget = cpus // local_ranks
     intra = torch.get_num_threads()
-    # One decoder and one producer, plus ATen on the consumer. Each block
-    # worker may use an intra-op pool: do not silently multiply CPU demand.
-    limit = max(0, (budget - intra - 2) // intra)
+    # FFmpeg's single-threaded codec still has demux/filter/encode/mux and
+    # pipe-management threads (six in imageio-ffmpeg 7). Reserve eight for
+    # that backend and the producer, separately from the consumer's ATen
+    # pool. This is backend overhead, not a fixed worker/rank/CPU count.
+    # Each block worker may also use a full ATen intra-op pool.
+    backend_overhead = 8
+    limit = max(0, (budget - intra - backend_overhead) // intra)
     return min(requested, limit) if requested else limit
 
 
