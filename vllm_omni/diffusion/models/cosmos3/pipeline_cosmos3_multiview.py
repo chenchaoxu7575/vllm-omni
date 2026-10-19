@@ -809,6 +809,13 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                     return self._decode_and_gather_camera_views(
                         camera_major_latents, num_views, latent_frames_per_view, sp, cfg
                     )
+        from vllm_omni.diffusion.output_shm import SharedVideo, is_output_owner
+
+        options = self.od_config.custom_pipeline_args or {}
+        direct = is_output_owner() and all(
+            as_bool(options.get(name, False), False)
+            for name in ("cosmos3_output_shm_direct", "cosmos3_output_bf16_shm", "cosmos3_output_chunked_postprocess")
+        )
         decoded_output = None
         for view in range(num_views):
             decoded_view = self._decode_latents(
@@ -820,12 +827,27 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 view_shape = decoded_view.shape
                 frames_per_view = view_shape[2]
                 output_shape = (*view_shape[:2], num_views * frames_per_view, *view_shape[3:])
-                decoded_output = torch.empty(output_shape, dtype=decoded_view.dtype, device="cpu")
+                if (
+                    direct
+                    and decoded_view.dtype == torch.bfloat16
+                    and (decoded_view.device.type == "cpu" or torch.version.cuda is not None)
+                ):
+                    decoded_output = SharedVideo.allocate(
+                        output_shape,
+                        decoded_view.dtype,
+                        [frames_per_view] * num_views,
+                        cuda=decoded_view.device.type == "cuda",
+                    )
+                else:
+                    decoded_output = torch.empty(output_shape, dtype=decoded_view.dtype, device="cpu")
             elif decoded_view.shape != view_shape or decoded_view.dtype != decoded_output.dtype:
                 raise ValueError("Cosmos3 multiview VAE decoded camera clips must have matching shapes and dtypes.")
             # Copy each camera before decoding the next: retaining the GPU clips
             # and concatenating them would require two full multiview videos.
-            decoded_output.narrow(2, view * frames_per_view, frames_per_view).copy_(decoded_view)
+            if isinstance(decoded_output, SharedVideo):
+                decoded_output.copy_view(view, decoded_view)
+            else:
+                decoded_output.narrow(2, view * frames_per_view, frames_per_view).copy_(decoded_view)
             del decoded_view
 
         assert decoded_output is not None
