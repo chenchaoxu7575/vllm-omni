@@ -1075,10 +1075,10 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         }
         from contextlib import ExitStack
 
-        from .input_pipeline import FramePreparation, ViewPrefetch, prepare_workers
+        from .input_pipeline import FramePreparation, ViewPrefetch, prepare_workers_for_groups
 
         workers = (
-            prepare_workers(getattr(self, "vae_prepare_threads", 0))
+            prepare_workers_for_groups(getattr(self, "vae_prepare_threads", 0), sp, cfg)
             if getattr(self, "vae_prepare_pipeline", False)
             else 0
         )
