@@ -147,7 +147,9 @@ class FramePreparation(AbstractContextManager):
                     start = count - len(block)
                     pending.append(self.pool.submit(self._block, block, output, start, height, width))
                     block = []
-                    if len(pending) >= self.workers:
+                    # Keep one bounded queued block so a single resize
+                    # worker can overlap with decoding the following block.
+                    if len(pending) > self.workers:
                         pending.popleft().result()
                 if count == limit:
                     break
