@@ -3,9 +3,11 @@
 """Bounded owner-local CPU preparation; GPU work stays on the calling thread."""
 
 import os
-from collections import deque
+import socket
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
+from fractions import Fraction
 from pathlib import Path
 
 import torch
@@ -15,7 +17,7 @@ from vllm_omni.diffusion.utils.video_decode import _frame_to_uint8_rgb
 from .transfer import IMAGE_EXTENSIONS, media_to_uint8_cthw, resize_center_crop_uint8_cthw
 
 
-def prepare_workers(requested=0, local_ranks=None):
+def prepare_workers(requested=0, local_ranks=None, affinity_peers=None):
     """Budget nested ATen pools, decoder, producer and the GPU launch thread.
 
     WORLD_SIZE is a conservative fallback when a launcher does not provide
@@ -30,6 +32,16 @@ def prepare_workers(requested=0, local_ranks=None):
         return 0
     cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
     budget = cpus // local_ranks
+    if affinity_peers is not None and hasattr(os, "sched_getaffinity"):
+        local = [set(mask) for host, mask in affinity_peers if host == socket.gethostname()]
+        if local and len(local) <= local_ranks:
+            # Count only ranks that can run on each CPU. Unobserved local
+            # DP/TP ranks conservatively share every CPU; no WORLD collective.
+            shared = Counter(cpu for mask in local for cpu in mask)
+            unseen = local_ranks - len(local)
+            own = os.sched_getaffinity(0)
+            if all(shared[cpu] + unseen > 0 for cpu in own):
+                budget = int(sum(Fraction(1, shared[cpu] + unseen) for cpu in own))
     intra = torch.get_num_threads()
     # FFmpeg's single-threaded codec still has demux/filter/encode/mux and
     # pipe-management threads (six in imageio-ffmpeg 7). Reserve eight for
@@ -39,6 +51,19 @@ def prepare_workers(requested=0, local_ranks=None):
     backend_overhead = 8
     limit = max(0, (budget - intra - backend_overhead) // intra)
     return min(requested, limit) if requested else limit
+
+
+def prepare_workers_for_groups(requested, sp, cfg):
+    """Budget overlapping affinity domains within the existing replica groups."""
+    dist = torch.distributed
+    if not dist.is_initialized() or not hasattr(os, "sched_getaffinity"):
+        return prepare_workers(requested)
+    own = (socket.gethostname(), tuple(sorted(os.sched_getaffinity(0))))
+    reports = [None] * sp.world_size
+    dist.all_gather_object(reports, own, group=sp.cpu_group)
+    groups = [None] * cfg.world_size
+    dist.all_gather_object(groups, reports, group=cfg.cpu_group)
+    return prepare_workers(requested, affinity_peers=[item for group in groups for item in group])
 
 
 class ViewPrefetch(AbstractContextManager):

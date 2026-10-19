@@ -71,3 +71,18 @@ def test_payload_rounding_and_padding(frames, h, w, first):
             dtype=torch.bfloat16,
         )
     assert torch.equal(got[0].contiguous().view(torch.uint8), want.contiguous().view(torch.uint8))
+
+
+def test_thread_budget_affinity_domains(monkeypatch):
+    monkeypatch.setattr("socket.gethostname", lambda: "node-a")
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 8)
+    monkeypatch.setattr("os.sched_getaffinity", lambda _: set(range(112)))
+    split = [("node-a", range(112))] * 4 + [("node-a", range(112, 224))] * 4
+    assert prepare_workers(local_ranks=8, affinity_peers=split) == 1
+    assert prepare_workers(100, local_ranks=8, affinity_peers=split) == 1
+    shared = [("node-a", range(112))] * 8
+    assert prepare_workers(local_ranks=8, affinity_peers=shared) == 0
+    # Unobserved DP/TP ranks are conservatively charged against this domain.
+    assert prepare_workers(local_ranks=8, affinity_peers=split[:4]) == 0
+    remote = [("node-b", range(112))] * 4
+    assert prepare_workers(local_ranks=4, affinity_peers=split[:4] + remote) == 1
