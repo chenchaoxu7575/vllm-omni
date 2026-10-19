@@ -14,8 +14,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 def test_thread_budget(monkeypatch):
     monkeypatch.setattr("os.sched_getaffinity", lambda _: set(range(224)))
     monkeypatch.setattr(torch, "get_num_threads", lambda: 8)
-    assert prepare_workers(local_ranks=8) == 2
-    assert prepare_workers(100, local_ranks=8) == 2
+    assert prepare_workers(local_ranks=8) == 1
+    assert prepare_workers(100, local_ranks=8) == 1
     assert prepare_workers(1, local_ranks=8) == 1
     monkeypatch.setattr("os.sched_getaffinity", lambda _: set(range(8)))
     assert prepare_workers(local_ranks=8) == 0
