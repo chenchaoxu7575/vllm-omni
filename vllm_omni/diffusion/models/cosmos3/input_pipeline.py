@@ -91,7 +91,7 @@ class FramePreparation(AbstractContextManager):
         if value is None:
             if field != "vision":
                 raise ValueError(f"Cosmos3 multiview camera {view['camera_key']!r} is missing {field} input.")
-            output.copy_(torch.tensor(128, dtype=dtype).div_(127.5).sub_(1.0))
+            output.copy_(torch.tensor(128, dtype=dtype, device="cpu").div_(127.5).sub_(1.0))
             return output.unsqueeze(0)
         limit = 1 if keep_first else num_frames
         if isinstance(value, (str, Path)) and Path(value).suffix.lower() not in IMAGE_EXTENSIONS:
