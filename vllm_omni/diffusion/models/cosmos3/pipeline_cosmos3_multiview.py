@@ -880,6 +880,14 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         """
         import torch.distributed as dist
 
+        from vllm_omni.diffusion.output_shm import SharedVideo, is_output_owner
+
+        options = self.od_config.custom_pipeline_args or {}
+        direct = is_output_owner() and all(
+            as_bool(options.get(name, False), False)
+            for name in ("cosmos3_output_shm_direct", "cosmos3_output_bf16_shm", "cosmos3_output_chunked_postprocess")
+        )
+
         rank = cfg.rank_in_group * sp.world_size + sp.rank_in_group
         size = sp.world_size * cfg.world_size
 
@@ -926,7 +934,18 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 if sp.rank_in_group == 0 and receive is None:
                     receive = torch.empty(shape, dtype=dtype, device=latents.device)
                 if rank == 0 and output is None:
-                    output = torch.empty((*shape[:2], num_views * shape[2], *shape[3:]), dtype=dtype, device="cpu")
+                    output_shape = (*shape[:2], num_views * shape[2], *shape[3:])
+                    if direct and dtype == torch.bfloat16 and (
+                        latents.device.type == "cpu" or torch.version.cuda is not None
+                    ):
+                        try:
+                            output = SharedVideo.allocate(
+                                output_shape, dtype, [shape[2]] * num_views, cuda=latents.device.type == "cuda"
+                            )
+                        except (RuntimeError, OSError, ValueError):
+                            output = None
+                    if output is None:
+                        output = torch.empty(output_shape, dtype=dtype, device="cpu")
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
             failures = [(owner, message) for owner, message in enumerate(collect_reports(error)) if message]
@@ -950,7 +969,13 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                         dist.recv(video, src=cfg.ranks[owner_cfg], group=cfg.device_group)
                 if rank == 0:
                     try:
-                        output.narrow(2, current * shape[2], shape[2]).copy_(video)
+                        if isinstance(output, SharedVideo):
+                            output.copy_view(current, video)
+                            if video.device.type == "cuda":
+                                # The next receive reuses this device buffer.
+                                torch.cuda.current_stream().wait_stream(output._stream)
+                        else:
+                            output.narrow(2, current * shape[2], shape[2]).copy_(video)
                     except Exception as exc:
                         # Finish the round's receives before all ranks report a
                         # host-copy failure, so no sender is left waiting.
@@ -1193,6 +1218,13 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
     def _owner_decode_outputs(self, targets, num_views, frames, owner_plan, lidar_request):
         from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group, get_sp_group
 
+        from vllm_omni.diffusion.output_shm import SharedVideo, is_output_owner
+
+        options = self.od_config.custom_pipeline_args or {}
+        direct = is_output_owner() and all(
+            as_bool(options.get(name, False), False)
+            for name in ("cosmos3_output_shm_direct", "cosmos3_output_bf16_shm", "cosmos3_output_chunked_postprocess")
+        )
         sp, cfg = get_sp_group(), get_cfg_group()
         owners, order = owner_plan
         latents = targets[0]
@@ -1214,9 +1246,14 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         exchange = VaeOwnerExchange(self.device, sp, cfg, (owners, order, specs))
         video = lidar = None
         if exchange.rank == 0:
-            video = torch.empty(
-                (*shape[:2], num_views * shape[2], *shape[3:]), dtype=self.vae.dtype, device="cpu", pin_memory=True
-            )
+            output_shape = (*shape[:2], num_views * shape[2], *shape[3:])
+            if direct and self.vae.dtype == torch.bfloat16 and torch.version.cuda is not None:
+                try:
+                    video = SharedVideo.allocate(output_shape, self.vae.dtype, [shape[2]] * num_views, cuda=True)
+                except (RuntimeError, OSError, ValueError):
+                    video = None
+            if video is None:
+                video = torch.empty(output_shape, dtype=self.vae.dtype, device="cpu", pin_memory=True)
             if "lidar" in specs:
                 lidar = torch.empty(specs["lidar"][0], dtype=torch.float32, device="cpu", pin_memory=True)
         buffers = {}
@@ -1237,8 +1274,15 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                     raise ValueError(f"Decoded VAE geometry differs from planned geometry for {key}.")
             destination = None
             if exchange.rank == 0:
-                destination = lidar if key == "lidar" else video.narrow(2, int(key) * shape[2], shape[2])
+                if key == "lidar":
+                    destination = lidar
+                elif isinstance(video, SharedVideo):
+                    destination = video._view(int(key))
+                else:
+                    destination = video.narrow(2, int(key) * shape[2], shape[2])
             exchange.transfer(value, owners[key], gather=True, destination=destination)
+            if exchange.rank == 0 and key != "lidar" and isinstance(video, SharedVideo):
+                video.record_view(int(key), exchange.stream)
         exchange.finish(cpu=True)
         return video, lidar
 
