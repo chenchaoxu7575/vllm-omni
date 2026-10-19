@@ -70,3 +70,16 @@ def test_copy_shape_error_does_not_publish_view():
     assert owner._status(0) == 0
     with pytest.raises(RuntimeError):
         owner.clamp_(-1, 1)
+
+
+def test_completion_thread_preserves_model_inference_mode():
+    with torch.inference_mode():
+        owner = SharedVideo.allocate((1, 3, 2, 5, 7), torch.bfloat16, (2,))
+        owner.copy_view(0, torch.zeros(1, 3, 2, 5, 7, dtype=torch.bfloat16))
+    assert owner.tensor.is_inference()
+    # Events are None on CPU; this selects the production background path.
+    owner._stream = object()
+    owner.clamp_(-1, 1)
+    owner._thread.join(5)
+    assert not owner._thread.is_alive()
+    assert owner._status(0) == 1
