@@ -61,7 +61,6 @@ from .transfer import (
     as_bool,
     media_hw,
     media_to_uint8_cthw,
-    uint8_cthw_to_normalized_5d,
 )
 from .transformer_cosmos3 import _tf_config_get
 from .utils import VIDEO_RES_SIZE_INFO
@@ -443,6 +442,13 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         )
         if not isinstance(vae_encode_parallel, bool):
             raise ValueError("custom_pipeline_args.cosmos3_vae_encode_parallel must be a bool.")
+        vae_prepare_parallel = (getattr(od_config, "custom_pipeline_args", None) or {}).get(
+            "cosmos3_vae_prepare_parallel", False
+        )
+        if not isinstance(vae_prepare_parallel, bool):
+            raise ValueError("custom_pipeline_args.cosmos3_vae_prepare_parallel must be a bool.")
+        if vae_prepare_parallel and not vae_encode_parallel:
+            raise ValueError("cosmos3_vae_prepare_parallel requires cosmos3_vae_encode_parallel.")
         multiview_config = _validated_multiview_deployment_config(od_config.tf_model_config)
         resolved_backend = self._resolve_attention_backend()
         validate_multiview_parallel_config(
@@ -459,6 +465,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
 
         self.multiview_config = multiview_config
         self.vae_encode_parallel = vae_encode_parallel
+        self.vae_prepare_parallel = vae_prepare_parallel
         self._encoder_modules = []
         self._vae_modules = ["vae"]
         self.lidar_encoder = None
@@ -540,12 +547,16 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         keep_first: bool,
         require_complete: bool = False,
     ) -> torch.Tensor:
-        prepared = []
-        for view in views:
+        # Write each view into the final buffer. In particular, normalize an
+        # image condition before repeating it across the requested frames.
+        camera_major = torch.empty((3, len(views) * num_frames, height, width), dtype=self.dtype, device="cpu")
+        for view_index, view in enumerate(views):
+            output = camera_major[:, view_index * num_frames : (view_index + 1) * num_frames]
             value = self._view_value(view, field)
             if value is None:
                 if field == "vision":
-                    prepared.append(torch.full((3, num_frames, height, width), 128, dtype=torch.uint8))
+                    gray = torch.tensor(128, dtype=self.dtype, device="cpu").div_(127.5).sub_(1.0)
+                    output.copy_(gray)
                     continue
                 raise ValueError(f"Cosmos3 multiview camera {view['camera_key']!r} is missing {field} input.")
             frames = media_to_uint8_cthw(
@@ -558,9 +569,15 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ValueError(
                     f"Known camera {view['camera_key']!r} requires a complete RGB video of {num_frames} frames."
                 )
-            prepared.append(_pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width))
-        camera_major = torch.cat(prepared, dim=1)
-        return uint8_cthw_to_normalized_5d(camera_major, dtype=self.dtype)
+            frame_count = min(int(frames.shape[1]), num_frames)
+            frames = _pad_multiview_view_video(frames, num_frames=frame_count, height=height, width=width)
+            # Copy casts uint8 into the final dtype. Keep div/sub separate to
+            # preserve the original dtype rounding without temporary videos.
+            normalized = output[:, :frame_count]
+            normalized.copy_(frames).div_(127.5).sub_(1.0)
+            if frame_count < num_frames:
+                output[:, frame_count:].copy_(normalized[:, -1:])
+        return camera_major.unsqueeze(0)
 
     def _encode_multiview_video(
         self,
@@ -585,6 +602,45 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             encode_view=encode_view,
         )
 
+    def _prepare_and_encode_camera_views(
+        self,
+        views: Sequence[Mapping[str, Any]],
+        *,
+        field: str,
+        height: int,
+        width: int,
+        num_frames: int,
+        keep_first: bool,
+        require_complete: bool = False,
+    ) -> torch.Tensor:
+        """Prepare each camera only on its encoder owner; share compact latents."""
+
+        def encode_view(view: int) -> torch.Tensor:
+            pixels = self._prepare_camera_major_pixels(
+                views[view : view + 1],
+                field=field,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                keep_first=keep_first,
+                require_complete=require_complete,
+            )
+            return self._encode_video_tensor(pixels)
+
+        return self._encode_and_share_camera_views(
+            num_views=len(views),
+            input_metadata=(
+                tuple(view["camera_key"] for view in views),
+                field,
+                height,
+                width,
+                num_frames,
+                keep_first,
+                require_complete,
+                self.dtype,
+            ),
+            encode_view=encode_view,
+        )
 
     def _encode_and_share_camera_views(
         self,
@@ -759,6 +815,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         width: int,
         generator: torch.Generator,
         injected_latents: torch.Tensor | None,
+        encoded_target: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         latent_frames_per_view = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         shape = (
@@ -782,13 +839,15 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         condition_mask = torch.zeros(1, 1, shape[2], 1, 1, device=self.device, dtype=self.sampling_dtype)
         condition_latents = torch.zeros_like(noise)
         if condition_indexes:
-            if target_pixels is None:
-                raise ValueError("Cosmos3 multiview condition indexes require per-camera vision inputs.")
-            encoded = self._encode_multiview_video(
-                target_pixels,
-                num_views=num_views,
-                frames_per_view=num_frames,
-            )
+            if encoded_target is None:
+                if target_pixels is None:
+                    raise ValueError("Cosmos3 multiview condition indexes require per-camera vision inputs.")
+                encoded_target = self._encode_multiview_video(
+                    target_pixels,
+                    num_views=num_views,
+                    frames_per_view=num_frames,
+                )
+            encoded = encoded_target
             if tuple(encoded.shape) != shape:
                 raise ValueError(
                     f"Cosmos3 multiview target VAE latent shape mismatch: expected={shape}, got={tuple(encoded.shape)}."
@@ -869,30 +928,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         has_vision = bool(known_views)
         completion = has_vision and len(known_views) < num_views
         vision_kind = _media_kind(self._view_value(views[known_views[0]], "vision")) if has_vision else None
-        target_pixels = None
-        if has_vision:
-            target_pixels = self._prepare_camera_major_pixels(
-                views,
-                field="vision",
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                keep_first=condition_video_as_image,
-                require_complete=completion,
-            )
-        control_pixels = (
-            self._prepare_camera_major_pixels(
-                views,
-                field="control",
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                keep_first=False,
-            )
-            if selected_hints
-            else None
-        )
-
         latent_frames_per_view = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         latent_t = num_views * latent_frames_per_view
         raw_indexes = multiview.get("condition_frame_indexes_vision")
@@ -916,6 +951,44 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ValueError("Camera condition frame index is outside the generated latent clip.")
             condition_indexes = expand_multiview_condition_frame_indexes(local_indexes, num_views, latent_t)
 
+        prepare_parallel = getattr(self, "vae_prepare_parallel", False)
+        encoded_target = None
+        target_pixels = None
+        if has_vision:
+            # With no conditioning positions, preserve the baseline media
+            # validation without performing an otherwise-unused VAE encode.
+            prepare_target = (
+                self._prepare_and_encode_camera_views
+                if prepare_parallel and condition_indexes
+                else self._prepare_camera_major_pixels
+            )
+            target = prepare_target(
+                views,
+                field="vision",
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                keep_first=condition_video_as_image,
+                require_complete=completion,
+            )
+            if prepare_parallel and condition_indexes:
+                encoded_target = target
+            else:
+                target_pixels = target
+            del target
+        control_pixels = (
+            self._prepare_camera_major_pixels(
+                views,
+                field="control",
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                keep_first=False,
+            )
+            if selected_hints and not prepare_parallel
+            else None
+        )
+
         generator = sp.generator
         seed = self._resolve_seed(sp, generator)
         if generator is None:
@@ -930,6 +1003,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             width=width,
             generator=generator,
             injected_latents=injected_latents,
+            encoded_target=encoded_target,
         )
         control_latents = (
             self._encode_multiview_video(
@@ -940,7 +1014,16 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             if control_pixels is not None
             else None
         )
-        del target_pixels, control_pixels
+        if selected_hints and prepare_parallel:
+            control_latents = self._prepare_and_encode_camera_views(
+                views,
+                field="control",
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                keep_first=False,
+            )
+        del target_pixels, control_pixels, encoded_target
         if control_latents is not None and control_latents.shape != latents.shape:
             raise ValueError(
                 "Cosmos3 multiview WSM and target latent shapes must match: "
