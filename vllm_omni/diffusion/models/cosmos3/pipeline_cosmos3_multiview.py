@@ -1067,6 +1067,13 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 "payload": payload,
                 "metadata": {
                     **lidar_metadata,
+                    **(
+                        {"internal": {"cosmos3_output_bf16_shm": True}}
+                        if as_bool(
+                            (self.od_config.custom_pipeline_args or {}).get("cosmos3_output_bf16_shm", False), False
+                        )
+                        else {}
+                    ),
                     "multiview": {
                         "cameras": [view["camera_key"] for view in views],
                         "frames_per_view": num_frames,
