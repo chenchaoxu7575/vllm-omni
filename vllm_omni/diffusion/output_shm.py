@@ -65,7 +65,7 @@ class SharedVideo:
         self.exported = False
         self._registered = False
         self._stream = None
-        self._events = []
+        self._events = {}
         self._thread = None
         self._offset = ((len(frames) * 8 + 4095) // 4096) * 4096
         array = np.ndarray((math.prod(shape),), dtype=np.uint16, buffer=shm.buf, offset=self._offset)
@@ -153,14 +153,14 @@ class SharedVideo:
         return self.tensor.narrow(0, start, self.frames[index] * frame_elements).reshape(b, c, self.frames[index], h, w)
 
     def copy_view(self, index, source):
-        if index != len(self._events):
-            raise ValueError("Views must be copied in metadata order")
+        if not 0 <= index < len(self.frames) or index in self._events:
+            raise ValueError("View index is invalid or already copied")
         target = self._view(index)
         if tuple(source.shape) != tuple(target.shape) or source.dtype != self.dtype:
             raise ValueError("Decoded view disagrees with SHM metadata")
         if self._stream is None:
             target.copy_(source)
-            self._events.append(None)
+            self._events[index] = None
         else:
             self._stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._stream):
@@ -168,7 +168,22 @@ class SharedVideo:
                 source.record_stream(self._stream)
                 event = torch.cuda.Event()
                 event.record(self._stream)
-            self._events.append(event)
+            self._events[index] = event
+
+    def record_view(self, index, stream):
+        """Record a direct write made on an existing transport stream.
+
+        The SHM stream joins the producer before publishing readiness or
+        unregistering host memory. Owner scheduling may visit views out of order.
+        """
+        if not 0 <= index < len(self.frames) or index in self._events:
+            raise ValueError("View index is invalid or already copied")
+        if self._stream is None:
+            raise RuntimeError("External CUDA writes require registered SHM")
+        self._stream.wait_stream(stream)
+        event = torch.cuda.Event()
+        event.record(self._stream)
+        self._events[index] = event
 
     def clamp_(self, low, high):
         """Publish views after the pipeline's original CPU clamp, asynchronously."""
@@ -178,7 +193,8 @@ class SharedVideo:
         @torch.inference_mode()
         def finish():
             try:
-                for index, event in enumerate(self._events):
+                for index in range(len(self.frames)):
+                    event = self._events[index]
                     if event is not None:
                         event.synchronize()
                     self._view(index).clamp_(low, high)

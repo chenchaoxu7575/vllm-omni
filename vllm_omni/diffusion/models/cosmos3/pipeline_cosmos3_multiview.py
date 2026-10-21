@@ -893,6 +893,13 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
     def _owner_decode_outputs(self, targets, num_views, frames, owner_plan, lidar_request):
         from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group, get_sp_group
 
+        from vllm_omni.diffusion.output_shm import SharedVideo, is_output_owner
+
+        options = self.od_config.custom_pipeline_args or {}
+        direct = is_output_owner() and all(
+            as_bool(options.get(name, False), False)
+            for name in ("cosmos3_output_shm_direct", "cosmos3_output_bf16_shm", "cosmos3_output_chunked_postprocess")
+        )
         sp, cfg = get_sp_group(), get_cfg_group()
         owners, order = owner_plan
         latents = targets[0]
@@ -914,9 +921,14 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         exchange = VaeOwnerExchange(self.device, sp, cfg, (owners, order, specs))
         video = lidar = None
         if exchange.rank == 0:
-            video = torch.empty(
-                (*shape[:2], num_views * shape[2], *shape[3:]), dtype=self.vae.dtype, device="cpu", pin_memory=True
-            )
+            output_shape = (*shape[:2], num_views * shape[2], *shape[3:])
+            if direct and self.vae.dtype == torch.bfloat16 and torch.version.cuda is not None:
+                try:
+                    video = SharedVideo.allocate(output_shape, self.vae.dtype, [shape[2]] * num_views, cuda=True)
+                except (RuntimeError, OSError, ValueError):
+                    video = None
+            if video is None:
+                video = torch.empty(output_shape, dtype=self.vae.dtype, device="cpu", pin_memory=True)
             if "lidar" in specs:
                 lidar = torch.empty(specs["lidar"][0], dtype=torch.float32, device="cpu", pin_memory=True)
         buffers = {}
@@ -937,8 +949,15 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                     raise ValueError(f"Decoded VAE geometry differs from planned geometry for {key}.")
             destination = None
             if exchange.rank == 0:
-                destination = lidar if key == "lidar" else video.narrow(2, int(key) * shape[2], shape[2])
+                if key == "lidar":
+                    destination = lidar
+                elif isinstance(video, SharedVideo):
+                    destination = video._view(int(key))
+                else:
+                    destination = video.narrow(2, int(key) * shape[2], shape[2])
             exchange.transfer(value, owners[key], gather=True, destination=destination)
+            if exchange.rank == 0 and key != "lidar" and isinstance(video, SharedVideo):
+                video.record_view(int(key), exchange.stream)
         exchange.finish(cpu=True)
         return video, lidar
 
