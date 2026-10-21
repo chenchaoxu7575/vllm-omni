@@ -240,6 +240,31 @@ def _chunk_rows(rows: Rows, chunk: slice) -> Rows:
     return rows[chunk]
 
 
+def _merge_pass(
+    acc: torch.Tensor,
+    acc_lse: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    rows: Rows,
+    first_pass: bool,
+    result: torch.Tensor | None = None,
+) -> None:
+    """Fuse row gathering, the existing FP32 recurrence, and output writes."""
+    if first_pass:
+        merged, merged_lse = out, lse
+    else:
+        merged, merged_lse = merge_rows(_gather(acc, rows), _gather(acc_lse, rows), out, lse)
+    _scatter(acc, rows, merged)
+    _scatter(acc_lse, rows, merged_lse)
+    if result is not None:
+        # The final pass need not cover all queries. Copy the full accumulator,
+        # including rows that were last updated by an earlier pass.
+        result.copy_(acc)
+
+
+_compiled_merge_pass = torch.compile(_merge_pass, fullgraph=True, dynamic=True)
+
+
 def _append_staged_stream(
     key_streams: list[torch.Tensor], value_streams: list[torch.Tensor], staging: torch.Tensor
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -309,6 +334,10 @@ def _maskless_attention_impl(
     same_view_kernel = (
         get_pass_kernel("fa3_single_split") if same_view_single_split and kernel_name == "fa3" else kernel
     )
+    lse_fusion = options.get("cosmos3_lse_fusion", False)
+    if not isinstance(lse_fusion, bool):
+        raise ValueError("custom_pipeline_args['cosmos3_lse_fusion'] must be a bool.")
+    fused_merge = lse_fusion and q.device.type == "cuda"
     merge = _merge_rows_for(q.device)
     # Preserve the caller's tensor mode: HSDP/offload use no_grad() and need
     # outputs with version counters.  Only the passes and the accumulators are
@@ -364,18 +393,31 @@ def _maskless_attention_impl(
                     f"Maskless pass kernel returned output {tuple(out.shape)} and LSE {tuple(lse.shape)} "
                     f"for {rows} rows × {heads} heads × {head_dim}."
                 )
-            for start in range(0, rows, MERGE_CHUNK_SIZE):
-                chunk = slice(start, start + MERGE_CHUNK_SIZE)
-                target = _chunk_rows(q_rows, chunk)
-                if index == 0:
-                    _scatter(acc, target, out[chunk])
-                    _scatter(acc_lse, target, lse[chunk])
-                else:
-                    merged, merged_lse = merge(_gather(acc, target), _gather(acc_lse, target), out[chunk], lse[chunk])
-                    _scatter(acc, target, merged)
-                    _scatter(acc_lse, target, merged_lse)
+            if fused_merge:
+                _compiled_merge_pass(
+                    acc,
+                    acc_lse,
+                    out,
+                    lse,
+                    q_rows,
+                    index == 0,
+                    result_rows if index == num_passes - 1 and acc is not result_rows else None,
+                )
+            else:
+                for start in range(0, rows, MERGE_CHUNK_SIZE):
+                    chunk = slice(start, start + MERGE_CHUNK_SIZE)
+                    target = _chunk_rows(q_rows, chunk)
+                    if index == 0:
+                        _scatter(acc, target, out[chunk])
+                        _scatter(acc_lse, target, lse[chunk])
+                    else:
+                        merged, merged_lse = merge(
+                            _gather(acc, target), _gather(acc_lse, target), out[chunk], lse[chunk]
+                        )
+                        _scatter(acc, target, merged)
+                        _scatter(acc_lse, target, merged_lse)
             del out, lse
-        if acc is not result_rows:
+        if acc is not result_rows and not fused_merge:
             for start in range(0, planned_tokens, MERGE_CHUNK_SIZE):
                 chunk = slice(start, start + MERGE_CHUNK_SIZE)
                 result_rows[chunk].copy_(acc[chunk])
