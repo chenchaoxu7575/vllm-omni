@@ -308,6 +308,9 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             from .multiview_maskless_attention import prepare_maskless_context
 
             context = prepare_maskless_context(context, num_und_tokens=int(text_ids.shape[1]), device=camera.device)
+            from .multiview_maskless_attention import prepare_long_first_same_view_context
+
+            context = prepare_long_first_same_view_context(context, head_dim=self.head_dim, dtype=camera.dtype)
         final_context = None
         if layout.backend == "maskless":
             from .multiview_maskless_attention import prepare_last_layer_same_view_context
