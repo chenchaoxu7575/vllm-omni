@@ -460,6 +460,15 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             raise ValueError("custom_pipeline_args.cosmos3_vae_lidar_owner must be a bool.")
         if vae_lidar_owner and not (vae_prepare_parallel and vae_encode_parallel and vae_decode_parallel):
             raise ValueError("cosmos3_vae_lidar_owner requires all three cosmos3_vae parallel switches.")
+        prepare_args = getattr(od_config, "custom_pipeline_args", None) or {}
+        prepare_pipeline = prepare_args.get("cosmos3_vae_prepare_pipeline", False)
+        if not isinstance(prepare_pipeline, bool):
+            raise ValueError("cosmos3_vae_prepare_pipeline must be a bool.")
+        if prepare_pipeline and not vae_lidar_owner:
+            raise ValueError("cosmos3_vae_prepare_pipeline requires all four VAE owner switches.")
+        prepare_threads = prepare_args.get("cosmos3_vae_prepare_threads", 0)
+        if type(prepare_threads) is not int or prepare_threads < 0:
+            raise ValueError("cosmos3_vae_prepare_threads must be a nonnegative integer (0 = auto).")
         multiview_config = _validated_multiview_deployment_config(od_config.tf_model_config)
         resolved_backend = self._resolve_attention_backend()
         validate_multiview_parallel_config(
@@ -479,6 +488,8 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         self.vae_prepare_parallel = vae_prepare_parallel
         self.vae_decode_parallel = vae_decode_parallel
         self.vae_lidar_owner = vae_lidar_owner
+        self.vae_prepare_pipeline = prepare_pipeline
+        self.vae_prepare_threads = prepare_threads
         self._encoder_modules = []
         self._vae_modules = ["vae"]
         self.lidar_encoder = None
@@ -1052,34 +1063,75 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             for field, shape, dtype in specs[key]
             if owners[key] != exchange.rank
         }
-        values = {}
-        for key in order:
-            for field, shape, dtype in specs[key]:
-                if owners[key] == exchange.rank:
-                    if key == "lidar":
-                        if field == "control":
-                            frames = load_lidar_frames(lidar_request["control_path"], num_sweeps=sweeps)
-                            value = self.lidar_encoder(frames).to(device=self.device, dtype=dtype)
-                        else:
-                            value = self._encode_lidar_condition(lidar_request, sweeps, lidar_shape)
-                    else:
-                        pixels = self._prepare_camera_major_pixels(
-                            views[int(key) : int(key) + 1],
+        from contextlib import ExitStack
+
+        from .input_pipeline import FramePreparation, ViewPrefetch, prepare_workers_for_groups
+
+        workers = (
+            prepare_workers_for_groups(getattr(self, "vae_prepare_threads", 0), sp, cfg)
+            if getattr(self, "vae_prepare_pipeline", False)
+            else 0
+        )
+        with ExitStack() as stack:
+            prefetch = None
+            if workers:
+                frame_preparer = stack.enter_context(FramePreparation(workers))
+
+                def prepare_camera(key):
+                    return {
+                        field: frame_preparer.pixels(
+                            views[int(key)],
                             field=field,
                             height=height,
                             width=width,
                             num_frames=num_frames,
                             keep_first=field == "vision" and condition_video_as_image,
                             require_complete=field == "vision" and completion,
+                            dtype=self.dtype,
                         )
-                        value = self._encode_video_tensor(pixels)
-                    if tuple(value.shape) != shape or value.dtype != dtype:
-                        raise ValueError(f"VAE output geometry differs from planned geometry for {key}/{field}.")
-                    value = value.contiguous()
-                else:
-                    value = buffers[key, field]
-                exchange.transfer(value, owners[key])
-                values[key, field] = value
+                        for field in fields
+                    }
+
+                owned = [key for key in order if key != "lidar" and owners[key] == exchange.rank]
+                prefetch = stack.enter_context(ViewPrefetch(owned, prepare_camera))
+            values = {}
+            for key in order:
+                prepared = (
+                    prefetch.take(key)
+                    if prefetch is not None and key != "lidar" and owners[key] == exchange.rank
+                    else None
+                )
+                for field, shape, dtype in specs[key]:
+                    if owners[key] == exchange.rank:
+                        if key == "lidar":
+                            if field == "control":
+                                frames = load_lidar_frames(lidar_request["control_path"], num_sweeps=sweeps)
+                                value = self.lidar_encoder(frames).to(device=self.device, dtype=dtype)
+                            else:
+                                value = self._encode_lidar_condition(lidar_request, sweeps, lidar_shape)
+                        else:
+                            pixels = (
+                                prepared.pop(field)
+                                if prepared is not None
+                                else self._prepare_camera_major_pixels(
+                                    views[int(key) : int(key) + 1],
+                                    field=field,
+                                    height=height,
+                                    width=width,
+                                    num_frames=num_frames,
+                                    keep_first=field == "vision" and condition_video_as_image,
+                                    require_complete=field == "vision" and completion,
+                                )
+                            )
+                            value = self._encode_video_tensor(pixels)
+                            del pixels
+                        if tuple(value.shape) != shape or value.dtype != dtype:
+                            raise ValueError(f"VAE output geometry differs from planned geometry for {key}/{field}.")
+                        value = value.contiguous()
+                    else:
+                        value = buffers[key, field]
+                    exchange.transfer(value, owners[key])
+                    values[key, field] = value
         exchange.finish()
         cameras = {field: torch.cat([values[str(i), field] for i in range(len(views))], dim=2) for field in fields}
         lidar_control = values.get(("lidar", "control"))
