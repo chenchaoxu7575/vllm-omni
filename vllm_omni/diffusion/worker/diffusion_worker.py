@@ -1459,7 +1459,13 @@ class WorkerProc:
                 raise
             if hasattr(output, "output"):
                 logger.warning("SHM pack failed for model output: %s", e)
-        self._enqueue_result(output)
+        try:
+            self._enqueue_result(output)
+        except BaseException:
+            from vllm_omni.diffusion.ipc import discard_direct_output_shm
+
+            discard_direct_output_shm(output)
+            raise
 
     def _async_output_loop(self):
         """Background thread: D2H + SHM packing for async diffusion output.
@@ -1495,6 +1501,9 @@ class WorkerProc:
                     )
                 )
             except Exception:
+                from vllm_omni.diffusion.ipc import discard_direct_output_shm
+
+                discard_direct_output_shm(output)
                 logger.exception(
                     "Async output packing failed for id '%s'; sending error",
                     async_output_id,
@@ -1639,7 +1648,10 @@ class WorkerProc:
             if method in _MEMORY_RELEASING_METHODS:
                 self.drain_async_outputs()
             # Use execute_method from WorkerWrapperBase for consistent method resolution
-            result = self.worker.execute_method(method, *args, **kwargs)
+            from vllm_omni.diffusion.output_shm import output_owner
+
+            with output_owner(should_reply):
+                result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
             status.update(
