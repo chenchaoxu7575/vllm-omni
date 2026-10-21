@@ -11,8 +11,8 @@ websocket (``/v1/realtime/robot/openpi``) — the same wire path a robot uses
 
 The ``pi0_openpi_*`` helpers are protocol-level (handshake, send obs, receive
 chunk) and not π0-specific, so π0.5 reuses them; only the deploy config and the
-expected metadata differ. This file is selected explicitly by the weekly H100
-robot-policy job.
+expected metadata differ. This file is selected explicitly by the CUDA L2
+"Robot Policy · π0.5 Test" job.
 
 The in-process LeRobot parity oracle lives separately in
 ``tests/diffusion/models/pi05/test_pi05_parity.py``.
@@ -59,12 +59,15 @@ test_params = [
 ]
 
 
-@pytest.mark.slow
+@pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_pi05_openpi_online(omni_server):
-    pi0_openpi_require_dependencies()
+    try:
+        pi0_openpi_require_dependencies()
+    except ModuleNotFoundError as exc:
+        pytest.skip(str(exc))
 
     result = pi0_openpi_run_policy_session(
         host=omni_server.host,
