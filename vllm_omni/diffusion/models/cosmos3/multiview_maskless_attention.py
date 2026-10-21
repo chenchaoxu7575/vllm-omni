@@ -18,7 +18,7 @@ import logging
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from functools import cache
+from functools import cache, lru_cache
 from typing import Any
 
 import torch
@@ -34,6 +34,8 @@ from .multiview_maskless_plan import (
     META_MAX_SEQLEN_K,
     META_MAX_SEQLEN_Q,
     META_Q_START,
+    META_SIZE,
+    SAME_VIEW_GROUP_FIELDS,
     STAGING_FIELDS,
     TENSORS_PER_PASS,
     MultiviewMasklessPlan,
@@ -265,6 +267,44 @@ def _merge_pass(
 _compiled_merge_pass = torch.compile(_merge_pass, fullgraph=True, dynamic=True)
 
 
+@lru_cache(maxsize=16)
+def _same_view_groups(
+    cu_q: torch.Tensor, cu_k: torch.Tensor, descriptors: tuple[int, ...]
+) -> tuple[tuple[slice, torch.Tensor, torch.Tensor, int], ...]:
+    """Prepare rebased device offsets once per plan; cache size bounds retention."""
+    groups = []
+    for i in range(0, len(descriptors), SAME_VIEW_GROUP_FIELDS):
+        first, last, start, stop, maximum = descriptors[i : i + SAME_VIEW_GROUP_FIELDS]
+        groups.append((slice(start, stop), cu_q[first : last + 1] - start, cu_k[first : last + 1] - start, maximum))
+    return tuple(groups)
+
+
+def _grouped_same_view(
+    kernel: PassKernel,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    descriptors: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Camera/LiDAR queries are disjoint: concatenate their outputs, never LSE-merge them."""
+    outputs, lses = [], []
+    for rows, group_cu_q, group_cu_k, maximum in _same_view_groups(cu_q, cu_k, descriptors):
+        out, lse = kernel(
+            q[rows],
+            k[rows],
+            v[rows],
+            cu_seqlens_q=group_cu_q,
+            cu_seqlens_k=group_cu_k,
+            max_seqlen_q=maximum,
+            max_seqlen_k=maximum,
+        )
+        outputs.append(out)
+        lses.append(lse)
+    return torch.cat(outputs), torch.cat(lses)
+
+
 def _append_staged_stream(
     key_streams: list[torch.Tensor], value_streams: list[torch.Tensor], staging: torch.Tensor
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -335,8 +375,10 @@ def _maskless_attention_impl(
         get_pass_kernel("fa3_single_split") if same_view_single_split and kernel_name == "fa3" else kernel
     )
     lse_fusion = options.get("cosmos3_lse_fusion", False)
-    if not isinstance(lse_fusion, bool):
-        raise ValueError("custom_pipeline_args['cosmos3_lse_fusion'] must be a bool.")
+    same_view_grouping = options.get("cosmos3_same_view_grouping", False)
+    for name, enabled in (("cosmos3_lse_fusion", lse_fusion), ("cosmos3_same_view_grouping", same_view_grouping)):
+        if not isinstance(enabled, bool):
+            raise ValueError(f"custom_pipeline_args[{name!r}] must be a bool.")
     direct_store_enabled = options.get("cosmos3_lse_direct_store", False)
     if not isinstance(direct_store_enabled, bool):
         raise ValueError("cosmos3_lse_direct_store must be a bool")
@@ -398,15 +440,20 @@ def _maskless_attention_impl(
             queries = _gather(q[0], q_rows)
             keys, values = _gather(key_streams[stream], k_rows), _gather(value_streams[stream], k_rows)
             pass_kernel = same_view_kernel if index == 0 else kernel
-            out, lse = pass_kernel(
-                queries,
-                keys,
-                values,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-            )
+            if same_view_grouping and index == 0 and len(meta_values) > META_SIZE:
+                out, lse = _grouped_same_view(
+                    pass_kernel, queries, keys, values, cu_seqlens_q, cu_seqlens_k, tuple(meta_values[META_SIZE:])
+                )
+            else:
+                out, lse = pass_kernel(
+                    queries,
+                    keys,
+                    values,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                )
             del queries, keys, values
             rows = q_index.numel()
             if out.shape != (rows, heads, head_dim) or lse.shape != (rows, heads):
