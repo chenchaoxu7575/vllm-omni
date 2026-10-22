@@ -4051,11 +4051,10 @@ def test_multiview_denoising_state_is_float32_with_bf16_model() -> None:
     pipeline.vae_scale_factor_spatial = 8
     # Two cameras with two latent frames each; latent frame 0 of each camera is conditioned.
     encoded = torch.full((1, 2, 4, 2, 2), 0.3, dtype=torch.bfloat16)
-    pipeline._encode_multiview_video = lambda video, **kwargs: encoded
     # 1 + 2**-12 rounds to 1 in BF16; injected reference noise must survive unrounded.
     injected = torch.full((1, 2, 4, 2, 2), 1.0 + 2**-12)
     prepare = dict(
-        target_pixels=torch.zeros(1),
+        encoded_target=encoded,
         condition_indexes=[0, 2],
         num_views=2,
         num_frames=5,
