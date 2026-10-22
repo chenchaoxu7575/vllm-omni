@@ -946,6 +946,33 @@ def test_multiview_postprocess_bf16_numpy_matches_video_processor(frames_per_vie
     assert np.array_equal(np.ascontiguousarray(processed).view(np.uint8), np.ascontiguousarray(expected).view(np.uint8))
 
 
+@pytest.mark.parametrize("output_type", ["np", "pt", "latent"])
+def test_multiview_postprocess_reads_shared_video_like_a_tensor(output_type: str) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_post_process_func,
+    )
+    from vllm_omni.diffusion.output_shm import SharedVideo
+
+    postprocess = get_cosmos3_multiview_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    video = torch.linspace(-1, 1, 3 * 6 * 4 * 4).reshape(1, 3, 6, 4, 4).to(torch.bfloat16)
+    shared = SharedVideo.allocate(tuple(video.shape), torch.bfloat16, [3, 3])
+    for view in range(2):
+        shared.copy_view(view, video.narrow(2, 3 * view, 3))
+    shared.finalize(-1, 1)
+    metadata = {"multiview": {"cameras": ["front", "rear"], "frames_per_view": 3}}
+
+    expected = postprocess({"payload": {"video": video}, "metadata": metadata}, output_type=output_type)
+    result = postprocess({"payload": {"video": shared}, "metadata": metadata}, output_type=output_type)
+
+    processed = result["payload"]["video"]
+    if output_type == "np":
+        assert np.array_equal(processed, expected["payload"]["video"])
+    else:
+        # Callers never receive the shared-memory storage itself.
+        assert isinstance(processed, torch.Tensor)
+        assert torch.equal(processed, expected["payload"]["video"])
+
+
 @pytest.mark.parametrize(
     ("multiview", "video", "message"),
     [

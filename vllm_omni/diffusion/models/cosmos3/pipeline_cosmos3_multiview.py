@@ -24,6 +24,7 @@ from diffusers.video_processor import VideoProcessor
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.output_shm import SharedVideo, allocate_video_output, direct_video_supported
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_extras.cosmos3 import (
     COSMOS3_MULTIVIEW_UNSUPPORTED_NEGATIVE_FIELDS,
@@ -357,6 +358,10 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
 
     def post_process_func(output: dict[str, Any], output_type: str = "np", sampling_params=None):
         if output_type == "latent":
+            payload = output.get("payload")
+            if isinstance(payload, dict) and isinstance(payload.get("video"), SharedVideo):
+                # Return a tensor, not the shared-memory storage.
+                return {**output, "payload": {**payload, "video": payload["video"].to_tensor()}}
             return output
 
         payload = output.get("payload")
@@ -389,7 +394,11 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
             frame_start = view_index * frames_per_view
             # Move only this camera to the host, even for an in-process CUDA
             # caller. Guardrail conversions then stay bounded to one CPU clip.
-            view = video.narrow(2, frame_start, frames_per_view).detach().cpu()
+            if isinstance(video, SharedVideo):
+                view = video.wait_view(view_index)
+            else:
+                view = video.narrow(2, frame_start, frames_per_view)
+            view = view.detach().cpu()
             if guardrails_enabled:
                 view = check_video_safety(view)
             if video.dtype == torch.bfloat16 and output_type == "np" and not guardrails_enabled:
@@ -433,6 +442,14 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
+def _clamp_video(video: torch.Tensor | SharedVideo) -> None:
+    """Clamp decoded video to [-1, 1] in place; shared storage then publishes its views."""
+    if isinstance(video, SharedVideo):
+        video.finalize(-1, 1)
+    else:
+        video.clamp_(-1, 1)
+
+
 @dataclass(frozen=True)
 class _EncodeRequest:
     """Request inputs consumed by the VAE encoders."""
@@ -464,7 +481,7 @@ class _EncodedInputs:
 
 @dataclass
 class _DecodedOutputs:
-    video: torch.Tensor
+    video: torch.Tensor | SharedVideo
     lidar: torch.Tensor | None
 
 
@@ -667,7 +684,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         *,
         num_views: int,
         latent_frames_per_view: int,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | SharedVideo:
         if (
             num_views <= 0
             or latent_frames_per_view <= 0
@@ -689,16 +706,41 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 view_shape = decoded_view.shape
                 frames_per_view = view_shape[2]
                 output_shape = (*view_shape[:2], num_views * frames_per_view, *view_shape[3:])
-                decoded_output = torch.empty(output_shape, dtype=decoded_view.dtype, device="cpu")
+                decoded_output = self._allocate_video_output(
+                    output_shape,
+                    decoded_view.dtype,
+                    [frames_per_view] * num_views,
+                    cuda=decoded_view.device.type == "cuda",
+                )
             elif decoded_view.shape != view_shape or decoded_view.dtype != decoded_output.dtype:
                 raise ValueError("Cosmos3 multiview VAE decoded camera clips must have matching shapes and dtypes.")
             # Copy each camera before decoding the next: retaining the GPU clips
             # and concatenating them would require two full multiview videos.
-            decoded_output.narrow(2, view * frames_per_view, frames_per_view).copy_(decoded_view)
+            if isinstance(decoded_output, SharedVideo):
+                decoded_output.copy_view(view, decoded_view)
+            else:
+                decoded_output.narrow(2, view * frames_per_view, frames_per_view).copy_(decoded_view)
             del decoded_view
 
         assert decoded_output is not None
         return decoded_output
+
+    def _allocate_video_output(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        frames: list[int],
+        *,
+        cuda: bool,
+        pin_memory: bool = False,
+    ) -> torch.Tensor | SharedVideo:
+        """Output storage for decoded camera video on the rank that replies.
+
+        BF16 video of a CUDA model goes straight into shared memory that the
+        reply hands over without another host copy; anything else uses a CPU tensor.
+        """
+        shared = direct_video_supported(self.device, self.vae.dtype) and dtype == torch.bfloat16
+        return allocate_video_output(shape, dtype, frames, shared=shared, cuda=cuda, pin_memory=pin_memory)
 
     def _mask_transfer_noise(
         self, noise: torch.Tensor, velocity_mask: torch.Tensor, shared_kwargs: dict[str, Any]
@@ -963,7 +1005,8 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 final_targets[0],
                 num_views=num_views,
                 latent_frames_per_view=latent_frames_per_view,
-            ).clamp_(-1, 1)
+            )
+            _clamp_video(video)
             lidar = self.lidar_decoder(final_targets[1]) if return_lidar else None
             return _DecodedOutputs(video=video, lidar=lidar)
         assert plan is not None
@@ -977,7 +1020,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         )
         if owner_video is None:
             return None
-        owner_video.clamp_(-1, 1)
+        _clamp_video(owner_video)
         return _DecodedOutputs(video=owner_video, lidar=lidar)
 
     def _owner_decode_outputs(
@@ -989,7 +1032,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         num_views: int,
         latent_frames_per_view: int,
         return_lidar: bool,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | SharedVideo | None, torch.Tensor | None]:
         latents = final_targets[0]
         frames = latent_frames_per_view
         shape = (
@@ -1008,13 +1051,21 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         # otherwise its first decode delays every remote transfer.
         order = sorted((key for key in plan.order if key in specs), key=lambda key: plan.owners[key] == 0)
         exchange = VaeOwnerExchange(self.device, grid, (plan.owners, order, specs))
-        video = lidar = None
+        video: torch.Tensor | SharedVideo | None = None
+        lidar = None
         destinations = None
         if exchange.rank == 0:
-            video = torch.empty(
-                (*shape[:2], num_views * shape[2], *shape[3:]), dtype=self.vae.dtype, device="cpu", pin_memory=True
+            video = self._allocate_video_output(
+                (*shape[:2], num_views * shape[2], *shape[3:]),
+                self.vae.dtype,
+                [shape[2]] * num_views,
+                cuda=True,
+                pin_memory=True,
             )
-            destinations = {str(i): video.narrow(2, i * shape[2], shape[2]) for i in range(num_views)}
+            if isinstance(video, SharedVideo):
+                destinations = {str(i): video.view(i) for i in range(num_views)}
+            else:
+                destinations = {str(i): video.narrow(2, i * shape[2], shape[2]) for i in range(num_views)}
             if "lidar" in specs:
                 lidar = torch.empty(specs["lidar"][0], dtype=torch.float32, device="cpu", pin_memory=True)
                 destinations["lidar"] = lidar
@@ -1024,6 +1075,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 return self.lidar_decoder(final_targets[1])
             return self._decode_latents(latents.narrow(2, int(key) * frames, frames))
 
+        def record_camera(key: str) -> None:
+            # Publish a camera only after its copy on the transfer stream.
+            if key != "lidar" and isinstance(video, SharedVideo):
+                video.record_view(int(key), exchange.stream)
+
         decode_and_gather(
             order=order,
             owners=plan.owners,
@@ -1032,6 +1088,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             decode=decode,
             destinations=destinations,
             device=self.device,
+            after_gather=record_camera if isinstance(video, SharedVideo) else None,
         )
         exchange.finish(cpu=True)
         return video, lidar

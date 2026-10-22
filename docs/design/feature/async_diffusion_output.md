@@ -141,6 +141,8 @@ When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_
 
 On CUDA, Cosmos3 multiview output marks its CPU BF16 video for bit-exact transport. The BF16 bits are written to shared memory unchanged and the reader borrows the shared-memory lease, so the video is neither widened to FP32 nor copied again.
 
+On the CUDA rank that replies, decode writes each camera view directly into registered shared memory. The wire handle carries the shape, dtype, frames per view and segment name. A reader waits for each view's D2H copy and [-1, 1] clamp before it consumes that view. If shared memory cannot be created or registered, decode returns a CPU tensor, which still uses the BF16 transport above.
+
 BF16 video of shape `[B, 3, V*F, H, W]` needs about `2*B*3*V*F*H*W` bytes of `/dev/shm`, half of the FP32 size. Numeric LiDAR output is stored separately.
 
 ## Model Coverage

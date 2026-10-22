@@ -69,10 +69,12 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import (
     DIFFUSION_RPC_RESULT_ENVELOPE,
+    discard_direct_output_shm,
     pack_diffusion_output_shm,
     payload_carries_typed_media,
 )
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
+from vllm_omni.diffusion.output_shm import output_owner
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -1459,7 +1461,11 @@ class WorkerProc:
                 raise
             if hasattr(output, "output"):
                 logger.warning("SHM pack failed for model output: %s", e)
-        self._enqueue_result(output)
+        try:
+            self._enqueue_result(output)
+        except BaseException:
+            discard_direct_output_shm(output)
+            raise
 
     def _async_output_loop(self):
         """Background thread: D2H + SHM packing for async diffusion output.
@@ -1495,6 +1501,7 @@ class WorkerProc:
                     )
                 )
             except Exception:
+                discard_direct_output_shm(output)
                 logger.exception(
                     "Async output packing failed for id '%s'; sending error",
                     async_output_id,
@@ -1639,7 +1646,8 @@ class WorkerProc:
             if method in _MEMORY_RELEASING_METHODS:
                 self.drain_async_outputs()
             # Use execute_method from WorkerWrapperBase for consistent method resolution
-            result = self.worker.execute_method(method, *args, **kwargs)
+            with output_owner(should_reply):
+                result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
             status.update(

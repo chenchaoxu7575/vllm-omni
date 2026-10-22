@@ -370,12 +370,14 @@ def decode_and_gather(
     decode: Callable[[str], torch.Tensor],
     destinations: Mapping[str, torch.Tensor] | None,
     device: torch.device,
+    after_gather: Callable[[str], None] | None = None,
 ) -> None:
     """Decode owned items and gather every item to grid rank 0 in ``order``.
 
     ``destinations`` maps each key to its host output on grid rank 0 and is
-    None elsewhere. Receive buffers are allocated before any decode. The caller
-    calls ``exchange.finish(cpu=True)`` before reading the destinations.
+    None elsewhere. Receive buffers are allocated before any decode.
+    ``after_gather(key)`` runs once the copy of ``key`` has been queued. The
+    caller calls ``exchange.finish(cpu=True)`` before reading the destinations.
     """
     buffers = {
         key: torch.empty(specs[key][0], dtype=specs[key][1], device=device)
@@ -389,3 +391,5 @@ def decode_and_gather(
             if tuple(value.shape) != specs[key][0] or value.dtype != specs[key][1]:
                 raise ValueError(f"Decoded VAE geometry differs from planned geometry for {key}.")
         exchange.gather_to_output(value, owners[key], destinations[key] if destinations is not None else None)
+        if after_gather is not None:
+            after_gather(key)

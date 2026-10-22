@@ -31,6 +31,7 @@ from vllm_omni.diffusion.media import (
     VideoTransportConstraints,
     VideoValueRange,
 )
+from vllm_omni.diffusion.output_shm import SharedVideo, is_shared_video_handle
 from vllm_omni.diffusion.shm_utils import require_shared_memory
 
 _SHM_TENSOR_THRESHOLD = 1_000_000  # 1 MB
@@ -332,6 +333,11 @@ def _pack_value_if_large(
     through unchanged. ``_unpack_if_shm_handle`` must mirror these shapes — keep
     the two in sync.
     """
+    if isinstance(val, SharedVideo):
+        handle = val.handle()
+        if created is not None:
+            created.append(handle)
+        return handle
     if isinstance(val, torch.Tensor):
         return _pack_tensor_if_large(val, d2h_stream=d2h_stream, created=created)
     if isinstance(val, np.ndarray):
@@ -351,6 +357,8 @@ def _pack_value_if_large(
 
 def _unpack_if_shm_handle(val: object) -> object:
     """Reconstruct tensors from SHM handles, mirroring ``_pack_value_if_large``."""
+    if is_shared_video_handle(val):
+        return SharedVideo.from_handle(val)
     if isinstance(val, dict) and val.get("__tensor_shm__"):
         return _tensor_from_shm(val)
     if isinstance(val, dict) and val.get("__ndarray_shm__"):
@@ -665,3 +673,22 @@ def unpack_diffusion_output_shm(output: object) -> object:
         for runner_output in runner_outputs:
             unpack_diffusion_output_shm(runner_output)
     return output
+
+
+def discard_direct_output_shm(output: object) -> None:
+    """Unlink direct leases if publishing the packed output fails."""
+
+    def discard(value: object) -> None:
+        if isinstance(value, SharedVideo):
+            value.unlink()
+        elif is_shared_video_handle(value):
+            _unlink_shm_handle(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                discard(item)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                discard(item)
+
+    for item in _iter_diffusion_outputs(output):
+        discard(item.output)
