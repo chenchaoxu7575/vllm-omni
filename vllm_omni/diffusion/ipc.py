@@ -31,6 +31,7 @@ from vllm_omni.diffusion.media import (
     VideoTransportConstraints,
     VideoValueRange,
 )
+from vllm_omni.diffusion.shm_utils import require_shared_memory
 
 _SHM_TENSOR_THRESHOLD = 1_000_000  # 1 MB
 DIFFUSION_RPC_RESULT_ENVELOPE = "diffusion_rpc_result"
@@ -62,6 +63,7 @@ def _new_shm_array(shape: tuple[int, ...], dtype: np.dtype) -> tuple[Any, np.nda
     from multiprocessing import shared_memory
 
     nbytes = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+    require_shared_memory(nbytes)
     shm = shared_memory.SharedMemory(create=True, size=nbytes)
     array = np.ndarray(shape, dtype=dtype, buffer=shm.buf[:nbytes])
     handle = {
@@ -481,7 +483,7 @@ def _pack_diffusion_fields(
             payload = values.get("payload")
             video = payload.get("video") if isinstance(payload, dict) else None
             if (
-                internal.get("cosmos3_output_bf16_shm") is True
+                internal.get("video_bf16_transport") is True
                 and isinstance(video, torch.Tensor)
                 and video.device.type == "cpu"
                 and video.dtype == torch.bfloat16
@@ -499,6 +501,7 @@ def _pack_diffusion_fields(
                     torch_dtype_view=True,
                     borrow_on_unpack=True,
                 )
+                assert isinstance(payload, dict)
                 values = {**values, "payload": {**payload, "video": handle}}
         packed_output = _pack_value_if_large(values, d2h_stream=d2h_stream, created=created)
     packed_media = _UNSET

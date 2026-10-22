@@ -8,7 +8,7 @@ import torch
 
 from vllm_omni.diffusion.output_shm import SharedVideo, is_output_owner, output_owner
 
-pytestmark = [pytest.mark.cpu, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 def test_output_owner_context_restores_after_error():
@@ -83,3 +83,50 @@ def test_completion_thread_preserves_model_inference_mode():
     owner._thread.join(5)
     assert not owner._thread.is_alive()
     assert owner._status(0) == 1
+
+
+def test_capacity_precheck_prevents_allocation(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.shm_utils import SharedMemoryCapacityError
+
+    monkeypatch.setattr("os.statvfs", lambda _: SimpleNamespace(f_bavail=1, f_frsize=4096))
+    calls = []
+    monkeypatch.setattr(shared_memory, "SharedMemory", lambda **kw: calls.append(kw))
+    # 4096 header + 420 bytes BF16 pixels.
+    with pytest.raises(SharedMemoryCapacityError, match="required 4516 bytes, available 4096 bytes"):
+        SharedVideo.allocate((1, 3, 2, 5, 7), torch.bfloat16, (2,))
+    assert calls == []
+
+
+def test_capacity_exact_fit_and_free_blocks(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.shm_utils import SharedMemoryCapacityError, require_shared_memory
+
+    monkeypatch.setattr("os.statvfs", lambda _: SimpleNamespace(f_bavail=2, f_bfree=99, f_frsize=4096))
+    require_shared_memory(8192)
+    with pytest.raises(SharedMemoryCapacityError, match="required 8193 bytes, available 8192 bytes"):
+        require_shared_memory(8193)
+
+
+@pytest.mark.parametrize(
+    "device,cuda,dtype,owner,expected",
+    [
+        ("cuda", "13.0", torch.bfloat16, True, True),
+        ("cuda", None, torch.bfloat16, True, False),
+        ("cpu", "13.0", torch.bfloat16, True, False),
+        ("xpu", "13.0", torch.bfloat16, True, False),
+        ("npu", "13.0", torch.bfloat16, True, False),
+        ("cuda", "13.0", torch.float32, True, False),
+        ("cuda", "13.0", torch.bfloat16, False, False),
+    ],
+)
+def test_direct_storage_automatic_fallback(monkeypatch, device, cuda, dtype, owner, expected):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.output_shm import direct_video_supported
+
+    monkeypatch.setattr(torch.version, "cuda", cuda)
+    with output_owner(owner):
+        assert direct_video_supported(SimpleNamespace(type=device), dtype) == expected

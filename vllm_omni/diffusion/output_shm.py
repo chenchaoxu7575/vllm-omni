@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Owner-allocated host storage for opt-in multiview output.
+"""Owner-allocated host storage for multiview output.
 
 The wire contains shape/dtype/view lengths and a shared-memory name, never a
 Tensor storage. A per-view completion word is published under a process-shared
@@ -22,6 +22,8 @@ from typing import Any
 
 import numpy as np
 import torch
+
+from vllm_omni.diffusion.shm_utils import require_shared_memory
 
 _OUTPUT_OWNER = contextvars.ContextVar("diffusion_output_owner", default=False)
 _FAILED_TRANSFERS: list[Any] = []
@@ -77,12 +79,20 @@ class SharedVideo:
     def allocate(cls, shape, dtype, frames, *, cuda=False):
         if dtype != torch.bfloat16:
             raise ValueError("Direct multiview SHM requires BF16; other dtypes use the original path")
-        if len(shape) != 5 or not frames or any(f <= 0 for f in frames) or sum(frames) != shape[2]:
+        if (
+            len(shape) != 5
+            or any(type(d) is not int or d <= 0 for d in shape)
+            or not frames
+            or any(type(f) is not int or f <= 0 for f in frames)
+            or sum(frames) != shape[2]
+        ):
             raise ValueError("Invalid multiview SHM dimensions")
         if _FAILED_TRANSFERS:
             raise RuntimeError("A CUDA SHM transfer failed cleanup; restart the worker")
         offset = ((len(frames) * 8 + 4095) // 4096) * 4096
-        shm = shared_memory.SharedMemory(create=True, size=offset + math.prod(shape) * 2)
+        required = offset + math.prod(shape) * 2
+        require_shared_memory(required)
+        shm = shared_memory.SharedMemory(create=True, size=required)
         obj = cls(shm, shape, dtype, frames, owner=True)
         obj._state.fill(0)
         try:
@@ -214,9 +224,10 @@ class SharedVideo:
 
     def _unregister(self):
         if self._registered:
+            assert self._stream is not None
             try:
                 self._stream.synchronize()
-                with torch.cuda.device(self._stream.device):
+                with torch.accelerator.device_index(self._stream.device.index):
                     rt = torch.cuda.cudart()
                     error = rt.cudaHostUnregister(self.tensor.data_ptr())
                 if int(error) != 0:
@@ -261,3 +272,8 @@ class SharedVideo:
 
 def is_shared_video_handle(value):
     return isinstance(value, dict) and value.get("__type__") == _WIRE_TYPE
+
+
+def direct_video_supported(device, dtype):
+    """Use registered BF16 storage only for the actual CUDA output owner."""
+    return is_output_owner() and device.type == "cuda" and torch.version.cuda is not None and dtype == torch.bfloat16

@@ -338,9 +338,6 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
     from .guardrails import check_video_safety, is_guardrails_enabled
 
     video_processor = VideoProcessor(vae_scale_factor=16)
-    chunked_postprocess = as_bool(
-        (od_config.custom_pipeline_args or {}).get("cosmos3_output_chunked_postprocess", False), False
-    )
 
     def post_process_func(output: dict[str, Any], output_type: str = "np", sampling_params=None):
         if output_type == "latent":
@@ -379,7 +376,7 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
             view = video.narrow(2, frame_start, frames_per_view).detach().cpu()
             if guardrails_enabled:
                 view = check_video_safety(view)
-            if chunked_postprocess and output_type == "np" and not guardrails_enabled:
+            if video.dtype == torch.bfloat16 and output_type == "np" and not guardrails_enabled:
                 if processed_video is None:
                     processed_video = np.empty((1, video.shape[2], video.shape[3], video.shape[4], 3), dtype=np.float32)
                 # Keep the two rounded operations in the input dtype, as in
@@ -621,13 +618,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 "Cosmos3 multiview latents must be camera-major before decode: "
                 f"shape={tuple(camera_major_latents.shape)}, V={num_views}, F={latent_frames_per_view}."
             )
-        from vllm_omni.diffusion.output_shm import SharedVideo, is_output_owner
+        from vllm_omni.diffusion.output_shm import SharedVideo, direct_video_supported
 
-        options = self.od_config.custom_pipeline_args or {}
-        direct = is_output_owner() and all(
-            as_bool(options.get(name, False), False)
-            for name in ("cosmos3_output_shm_direct", "cosmos3_output_bf16_shm", "cosmos3_output_chunked_postprocess")
-        )
+        direct = direct_video_supported(self.device, self.vae.dtype)
         decoded_output = None
         for view in range(num_views):
             decoded_view = self._decode_latents(
@@ -892,14 +885,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _owner_decode_outputs(self, targets, num_views, frames, owner_plan, lidar_request):
         from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group, get_sp_group
+        from vllm_omni.diffusion.output_shm import SharedVideo, direct_video_supported
 
-        from vllm_omni.diffusion.output_shm import SharedVideo, is_output_owner
-
-        options = self.od_config.custom_pipeline_args or {}
-        direct = is_output_owner() and all(
-            as_bool(options.get(name, False), False)
-            for name in ("cosmos3_output_shm_direct", "cosmos3_output_bf16_shm", "cosmos3_output_chunked_postprocess")
-        )
+        direct = direct_video_supported(self.device, self.vae.dtype)
         sp, cfg = get_sp_group(), get_cfg_group()
         owners, order = owner_plan
         latents = targets[0]
@@ -1373,13 +1361,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 "payload": payload,
                 "metadata": {
                     **lidar_metadata,
-                    **(
-                        {"internal": {"cosmos3_output_bf16_shm": True}}
-                        if as_bool(
-                            (self.od_config.custom_pipeline_args or {}).get("cosmos3_output_bf16_shm", False), False
-                        )
-                        else {}
-                    ),
+                    "internal": {"video_bf16_transport": self.device.type == "cuda" and torch.version.cuda is not None},
                     "multiview": {
                         "cameras": [view["camera_key"] for view in views],
                         "frames_per_view": num_frames,
