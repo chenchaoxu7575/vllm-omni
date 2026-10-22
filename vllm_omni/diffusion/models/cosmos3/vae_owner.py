@@ -335,18 +335,22 @@ def broadcast_owned_work(
     specs: Mapping[str, Sequence[FieldSpec]],
     exchange: VaeOwnerExchange,
     buffers: Mapping[tuple[str, str], torch.Tensor],
-    encode: Callable[[str, str], torch.Tensor],
+    prepare: Callable[[str], Any],
+    encode: Callable[[str, str, Any], torch.Tensor],
 ) -> dict[tuple[str, str], torch.Tensor]:
     """Encode owned fields and broadcast every field in plan order.
 
-    ``encode(key, field)`` returns one field's latents. The caller calls
-    ``exchange.finish()`` before using the returned tensors.
+    ``prepare(key)`` runs once per owned item before its fields;
+    ``encode(key, field, prepared)`` returns one field's latents. The caller
+    calls ``exchange.finish()`` before using the returned tensors.
     """
     values = {}
     for key in plan.order:
+        owned = plan.owners[key] == exchange.rank
+        prepared = prepare(key) if owned else None
         for field, shape, dtype in specs[key]:
-            if plan.owners[key] == exchange.rank:
-                value = encode(key, field)
+            if owned:
+                value = encode(key, field, prepared)
                 if tuple(value.shape) != shape or value.dtype != dtype:
                     raise ValueError(f"VAE output geometry differs from planned geometry for {key}/{field}.")
                 value = value.contiguous()

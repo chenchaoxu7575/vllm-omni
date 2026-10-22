@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -36,6 +37,7 @@ from vllm_omni.model_extras.cosmos3_lidar import load_lidar_frames, required_lid
 
 from .action import find_closest_target_size
 from .lidar_vae import Cosmos3LidarDecoder, Cosmos3LidarEncoder
+from .media_prefetch import FramePreparation, ViewPrefetch, prepare_workers_for_groups
 from .multiview_config import _validated_multiview_deployment_config
 from .multiview_flex_attention import (
     DEFAULT_MAX_UND_TOKENS,
@@ -843,6 +845,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         self,
         key: str,
         field: str,
+        prepared: dict[str, torch.Tensor] | None,
         *,
         request: _EncodeRequest,
         work: _OwnerWork,
@@ -854,8 +857,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 frames = load_lidar_frames(request.lidar["control_path"], num_sweeps=work.lidar_sweeps)
                 return self.lidar_encoder(frames).to(device=self.device, dtype=self.dtype)
             return self._encode_lidar_condition(request.lidar, work.lidar_sweeps, work.lidar_shape)
-        index = int(key)
-        pixels = self._camera_pixels(request, request.views[index : index + 1], field)
+        if prepared is not None:
+            pixels = prepared.pop(field)
+        else:
+            index = int(key)
+            pixels = self._camera_pixels(request, request.views[index : index + 1], field)
         return self._encode_video_tensor(pixels)
 
     def _owner_encode_inputs(self, *, request: _EncodeRequest, grid: VaeGrid) -> _EncodedInputs:
@@ -868,11 +874,39 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         metadata = (tuple(view["camera_key"] for view in views), work.items, plan.owners, plan.order, work.specs)
         exchange = VaeOwnerExchange(self.device, grid, metadata)
         buffers = receive_buffers(plan, work.specs, exchange.rank, self.device)
+        workers = prepare_workers_for_groups(grid.sp, grid.cfg)
+        with ExitStack() as stack:
+            prefetch = None
+            if workers:
+                frame_preparer = stack.enter_context(FramePreparation(workers))
 
-        def encode(key: str, field: str) -> torch.Tensor:
-            return self._encode_owned_item(key, field, request=request, work=work)
+                def prepare_camera(key: str) -> dict[str, torch.Tensor]:
+                    return {
+                        field: frame_preparer.pixels(
+                            views[int(key)],
+                            field=field,
+                            height=request.height,
+                            width=request.width,
+                            num_frames=request.num_frames,
+                            keep_first=field == "vision" and request.condition_video_as_image,
+                            require_complete=field == "vision" and request.completion,
+                            dtype=self.dtype,
+                        )
+                        for field in fields
+                    }
 
-        values = broadcast_owned_work(plan=plan, specs=work.specs, exchange=exchange, buffers=buffers, encode=encode)
+                owned = [key for key in plan.order if key != "lidar" and plan.owners[key] == exchange.rank]
+                prefetch = stack.enter_context(ViewPrefetch(owned, prepare_camera))
+
+            def prepare(key: str) -> dict[str, torch.Tensor] | None:
+                return prefetch.take(key) if prefetch is not None and key != "lidar" else None
+
+            def encode(key: str, field: str, prepared: dict[str, torch.Tensor] | None) -> torch.Tensor:
+                return self._encode_owned_item(key, field, prepared, request=request, work=work)
+
+            values = broadcast_owned_work(
+                plan=plan, specs=work.specs, exchange=exchange, buffers=buffers, prepare=prepare, encode=encode
+            )
         exchange.finish()
         cameras = {field: torch.cat([values[str(i), field] for i in range(len(views))], dim=2) for field in fields}
         lidar_control = values.get(("lidar", "control"))

@@ -34,7 +34,8 @@ def is_video_file_path(value: Any) -> bool:
     return suffix in VIDEO_EXTENSIONS
 
 
-def _frame_to_uint8_rgb(value: Any) -> np.ndarray:
+def frame_to_uint8_rgb(value: Any) -> np.ndarray:
+    """Convert one decoded frame (PIL image or array) to ``[H, W, 3]`` uint8 RGB."""
     if isinstance(value, PIL.Image.Image):
         return np.array(value.convert("RGB"), dtype=np.uint8, copy=True)
     if isinstance(value, np.ndarray):
@@ -78,12 +79,12 @@ def decode_path_video_frames(
     if keep == "last" and limit is not None:
         window: deque[np.ndarray] = deque(maxlen=limit)
         for frame in iio.imiter(media_path):
-            window.append(_frame_to_uint8_rgb(frame))
+            window.append(frame_to_uint8_rgb(frame))
         frames = list(window)
     else:
         frames = []
         for frame in iio.imiter(media_path):
-            frames.append(_frame_to_uint8_rgb(frame))
+            frames.append(frame_to_uint8_rgb(frame))
             if limit is not None and len(frames) >= limit:
                 break
     if not frames:

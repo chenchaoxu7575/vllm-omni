@@ -183,14 +183,26 @@ def test_broadcast_owned_work_encodes_owned_fields_in_plan_order() -> None:
     assert set(buffers) == {("1", "vision"), ("1", "control")}
     events: list[tuple] = []
 
-    def encode(key: str, field: str) -> torch.Tensor:
-        events.append((key, field))
+    def prepare(key: str) -> str:
+        events.append(("prepare", key))
+        return f"prepared-{key}"
+
+    def encode(key: str, field: str, prepared: str) -> torch.Tensor:
+        events.append(("encode", key, field, prepared))
         shape, dtype = next((s, d) for f, s, d in specs[key] if f == field)
         return torch.zeros(shape, dtype=dtype)
 
-    values = broadcast_owned_work(plan=plan, specs=specs, exchange=exchange, buffers=buffers, encode=encode)
+    values = broadcast_owned_work(
+        plan=plan, specs=specs, exchange=exchange, buffers=buffers, prepare=prepare, encode=encode
+    )
 
-    assert events == [("lidar", "control"), ("0", "vision"), ("0", "control")]
+    assert events == [
+        ("prepare", "lidar"),
+        ("encode", "lidar", "control", "prepared-lidar"),
+        ("prepare", "0"),
+        ("encode", "0", "vision", "prepared-0"),
+        ("encode", "0", "control", "prepared-0"),
+    ]
     assert [(op, owner) for op, owner, _ in exchange.calls] == [("broadcast", 1)] * 3 + [("broadcast", 0)] * 2
     assert values["1", "vision"] is buffers["1", "vision"]
     assert [tensor for *_, tensor in exchange.calls] == [values[k, f] for k in plan.order for f, _, _ in specs[k]]
@@ -205,7 +217,8 @@ def test_broadcast_owned_work_rejects_unplanned_geometry() -> None:
             specs=specs,
             exchange=RecordingExchange(rank=0),
             buffers={},
-            encode=lambda key, field: torch.zeros(1, 3),
+            prepare=lambda key: None,
+            encode=lambda key, field, prepared: torch.zeros(1, 3),
         )
 
 
