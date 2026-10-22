@@ -204,7 +204,8 @@ ownership of their variables. Common groups include:
 
 - device visibility (`ASCEND_RT_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`, and
   `MUSA_VISIBLE_DEVICES`);
-- distributed launch (`MASTER_ADDR`, `MASTER_PORT`, `RANK`, and `WORLD_SIZE`);
+- distributed launch (`MASTER_ADDR`, `MASTER_PORT`, `RANK`, `WORLD_SIZE`, and
+  `LOCAL_WORLD_SIZE`);
 - Hugging Face cache and authentication (`HF_HOME`, `HF_TOKEN`, and related
   names);
 - accelerator libraries such as NCCL, FlashInfer, MindIE, MORI, and quack.
