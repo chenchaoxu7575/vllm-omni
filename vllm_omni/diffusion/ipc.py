@@ -31,6 +31,7 @@ from vllm_omni.diffusion.media import (
     VideoTransportConstraints,
     VideoValueRange,
 )
+from vllm_omni.diffusion.shm_utils import require_shared_memory
 
 _SHM_TENSOR_THRESHOLD = 1_000_000  # 1 MB
 DIFFUSION_RPC_RESULT_ENVELOPE = "diffusion_rpc_result"
@@ -62,6 +63,7 @@ def _new_shm_array(shape: tuple[int, ...], dtype: np.dtype) -> tuple[Any, np.nda
     from multiprocessing import shared_memory
 
     nbytes = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+    require_shared_memory(nbytes)
     shm = shared_memory.SharedMemory(create=True, size=nbytes)
     array = np.ndarray(shape, dtype=dtype, buffer=shm.buf[:nbytes])
     handle = {

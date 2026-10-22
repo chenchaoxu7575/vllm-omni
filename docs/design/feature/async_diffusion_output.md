@@ -134,6 +134,9 @@ When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_
 4. **Storage-Aware IPC Packing**:
    `pack_diffusion_output_shm()` evaluates `max(view_bytes, storage_bytes)` against `_SHM_TENSOR_THRESHOLD` (1 MB) to ensure that per-request slices sharing a large batch storage are moved to POSIX shared memory rather than serialized through pickle over the MessageQueue inline buffer.
 
+5. **Shared-Memory Capacity Check**:
+   Before a shared-memory segment is created, its size is compared with the free space that `statvfs("/dev/shm")` reports. If it does not fit, packing raises an error that reports both values instead of failing with `SIGBUS` while copying. The check does not reserve space, so unrelated processes can still use it up concurrently.
+
 ## Model Coverage
 
 ### Currently Supported (request-mode, `step_execution=False`)
