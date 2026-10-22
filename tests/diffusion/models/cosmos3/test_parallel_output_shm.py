@@ -140,3 +140,69 @@ def test_shm_out_of_order_and_duplicate():
         video.copy_view(0, video._view(0))
     video.clamp_(-1, 1)
     assert all(video._status(i) == 1 for i in range(3))
+
+
+@pytest.mark.parametrize("distributed", [False, True])
+@pytest.mark.parametrize("failure", [RuntimeError, OSError, ValueError, MemoryError])
+def test_storage_failure_falls_back_except_capacity(monkeypatch, distributed, failure):
+    import vllm_omni.diffusion.distributed.parallel_state as ps
+    from vllm_omni.diffusion.shm_utils import SharedMemoryCapacityError
+
+    monkeypatch.setattr(torch.version, "cuda", "test")
+    monkeypatch.setattr(ps, "get_sp_group", lambda: group(1))
+    monkeypatch.setattr(ps, "get_cfg_group", lambda: group(2))
+    allocations = []
+
+    def fail(*args, **kwargs):
+        allocations.append(True)
+        if failure is MemoryError:
+            raise SharedMemoryCapacityError("required 100 bytes, available 0 bytes")
+        raise failure("storage creation or CUDA registration failed")
+
+    monkeypatch.setattr(SharedVideo, "allocate", fail)
+    original_empty = torch.empty
+    monkeypatch.setattr(
+        torch,
+        "empty",
+        lambda *args, **kwargs: original_empty(
+            *args, **{k: ("cpu" if k == "device" else v) for k, v in kwargs.items() if k != "pin_memory"}
+        ),
+    )
+    latents = torch.arange(24, dtype=torch.float32).reshape(1, 1, 4, 2, 3)
+    expected = latents.repeat(1, 3, 1, 1, 1).to(torch.bfloat16)
+    obj = SimpleNamespace(
+        device=torch.device("cuda"),
+        vae=SimpleNamespace(dtype=torch.bfloat16),
+        vae_scale_factor_temporal=1,
+        vae_scale_factor_spatial=1,
+        _decode_latents=lambda x: x.repeat(1, 3, 1, 1, 1).to(torch.bfloat16),
+    )
+
+    class Exchange:
+        def __init__(self, device, sp, cfg, metadata):
+            self.rank = 0
+
+        def transfer(self, value, source, *, gather, destination):
+            destination.copy_(value)
+
+        def finish(self, *, cpu):
+            assert cpu
+
+    def run():
+        if distributed:
+            result, lidar = method("_owner_decode_outputs", {"VaeOwnerExchange": Exchange})(
+                obj, [latents], 2, 2, ({"0": 0, "1": 0}, ["0", "1"]), None
+            )
+            assert lidar is None
+            return result
+        return method("_decode_multiview_latents")(obj, latents, num_views=2, latent_frames_per_view=2)
+
+    with output_owner(True):
+        if failure is MemoryError:
+            with pytest.raises(SharedMemoryCapacityError, match="required 100 bytes, available 0 bytes"):
+                run()
+        else:
+            actual = run()
+            assert isinstance(actual, torch.Tensor)
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    assert len(allocations) == 1

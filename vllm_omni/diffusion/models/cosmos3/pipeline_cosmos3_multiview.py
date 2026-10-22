@@ -637,13 +637,16 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                     and decoded_view.dtype == torch.bfloat16
                     and (decoded_view.device.type == "cpu" or torch.version.cuda is not None)
                 ):
-                    decoded_output = SharedVideo.allocate(
-                        output_shape,
-                        decoded_view.dtype,
-                        [frames_per_view] * num_views,
-                        cuda=decoded_view.device.type == "cuda",
-                    )
-                else:
+                    try:
+                        decoded_output = SharedVideo.allocate(
+                            output_shape,
+                            decoded_view.dtype,
+                            [frames_per_view] * num_views,
+                            cuda=decoded_view.device.type == "cuda",
+                        )
+                    except (RuntimeError, OSError, ValueError):
+                        decoded_output = None
+                if decoded_output is None:
                     decoded_output = torch.empty(output_shape, dtype=decoded_view.dtype, device="cpu")
             elif decoded_view.shape != view_shape or decoded_view.dtype != decoded_output.dtype:
                 raise ValueError("Cosmos3 multiview VAE decoded camera clips must have matching shapes and dtypes.")
