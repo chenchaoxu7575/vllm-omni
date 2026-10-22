@@ -61,7 +61,6 @@ from .transfer import (
     as_bool,
     media_hw,
     media_to_uint8_cthw,
-    uint8_cthw_to_normalized_5d,
 )
 from .transformer_cosmos3 import _tf_config_get
 from .utils import VIDEO_RES_SIZE_INFO
@@ -534,12 +533,16 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         keep_first: bool,
         require_complete: bool = False,
     ) -> torch.Tensor:
-        prepared = []
-        for view in views:
+        # Write each view into the final buffer. In particular, normalize an
+        # image condition before repeating it across the requested frames.
+        camera_major = torch.empty((3, len(views) * num_frames, height, width), dtype=self.dtype, device="cpu")
+        for view_index, view in enumerate(views):
+            output = camera_major[:, view_index * num_frames : (view_index + 1) * num_frames]
             value = self._view_value(view, field)
             if value is None:
                 if field == "vision":
-                    prepared.append(torch.full((3, num_frames, height, width), 128, dtype=torch.uint8))
+                    gray = torch.tensor(128, dtype=self.dtype, device="cpu").div_(127.5).sub_(1.0)
+                    output.copy_(gray)
                     continue
                 raise ValueError(f"Cosmos3 multiview camera {view['camera_key']!r} is missing {field} input.")
             frames = media_to_uint8_cthw(
@@ -552,9 +555,15 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ValueError(
                     f"Known camera {view['camera_key']!r} requires a complete RGB video of {num_frames} frames."
                 )
-            prepared.append(_pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width))
-        camera_major = torch.cat(prepared, dim=1)
-        return uint8_cthw_to_normalized_5d(camera_major, dtype=self.dtype)
+            frame_count = min(int(frames.shape[1]), num_frames)
+            frames = _pad_multiview_view_video(frames, num_frames=frame_count, height=height, width=width)
+            # Cast to the model dtype on copy, then divide and subtract in place
+            # as separate rounded steps, matching uint8_cthw_to_normalized_5d.
+            normalized = output[:, :frame_count]
+            normalized.copy_(frames).div_(127.5).sub_(1.0)
+            if frame_count < num_frames:
+                output[:, frame_count:].copy_(normalized[:, -1:])
+        return camera_major.unsqueeze(0)
 
     def _encode_multiview_video(
         self,

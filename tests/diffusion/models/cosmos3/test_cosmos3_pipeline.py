@@ -4009,6 +4009,37 @@ def test_multiview_encode_lidar_condition_bounds_and_shape(tmp_path) -> None:
         pipeline._encode_lidar_condition({"condition_path": str(path), "num_conditional_sweeps": 5}, 6, target)
 
 
+@pytest.mark.parametrize("keep_first", [False, True])
+def test_multiview_camera_pixels_match_uint8_normalization(keep_first: bool) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        Cosmos3MultiviewPipeline,
+        _pad_multiview_view_video,
+    )
+    from vllm_omni.diffusion.models.cosmos3.transfer import media_to_uint8_cthw, uint8_cthw_to_normalized_5d
+
+    pipeline = object.__new__(Cosmos3MultiviewPipeline)
+    pipeline.dtype = torch.bfloat16
+    clips = [
+        torch.arange(3 * frames * 20 * 30).remainder(256).to(torch.uint8).reshape(3, frames, 20, 30)
+        for frames in (7, 4)
+    ]
+    views = [{"camera_key": "a", "vision": clips[0]}, {"camera_key": "b"}, {"camera_key": "c", "vision": clips[1]}]
+    got = pipeline._prepare_camera_major_pixels(
+        views, field="vision", height=16, width=24, num_frames=7, keep_first=keep_first
+    )
+
+    expected = []
+    for view in views:
+        if "vision" not in view:
+            expected.append(torch.full((3, 7, 16, 24), 128, dtype=torch.uint8))
+            continue
+        frames = media_to_uint8_cthw(view["vision"], height=16, width=24, max_frames=1 if keep_first else 7)
+        expected.append(_pad_multiview_view_video(frames, num_frames=7, height=16, width=24))
+    reference = uint8_cthw_to_normalized_5d(torch.cat(expected, dim=1), dtype=torch.bfloat16)
+    assert got.shape == reference.shape == (1, 3, 21, 16, 24)
+    assert torch.equal(got.view(torch.int16), reference.view(torch.int16))
+
+
 def test_multiview_denoising_state_is_float32_with_bf16_model() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
 
