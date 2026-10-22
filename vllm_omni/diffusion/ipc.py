@@ -464,7 +464,35 @@ def _pack_diffusion_fields(
             for position, value in enumerate(values)
         )
     elif output.output is not None:
-        packed_output = _pack_value_if_large(output.output, d2h_stream=d2h_stream, created=created)
+        values = output.output
+        if isinstance(values, dict):
+            metadata = values.get("metadata")
+            internal = metadata.get("internal") if isinstance(metadata, dict) else None
+            internal = internal if isinstance(internal, dict) else {}
+            payload = values.get("payload")
+            video = payload.get("video") if isinstance(payload, dict) else None
+            if (
+                internal.get("video_bf16_transport") is True
+                and isinstance(video, torch.Tensor)
+                and video.device.type == "cpu"
+                and video.dtype == torch.bfloat16
+                and video.numel() * video.element_size() > _SHM_TENSOR_THRESHOLD
+            ):
+                # Cosmos3 multiview decode returns its video as a CPU BF16
+                # tensor. Keep its bits and borrow the SHM lease on receipt,
+                # avoiding FP32 widening and a second host copy.
+                handle = _array_to_shm(video.detach().contiguous().view(torch.uint16).numpy())
+                if created is not None:
+                    created.append(handle)
+                handle.update(
+                    __tensor_shm__=True,
+                    torch_dtype=str(video.dtype),
+                    torch_dtype_view=True,
+                    borrow_on_unpack=True,
+                )
+                assert isinstance(payload, dict)
+                values = {**values, "payload": {**payload, "video": handle}}
+        packed_output = _pack_value_if_large(values, d2h_stream=d2h_stream, created=created)
     packed_media = _UNSET
     if output.media is not None:
         packed_media = _pack_diffusion_media(

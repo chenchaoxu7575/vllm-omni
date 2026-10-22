@@ -137,6 +137,12 @@ When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_
 5. **Shared-Memory Capacity Check**:
    Before a shared-memory segment is created, its size is compared with the free space that `statvfs("/dev/shm")` reports. If it does not fit, packing raises an error that reports both values instead of failing with `SIGBUS` while copying. The check does not reserve space, so unrelated processes can still use it up concurrently.
 
+### Cosmos3 Multiview Video Storage
+
+On CUDA, Cosmos3 multiview output marks its CPU BF16 video for bit-exact transport. The BF16 bits are written to shared memory unchanged and the reader borrows the shared-memory lease, so the video is neither widened to FP32 nor copied again.
+
+BF16 video of shape `[B, 3, V*F, H, W]` needs about `2*B*3*V*F*H*W` bytes of `/dev/shm`, half of the FP32 size. Numeric LiDAR output is stored separately.
+
 ## Model Coverage
 
 ### Currently Supported (request-mode, `step_execution=False`)

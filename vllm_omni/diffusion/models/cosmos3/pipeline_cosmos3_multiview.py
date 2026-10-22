@@ -1371,6 +1371,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 "payload": payload,
                 "metadata": {
                     **lidar_metadata,
+                    "internal": {"video_bf16_transport": self.device.type == "cuda" and torch.version.cuda is not None},
                     "multiview": {
                         "cameras": [view["camera_key"] for view in views],
                         "frames_per_view": num_frames,
