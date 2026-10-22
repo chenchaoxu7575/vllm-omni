@@ -99,6 +99,8 @@ COSMOS3_MULTIVIEW_DEFAULT_LIDAR_CONDITION_SWEEPS = 1
 # two cannot drift and accidentally trigger shape-specific recompilation.
 COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS = 2
 COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH = DEFAULT_MAX_UND_TOKENS - COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS
+# Frames converted at once when BF16 video is postprocessed to a NumPy array.
+_POSTPROCESS_CHUNK_FRAMES = 16
 
 
 def _media_kind(value: Any) -> str:
@@ -390,6 +392,19 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
             view = video.narrow(2, frame_start, frames_per_view).detach().cpu()
             if guardrails_enabled:
                 view = check_video_safety(view)
+            if video.dtype == torch.bfloat16 and output_type == "np" and not guardrails_enabled:
+                if processed_video is None:
+                    processed_video = np.empty((1, video.shape[2], video.shape[3], video.shape[4], 3), dtype=np.float32)
+                # Keep the two rounded operations in the input dtype, as in
+                # VideoProcessor.denormalize. Convert and interleave directly
+                # into the final array instead of stacking a full camera copy.
+                for start in range(0, frames_per_view, _POSTPROCESS_CHUNK_FRAMES):
+                    count = min(_POSTPROCESS_CHUNK_FRAMES, frames_per_view - start)
+                    chunk = view.narrow(2, start, count).mul(0.5)
+                    chunk.add_(0.5).clamp_(0, 1)
+                    destination = processed_video[:, frame_start + start : frame_start + start + count]
+                    torch.from_numpy(destination).copy_(chunk.permute(0, 2, 3, 4, 1))
+                continue
             processed_view = video_processor.postprocess_video(view, output_type=output_type)
             if processed_video is None:
                 if output_type == "pil":

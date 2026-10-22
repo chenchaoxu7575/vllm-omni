@@ -923,6 +923,29 @@ def test_multiview_postprocess_releases_converted_view_before_next_camera(monkey
     assert all(reference() is None for reference in converted_views)
 
 
+@pytest.mark.parametrize("frames_per_view", [1, 15, 16, 17, 33])
+def test_multiview_postprocess_bf16_numpy_matches_video_processor(frames_per_view: int) -> None:
+    from diffusers.video_processor import VideoProcessor
+
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_post_process_func,
+    )
+
+    postprocess = get_cosmos3_multiview_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    generator = torch.Generator().manual_seed(frames_per_view)
+    video = torch.randn(1, 3, 2 * frames_per_view, 3, 5, generator=generator).clamp(-1, 1).to(torch.bfloat16)
+    metadata = {"multiview": {"cameras": ["front", "rear"], "frames_per_view": frames_per_view}}
+    result = postprocess({"payload": {"video": video}, "metadata": metadata}, output_type="np")
+
+    processor = VideoProcessor(vae_scale_factor=16)
+    views = [video.narrow(2, i * frames_per_view, frames_per_view) for i in range(2)]
+    expected = np.concatenate([processor.postprocess_video(view, output_type="np") for view in views], axis=1)
+    processed = result["payload"]["video"]
+    assert processed.dtype == expected.dtype and processed.shape == expected.shape
+    # Bitwise, so signed zeros and rounding differences are caught.
+    assert np.array_equal(np.ascontiguousarray(processed).view(np.uint8), np.ascontiguousarray(expected).view(np.uint8))
+
+
 @pytest.mark.parametrize(
     ("multiview", "video", "message"),
     [
