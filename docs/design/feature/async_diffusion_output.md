@@ -22,7 +22,7 @@ The async diffusion output feature moves the D2H (Device→Host) copy and SHM pa
 ### HunyuanImage-3.0 (TP4)
 
 | Resolution | Async Off (QPS) | Async On (QPS) | Change |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1024×1024 | 0.4773 | 0.4802 | +0.60% |
 | 768×768 | 0.8370 | 0.8533 | +1.95% |
 
@@ -32,7 +32,7 @@ The async diffusion output feature moves the D2H (Device→Host) copy and SHM pa
 
 ### Execution Timeline
 
-```
+```text
 Before (synchronous D2H):
 [forward req1] [D2H+SHM pack req1] [forward req2] [D2H+SHM pack req2]
                                  ^^^^^^^^^^^^^^^^ GPU bubble
@@ -45,7 +45,7 @@ After (async D2H):
 
 ### Data Flow
 
-```
+```text
                     ┌─────────────────────────────────────────────────────┐
                     │                 Worker Process                      │
                     │                                                    │
@@ -134,6 +134,24 @@ When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_
 4. **Storage-Aware IPC Packing**:
    `pack_diffusion_output_shm()` evaluates `max(view_bytes, storage_bytes)` against `_SHM_TENSOR_THRESHOLD` (1 MB) to ensure that per-request slices sharing a large batch storage are moved to POSIX shared memory rather than serialized through pickle over the MessageQueue inline buffer.
 
+### Cosmos3 multiview video storage
+
+Cosmos3 multiview automatically preserves CPU BF16 video bits in shared memory.
+For the CUDA reply owner, decode can write each camera directly into registered
+shared memory. The wire handle carries the shape, dtype and camera frame counts;
+readers wait for each camera's D2H copy and original CPU clamp before consuming it.
+Borrowed tensor storage keeps the mapping alive after its name is unlinked.
+Non-BF16 or non-CUDA outputs retain the existing transport. If CUDA registration
+is unavailable, decode returns a CPU tensor and BF16 IPC still avoids widening.
+
+Before allocating shared memory, `statvfs("/dev/shm")` checks required bytes
+against available bytes. Insufficient capacity raises an error with both values;
+it does not retry with the larger FP32 representation. This precheck cannot
+reserve space against unrelated concurrent processes. For RGB video dimensions
+`[B, 3, V*F, H, W]`, BF16 needs `2*B*3*V*F*H*W` payload bytes. Direct storage adds
+`align_up(8*V, 4096)` bytes for readiness state. The original FP32 payload requires
+twice the BF16 payload bytes. Numeric LiDAR storage is separate.
+
 ## Model Coverage
 
 ### Currently Supported (request-mode, `step_execution=False`)
@@ -143,7 +161,7 @@ All models running in request-mode (`step_execution=False`, the default) automat
 **Verified models**:
 
 | Model | Type | `supports_request_batch` |
-|---|---|---|
+| --- | --- | --- |
 | **HunyuanImage-3.0** | Image | `False` |
 | **Qwen-Image** | Image | `True` |
 | **LTX-2.3** | Video / Audio | `False` |
@@ -171,7 +189,7 @@ Adapting step-mode requires additional design because:
 No configuration needed. Async output is automatically enabled when `step_execution=False` (default).
 
 | `step_execution` | Mode | Async Output | Pump Thread | Worker BG Thread |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `False` (default) | request-mode | ✅ enabled | ✅ started | ✅ started |
 | `True` | step-mode | ❌ disabled | ❌ not started | ❌ not started |
 
