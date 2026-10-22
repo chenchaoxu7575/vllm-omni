@@ -1000,7 +1000,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         owner_plan = None
         owner_cameras = {}
         owner_lidar_control = owner_lidar_condition = None
-        groups = vae_replica_groups(self.device, self.sampling_dtype, self.vae, num_views + (lidar_request is not None))
+        groups = vae_replica_groups(self.device, self.dtype, self.vae, num_views + (lidar_request is not None))
         if groups is not None:
             owner_cameras, owner_lidar_control, owner_lidar_condition, owner_plan = self._owner_encode_inputs(
                 views,
