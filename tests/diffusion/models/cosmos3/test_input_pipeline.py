@@ -15,8 +15,6 @@ def test_thread_budget(monkeypatch):
     monkeypatch.setattr("os.sched_getaffinity", lambda _: set(range(224)))
     monkeypatch.setattr(torch, "get_num_threads", lambda: 8)
     assert prepare_workers(local_ranks=8) == 1
-    assert prepare_workers(100, local_ranks=8) == 1
-    assert prepare_workers(1, local_ranks=8) == 1
     monkeypatch.setattr("os.sched_getaffinity", lambda _: set(range(8)))
     assert prepare_workers(local_ranks=8) == 0
 
@@ -79,10 +77,26 @@ def test_thread_budget_affinity_domains(monkeypatch):
     monkeypatch.setattr("os.sched_getaffinity", lambda _: set(range(112)))
     split = [("node-a", range(112))] * 4 + [("node-a", range(112, 224))] * 4
     assert prepare_workers(local_ranks=8, affinity_peers=split) == 1
-    assert prepare_workers(100, local_ranks=8, affinity_peers=split) == 1
     shared = [("node-a", range(112))] * 8
     assert prepare_workers(local_ranks=8, affinity_peers=shared) == 0
     # Unobserved DP/TP ranks are conservatively charged against this domain.
     assert prepare_workers(local_ranks=8, affinity_peers=split[:4]) == 0
     remote = [("node-b", range(112))] * 4
     assert prepare_workers(local_ranks=4, affinity_peers=split[:4] + remote) == 1
+
+
+def test_unknown_topology_or_affinity_disables_workers(monkeypatch):
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    assert prepare_workers() == 0
+    monkeypatch.delattr("os.sched_getaffinity")
+    assert prepare_workers(local_ranks=8) == 0
+
+
+def test_affinity_query_failure_disables_workers(monkeypatch):
+    def fail(_):
+        raise OSError("affinity unavailable")
+
+    monkeypatch.setattr("os.sched_getaffinity", fail)
+    assert prepare_workers(local_ranks=8) == 0

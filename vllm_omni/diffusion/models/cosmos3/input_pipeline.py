@@ -17,20 +17,28 @@ from vllm_omni.diffusion.utils.video_decode import _frame_to_uint8_rgb
 from .transfer import IMAGE_EXTENSIONS, media_to_uint8_cthw, resize_center_crop_uint8_cthw
 
 
-def prepare_workers(requested=0, local_ranks=None, affinity_peers=None):
+def prepare_workers(local_ranks=None, affinity_peers=None):
     """Budget nested ATen pools, decoder, producer and the GPU launch thread.
 
     WORLD_SIZE is a conservative fallback when a launcher does not provide
     LOCAL_WORLD_SIZE (e.g. multi-node deployments). Unknown topology disables
-    the pipeline. Explicit worker requests are capped by the same budget.
+    the pipeline. Missing CPU affinity information disables the pipeline.
     """
+    if not hasattr(os, "sched_getaffinity"):
+        return 0
     if local_ranks is None:
-        local_ranks = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", "0")))
+        try:
+            local_ranks = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", "0")))
+        except ValueError:
+            return 0
         if not local_ranks and torch.distributed.is_initialized():
             local_ranks = torch.distributed.get_world_size()
     if local_ranks < 1:
         return 0
-    cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except OSError:
+        return 0
     budget = cpus // local_ranks
     if affinity_peers is not None and hasattr(os, "sched_getaffinity"):
         local = [set(mask) for host, mask in affinity_peers if host == socket.gethostname()]
@@ -50,20 +58,27 @@ def prepare_workers(requested=0, local_ranks=None, affinity_peers=None):
     # Each block worker may also use a full ATen intra-op pool.
     backend_overhead = 8
     limit = max(0, (budget - intra - backend_overhead) // intra)
-    return min(requested, limit) if requested else limit
+    return limit
 
 
-def prepare_workers_for_groups(requested, sp, cfg):
+def prepare_workers_for_groups(sp, cfg):
     """Budget overlapping affinity domains within the existing replica groups."""
     dist = torch.distributed
     if not dist.is_initialized() or not hasattr(os, "sched_getaffinity"):
-        return prepare_workers(requested)
-    own = (socket.gethostname(), tuple(sorted(os.sched_getaffinity(0))))
+        return 0
+    try:
+        mask = tuple(sorted(os.sched_getaffinity(0)))
+    except OSError:
+        mask = ()
+    own = (socket.gethostname(), mask)
     reports = [None] * sp.world_size
     dist.all_gather_object(reports, own, group=sp.cpu_group)
     groups = [None] * cfg.world_size
     dist.all_gather_object(groups, reports, group=cfg.cpu_group)
-    return prepare_workers(requested, affinity_peers=[item for group in groups for item in group])
+    peers = [item for group in groups for item in group]
+    if any(not mask for _, mask in peers):
+        return 0
+    return prepare_workers(affinity_peers=peers)
 
 
 class ViewPrefetch(AbstractContextManager):

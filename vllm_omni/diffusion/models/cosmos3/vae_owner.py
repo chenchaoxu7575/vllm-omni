@@ -132,3 +132,61 @@ class VaeOwnerExchange:
             torch.cuda.current_stream().wait_stream(self.stream)
             for tensor in self.buffers:
                 tensor.record_stream(torch.cuda.current_stream())
+
+
+def replica_geometry_supported(sp, cfg):
+    """Require known, independent SP/CFG replica groups with valid rank maps."""
+    for group in (sp, cfg):
+        if group is None:
+            return False
+        size = getattr(group, "world_size", 0)
+        ranks = getattr(group, "ranks", ())
+        rank = getattr(group, "rank_in_group", -1)
+        if size < 1 or len(ranks) != size or len(set(ranks)) != size or not 0 <= rank < size:
+            return False
+        if getattr(group, "cpu_group", None) is None or getattr(group, "device_group", None) is None:
+            return False
+    # Both axes must refer to this same world rank; they share no other rank.
+    return (
+        sp.world_size * cfg.world_size > 1
+        and sp.ranks[sp.rank_in_group] == cfg.ranks[cfg.rank_in_group]
+        and len(set(sp.ranks) & set(cfg.ranks)) == 1
+    )
+
+
+def vae_replica_groups(device, dtype, vae, work_count):
+    """Automatic owner scheduling; return None to use the original serial path.
+
+    Only independent NVIDIA CUDA BF16 replicas share work. Unknown/uninitialized
+    group topology, one replica, one work item and distributed VAE implementations
+    use the pipeline's existing preparation, encode and decode behavior.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from vllm_omni.platforms import current_omni_platform
+
+    if (
+        device.type != "cuda"
+        or not current_omni_platform.is_cuda()
+        or dtype != torch.bfloat16
+        or getattr(vae, "dtype", None) != torch.bfloat16
+        or work_count < 2
+        or not dist.is_initialized()
+    ):
+        return None
+    distributed = getattr(vae, "is_distributed_enabled", None)
+    if callable(distributed) and distributed():
+        return None
+    from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group, get_sp_group
+
+    try:
+        sp, cfg = get_sp_group(), get_cfg_group()
+    except AssertionError:
+        # Existing group accessors assert when model parallelism is not set up.
+        return None
+    if not replica_geometry_supported(sp, cfg):
+        return None
+    if any(dist.get_backend(g.device_group) != "nccl" for g in (sp, cfg) if g.world_size > 1):
+        return None
+    return sp, cfg

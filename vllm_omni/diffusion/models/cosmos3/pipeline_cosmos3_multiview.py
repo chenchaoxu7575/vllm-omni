@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -64,7 +64,7 @@ from .transfer import (
 )
 from .transformer_cosmos3 import _tf_config_get
 from .utils import VIDEO_RES_SIZE_INFO
-from .vae_owner import VaeOwnerExchange, VaeWork, plan_vae_work
+from .vae_owner import VaeOwnerExchange, VaeWork, plan_vae_work, vae_replica_groups
 
 logger = init_logger(__name__)
 
@@ -438,37 +438,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         return combined
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
-        vae_encode_parallel = (getattr(od_config, "custom_pipeline_args", None) or {}).get(
-            "cosmos3_vae_encode_parallel", False
-        )
-        if not isinstance(vae_encode_parallel, bool):
-            raise ValueError("custom_pipeline_args.cosmos3_vae_encode_parallel must be a bool.")
-        vae_prepare_parallel = (getattr(od_config, "custom_pipeline_args", None) or {}).get(
-            "cosmos3_vae_prepare_parallel", False
-        )
-        if not isinstance(vae_prepare_parallel, bool):
-            raise ValueError("custom_pipeline_args.cosmos3_vae_prepare_parallel must be a bool.")
-        if vae_prepare_parallel and not vae_encode_parallel:
-            raise ValueError("cosmos3_vae_prepare_parallel requires cosmos3_vae_encode_parallel.")
-        vae_decode_parallel = (getattr(od_config, "custom_pipeline_args", None) or {}).get(
-            "cosmos3_vae_decode_parallel", False
-        )
-        if not isinstance(vae_decode_parallel, bool):
-            raise ValueError("custom_pipeline_args.cosmos3_vae_decode_parallel must be a bool.")
-        vae_lidar_owner = (getattr(od_config, "custom_pipeline_args", None) or {}).get("cosmos3_vae_lidar_owner", False)
-        if not isinstance(vae_lidar_owner, bool):
-            raise ValueError("custom_pipeline_args.cosmos3_vae_lidar_owner must be a bool.")
-        if vae_lidar_owner and not (vae_prepare_parallel and vae_encode_parallel and vae_decode_parallel):
-            raise ValueError("cosmos3_vae_lidar_owner requires all three cosmos3_vae parallel switches.")
-        prepare_args = getattr(od_config, "custom_pipeline_args", None) or {}
-        prepare_pipeline = prepare_args.get("cosmos3_vae_prepare_pipeline", False)
-        if not isinstance(prepare_pipeline, bool):
-            raise ValueError("cosmos3_vae_prepare_pipeline must be a bool.")
-        if prepare_pipeline and not vae_lidar_owner:
-            raise ValueError("cosmos3_vae_prepare_pipeline requires all four VAE owner switches.")
-        prepare_threads = prepare_args.get("cosmos3_vae_prepare_threads", 0)
-        if type(prepare_threads) is not int or prepare_threads < 0:
-            raise ValueError("cosmos3_vae_prepare_threads must be a nonnegative integer (0 = auto).")
         multiview_config = _validated_multiview_deployment_config(od_config.tf_model_config)
         resolved_backend = self._resolve_attention_backend()
         validate_multiview_parallel_config(
@@ -484,12 +453,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             raise ValueError("Cosmos3-Nano-Transfer-Auto requires CUDA for multiview attention.")
 
         self.multiview_config = multiview_config
-        self.vae_encode_parallel = vae_encode_parallel
-        self.vae_prepare_parallel = vae_prepare_parallel
-        self.vae_decode_parallel = vae_decode_parallel
-        self.vae_lidar_owner = vae_lidar_owner
-        self.vae_prepare_pipeline = prepare_pipeline
-        self.vae_prepare_threads = prepare_threads
         self._encoder_modules = []
         self._vae_modules = ["vae"]
         self.lidar_encoder = None
@@ -610,157 +573,19 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         num_views: int,
         frames_per_view: int,
     ) -> torch.Tensor:
-        def encode_view(view: int) -> torch.Tensor:
-            if (
-                frames_per_view <= 0
-                or camera_major_video.ndim != 5
-                or camera_major_video.shape[:2] != (1, 3)
-                or camera_major_video.shape[2] != num_views * frames_per_view
-            ):
-                raise ValueError("Expected camera-major pixels [1, 3, V*F, H, W] with positive V and F.")
-            return self._encode_video_tensor(camera_major_video.narrow(2, view * frames_per_view, frames_per_view))
-
-        return self._encode_and_share_camera_views(
-            num_views=num_views,
-            input_metadata=(tuple(camera_major_video.shape), camera_major_video.dtype, frames_per_view),
-            encode_view=encode_view,
-        )
-
-    def _prepare_and_encode_camera_views(
-        self,
-        views: Sequence[Mapping[str, Any]],
-        *,
-        field: str,
-        height: int,
-        width: int,
-        num_frames: int,
-        keep_first: bool,
-        require_complete: bool = False,
-    ) -> torch.Tensor:
-        """Prepare each camera only on its encoder owner; share compact latents."""
-
-        def encode_view(view: int) -> torch.Tensor:
-            pixels = self._prepare_camera_major_pixels(
-                views[view : view + 1],
-                field=field,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                keep_first=keep_first,
-                require_complete=require_complete,
+        expected_frames = num_views * frames_per_view
+        if camera_major_video.ndim != 5 or camera_major_video.shape[2] != expected_frames:
+            raise ValueError(
+                "Cosmos3 multiview pixel video must be camera-major [1, 3, V*F, H, W]: "
+                f"shape={tuple(camera_major_video.shape)}, V={num_views}, F={frames_per_view}."
             )
-            return self._encode_video_tensor(pixels)
-
-        return self._encode_and_share_camera_views(
-            num_views=len(views),
-            input_metadata=(
-                tuple(view["camera_key"] for view in views),
-                field,
-                height,
-                width,
-                num_frames,
-                keep_first,
-                require_complete,
-                self.dtype,
-            ),
-            encode_view=encode_view,
-        )
-
-    def _encode_and_share_camera_views(
-        self,
-        *,
-        num_views: int,
-        input_metadata: tuple,
-        encode_view: Callable[[int], torch.Tensor],
-    ) -> torch.Tensor:
-        """Run owned camera work, then distribute matching latents within CP/CFG."""
-        import torch.distributed as dist
-
-        parallel = getattr(self, "vae_encode_parallel", False) and dist.is_initialized()
-        if parallel:
-            from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group, get_sp_group
-
-            sp, cfg = get_sp_group(), get_cfg_group()
-            parallel = sp.world_size * cfg.world_size > 1
-        if parallel:
-            # These existing groups keep different DP requests and TP lanes
-            # separate; never use WORLD for per-request work sharing.
-            rank = cfg.rank_in_group * sp.world_size + sp.rank_in_group
-            size = sp.world_size * cfg.world_size
-
-            def collect_reports(report):
-                sp_reports = [None] * sp.world_size
-                dist.all_gather_object(sp_reports, report, group=sp.cpu_group)
-                cfg_reports = [None] * cfg.world_size
-                dist.all_gather_object(cfg_reports, sp_reports, group=cfg.cpu_group)
-                return [item for group_reports in cfg_reports for item in group_reports]
-
-            # Finish all owned encodes before delivery, so encodes on different
-            # ranks run concurrently instead of serializing at each broadcast.
-            local_views = {}
-            local_error = None
-            try:
-                if num_views <= 0:
-                    raise ValueError("Camera encode requires a positive view count.")
-                for view in range(rank, num_views, size):
-                    latent = encode_view(view)
-                    if latent.ndim != 5 or latent.shape[0] != 1 or any(dim <= 0 for dim in latent.shape):
-                        raise ValueError(f"Camera {view} VAE encode returned invalid shape {tuple(latent.shape)}.")
-                    if latent.device != self.device:
-                        raise ValueError(f"Camera {view} VAE encode returned {latent.device}, expected {self.device}.")
-                    local_views[view] = latent.contiguous()
-                if self.device.type == "cuda":
-                    torch.accelerator.synchronize(self.device)
-            except Exception as exc:
-                local_error = exc
-            reports = collect_reports(
-                {
-                    "error": None if local_error is None else f"{type(local_error).__name__}: {local_error}",
-                    "input": (num_views, input_metadata),
-                    "views": {view: (tuple(latent.shape), latent.dtype) for view, latent in local_views.items()},
-                }
-            )
-            failures = [(owner, report["error"]) for owner, report in enumerate(reports) if report["error"]]
-            if failures:
-                raise RuntimeError(f"Cosmos3 shared VAE encode failed on replica ranks {failures}.") from local_error
-            if any(report["input"] != reports[0]["input"] for report in reports):
-                raise ValueError("Cosmos3 shared VAE encode requires identical camera geometry on every CP/CFG rank.")
-            metadata = {view: value for report in reports for view, value in report["views"].items()}
-            if set(metadata) != set(range(num_views)) or any(value != metadata[0] for value in metadata.values()):
-                raise ValueError("Cosmos3 per-camera VAE encodes must have matching shapes and dtypes.")
-            shape, dtype = metadata[0]
-            allocation_error = None
-            try:
-                per_view = [
-                    local_views[view] if view in local_views else torch.empty(shape, dtype=dtype, device=self.device)
-                    for view in range(num_views)
-                ]
-                output = torch.empty((*shape[:2], num_views * shape[2], *shape[3:]), dtype=dtype, device=self.device)
-            except Exception as exc:
-                allocation_error = exc
-            failures = [
-                (owner, error)
-                for owner, error in enumerate(
-                    collect_reports(None if allocation_error is None else str(allocation_error))
-                )
-                if error is not None
-            ]
-            if failures:
-                raise RuntimeError(f"Cosmos3 shared VAE receive allocation failed: {failures}.") from allocation_error
-            for view, latent in enumerate(per_view):
-                owner_cfg, owner_sp = divmod(view % size, sp.world_size)
-                if cfg.rank_in_group == owner_cfg and sp.world_size > 1:
-                    dist.broadcast(latent, src=sp.ranks[owner_sp], group=sp.device_group)
-                if cfg.world_size > 1:
-                    dist.broadcast(latent, src=cfg.ranks[owner_cfg], group=cfg.device_group)
-                output.narrow(2, view * shape[2], shape[2]).copy_(latent)
-            return output
-
-        if num_views <= 0:
-            raise ValueError("Camera encode requires a positive view count.")
-        per_view = [encode_view(view) for view in range(num_views)]
-        if any(latent.shape != per_view[0].shape or latent.dtype != per_view[0].dtype for latent in per_view):
-            raise ValueError("Cosmos3 per-camera VAE encodes must have matching shapes and dtypes.")
+        per_view = [
+            self._encode_video_tensor(camera_major_video[:, :, view * frames_per_view : (view + 1) * frames_per_view])
+            for view in range(num_views)
+        ]
+        latent_frames = {int(latent.shape[2]) for latent in per_view}
+        if len(latent_frames) != 1:
+            raise ValueError(f"Cosmos3 multiview per-camera VAE encodes have unequal lengths: {latent_frames}.")
         return torch.cat(per_view, dim=2)
 
     def _decode_multiview_latents(
@@ -769,7 +594,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         *,
         num_views: int,
         latent_frames_per_view: int,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor:
         if (
             num_views <= 0
             or latent_frames_per_view <= 0
@@ -780,20 +605,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 "Cosmos3 multiview latents must be camera-major before decode: "
                 f"shape={tuple(camera_major_latents.shape)}, V={num_views}, F={latent_frames_per_view}."
             )
-        if getattr(self, "vae_decode_parallel", False):
-            import torch.distributed as dist
-
-            if dist.is_initialized():
-                from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group, get_sp_group
-
-                sp, cfg = get_sp_group(), get_cfg_group()
-                if sp.world_size * cfg.world_size > 1:
-                    distributed_decode = getattr(getattr(self, "vae", None), "is_distributed_enabled", None)
-                    if callable(distributed_decode) and distributed_decode():
-                        raise ValueError("Camera decode parallelism requires independent VAE replicas.")
-                    return self._decode_and_gather_camera_views(
-                        camera_major_latents, num_views, latent_frames_per_view, sp, cfg
-                    )
         decoded_output = None
         for view in range(num_views):
             decoded_view = self._decode_latents(
@@ -815,103 +626,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
 
         assert decoded_output is not None
         return decoded_output
-
-    def _decode_and_gather_camera_views(
-        self,
-        latents: torch.Tensor,
-        num_views: int,
-        latent_frames_per_view: int,
-        sp,
-        cfg,
-    ) -> torch.Tensor | None:
-        """Decode one camera per rank per round, gathering pixels only to CP0/CFG0.
-
-        Each DP replica and TP lane uses its existing SP/CFG groups. Only its
-        output rank returns a full CPU video; other ranks return None. A rank
-        retains at most one local video and one receive buffer on the device.
-        """
-        import torch.distributed as dist
-
-        rank = cfg.rank_in_group * sp.world_size + sp.rank_in_group
-        size = sp.world_size * cfg.world_size
-
-        def collect_reports(report):
-            sp_reports = [None] * sp.world_size
-            dist.all_gather_object(sp_reports, report, group=sp.cpu_group)
-            cfg_reports = [None] * cfg.world_size
-            dist.all_gather_object(cfg_reports, sp_reports, group=cfg.cpu_group)
-            return [item for reports in cfg_reports for item in reports]
-
-        inputs = collect_reports((tuple(latents.shape), latents.dtype, num_views, latent_frames_per_view))
-        if any(value != inputs[0] for value in inputs):
-            raise ValueError("Parallel camera decode requires matching latent geometry on every CP/CFG rank.")
-        output = receive = None
-        expected = None
-        for start in range(0, num_views, size):
-            view = start + rank
-            decoded = None
-            error = None
-            try:
-                if view < num_views:
-                    decoded = self._decode_latents(
-                        latents.narrow(2, view * latent_frames_per_view, latent_frames_per_view)
-                    ).contiguous()
-                    if decoded.ndim != 5 or decoded.shape[0] != 1 or any(dim <= 0 for dim in decoded.shape):
-                        raise ValueError(f"Camera {view} decode returned invalid shape {tuple(decoded.shape)}.")
-                    if decoded.device != latents.device:
-                        raise ValueError(f"Camera {view} decode returned {decoded.device}, expected {latents.device}.")
-                if latents.device.type == "cuda":
-                    torch.accelerator.synchronize(latents.device)
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-            reports = collect_reports((error, None if decoded is None else (tuple(decoded.shape), decoded.dtype)))
-            failures = [(owner, item[0]) for owner, item in enumerate(reports) if item[0] is not None]
-            if failures:
-                raise RuntimeError(f"Parallel camera decode failed: {failures}.")
-            metadata = [item[1] for item in reports[: min(size, num_views - start)]]
-            if expected is None:
-                expected = metadata[0]
-            if any(value != expected for value in metadata):
-                raise ValueError("Parallel camera decodes must have matching shapes and dtypes.")
-            shape, dtype = expected
-            try:
-                if sp.rank_in_group == 0 and receive is None:
-                    receive = torch.empty(shape, dtype=dtype, device=latents.device)
-                if rank == 0 and output is None:
-                    output = torch.empty((*shape[:2], num_views * shape[2], *shape[3:]), dtype=dtype, device="cpu")
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-            failures = [(owner, message) for owner, message in enumerate(collect_reports(error)) if message]
-            if failures:
-                raise RuntimeError(f"Parallel camera decode buffer allocation failed: {failures}.")
-
-            for current in range(start, min(start + size, num_views)):
-                owner_cfg, owner_sp = divmod(current % size, sp.world_size)
-                video = decoded if current == view else receive
-                # Gather to CP0 inside the owner's CFG slice, then to CFG0.
-                # Other ranks never receive this camera's large pixel tensor.
-                if cfg.rank_in_group == owner_cfg and owner_sp != 0:
-                    if sp.rank_in_group == owner_sp:
-                        dist.send(video, dst=sp.ranks[0], group=sp.device_group)
-                    elif sp.rank_in_group == 0:
-                        dist.recv(video, src=sp.ranks[owner_sp], group=sp.device_group)
-                if sp.rank_in_group == 0 and owner_cfg != 0:
-                    if cfg.rank_in_group == owner_cfg:
-                        dist.send(video, dst=cfg.ranks[0], group=cfg.device_group)
-                    elif cfg.rank_in_group == 0:
-                        dist.recv(video, src=cfg.ranks[owner_cfg], group=cfg.device_group)
-                if rank == 0:
-                    try:
-                        output.narrow(2, current * shape[2], shape[2]).copy_(video)
-                    except Exception as exc:
-                        # Finish the round's receives before all ranks report a
-                        # host-copy failure, so no sender is left waiting.
-                        error = f"{type(exc).__name__}: {exc}"
-            failures = [(owner, message) for owner, message in enumerate(collect_reports(error)) if message]
-            if failures:
-                raise RuntimeError(f"Parallel camera decode output copy failed: {failures}.")
-            del video, decoded
-        return output
 
     def _mask_transfer_noise(
         self, noise: torch.Tensor, velocity_mask: torch.Tensor, shared_kwargs: dict[str, Any]
@@ -1067,11 +781,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
 
         from .input_pipeline import FramePreparation, ViewPrefetch, prepare_workers_for_groups
 
-        workers = (
-            prepare_workers_for_groups(getattr(self, "vae_prepare_threads", 0), sp, cfg)
-            if getattr(self, "vae_prepare_pipeline", False)
-            else 0
-        )
+        workers = prepare_workers_for_groups(sp, cfg)
         with ExitStack() as stack:
             prefetch = None
             if workers:
@@ -1287,38 +997,30 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ValueError("Camera condition frame index is outside the generated latent clip.")
             condition_indexes = expand_multiview_condition_frame_indexes(local_indexes, num_views, latent_t)
 
-        prepare_parallel = getattr(self, "vae_prepare_parallel", False)
         owner_plan = None
         owner_cameras = {}
         owner_lidar_control = owner_lidar_condition = None
-        if getattr(self, "vae_lidar_owner", False):
-            import torch.distributed as dist
-
-            if self.device.type == "cuda" and dist.is_initialized():
-                owner_cameras, owner_lidar_control, owner_lidar_condition, owner_plan = self._owner_encode_inputs(
-                    views,
-                    height,
-                    width,
-                    num_frames,
-                    frame_rate,
-                    has_vision,
-                    condition_indexes,
-                    condition_video_as_image,
-                    completion,
-                    selected_hints,
-                    lidar_request,
-                )
+        groups = vae_replica_groups(self.device, self.sampling_dtype, self.vae, num_views + (lidar_request is not None))
+        if groups is not None:
+            owner_cameras, owner_lidar_control, owner_lidar_condition, owner_plan = self._owner_encode_inputs(
+                views,
+                height,
+                width,
+                num_frames,
+                frame_rate,
+                has_vision,
+                condition_indexes,
+                condition_video_as_image,
+                completion,
+                selected_hints,
+                lidar_request,
+            )
         encoded_target = owner_cameras.get("vision")
         target_pixels = None
         if has_vision and (owner_plan is None or not condition_indexes):
             # With no conditioning positions, preserve the baseline media
             # validation without performing an otherwise-unused VAE encode.
-            prepare_target = (
-                self._prepare_and_encode_camera_views
-                if prepare_parallel and condition_indexes
-                else self._prepare_camera_major_pixels
-            )
-            target = prepare_target(
+            target_pixels = self._prepare_camera_major_pixels(
                 views,
                 field="vision",
                 height=height,
@@ -1327,11 +1029,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 keep_first=condition_video_as_image,
                 require_complete=completion,
             )
-            if prepare_parallel and condition_indexes:
-                encoded_target = target
-            else:
-                target_pixels = target
-            del target
         control_pixels = (
             self._prepare_camera_major_pixels(
                 views,
@@ -1341,7 +1038,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 num_frames=num_frames,
                 keep_first=False,
             )
-            if selected_hints and not prepare_parallel
+            if selected_hints and owner_plan is None
             else None
         )
 
@@ -1372,15 +1069,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         )
         if owner_plan is not None:
             control_latents = owner_cameras.get("control")
-        elif selected_hints and prepare_parallel:
-            control_latents = self._prepare_and_encode_camera_views(
-                views,
-                field="control",
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                keep_first=False,
-            )
         del target_pixels, control_pixels, encoded_target, owner_cameras
         if control_latents is not None and control_latents.shape != latents.shape:
             raise ValueError(
