@@ -64,10 +64,7 @@ test_params = [
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_pi05_openpi_online(omni_server):
-    try:
-        pi0_openpi_require_dependencies()
-    except ModuleNotFoundError as exc:
-        pytest.skip(str(exc))
+    pi0_openpi_require_dependencies()
 
     result = pi0_openpi_run_policy_session(
         host=omni_server.host,
