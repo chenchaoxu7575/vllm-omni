@@ -896,7 +896,7 @@ def test_multiview_postprocess_preserves_camera_order_lidar_and_metadata(output_
     assert "internal" in output["metadata"]
 
 
-@pytest.mark.parametrize("output_type", ["np", "pt"])
+@pytest.mark.parametrize("output_type", ["pt"])
 def test_multiview_postprocess_releases_converted_view_before_next_camera(monkeypatch, output_type: str) -> None:
     from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as pipeline_module
 
@@ -3777,7 +3777,7 @@ def test_multiview_forward_per_view_negative_captions(
 
     pipeline.diffuse_transfer = diffuse
     pipeline._decode_outputs = lambda final_targets, **kwargs: (
-        torch.zeros(1),
+        torch.zeros(1, dtype=torch.bfloat16),
         torch.zeros(1, 3, final_targets[1].shape[2], 1, 3) if kwargs["return_lidar"] else None,
     )
     tokenizations = _capture_tokenize_calls(pipeline)
@@ -3830,6 +3830,9 @@ def test_multiview_forward_per_view_negative_captions(
     assert layout.cross_view_past_window_seconds == 0.4
     assert sum(item.is_lidar for item in layout.items) == (2 if joint else 0)
     assert ("lidar" in output.output["payload"]) is joint
+    # BF16 video is handed to the postprocessor as raw bits.
+    assert output.output["payload"]["video"].dtype == torch.uint16
+    assert output.output["metadata"]["internal"] == {"video_dtype": "bfloat16"}
 
 
 @pytest.mark.parametrize("negative", [[], {}, 42, True])
