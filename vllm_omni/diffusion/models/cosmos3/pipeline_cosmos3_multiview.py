@@ -42,6 +42,7 @@ from .multiview_flex_attention import (
     expand_multiview_condition_frame_indexes,
     validate_multiview_backend,
 )
+from .multiview_output import video_for_transport, video_from_transport, write_video_numpy
 from .multiview_packing import pack_state, patch_grid, unpack_state
 from .multiview_parallel import validate_multiview_parallel_config
 from .multiview_prompts import (
@@ -337,13 +338,19 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
     video_processor = VideoProcessor(vae_scale_factor=16)
 
     def post_process_func(output: dict[str, Any], output_type: str = "np", sampling_params=None):
+        payload = output.get("payload")
+        metadata = output.get("metadata") or {}
+        if isinstance(payload, dict) and "video" in payload:
+            # Restore the video the pipeline handed over in its transport form.
+            video = video_from_transport(payload["video"], metadata.get("internal") or {})
+            if video is not payload["video"]:
+                payload = {**payload, "video": video}
+                output = {**output, "payload": payload}
         if output_type == "latent":
             return output
 
-        payload = output.get("payload")
         if not isinstance(payload, dict) or "video" not in payload:
             raise ValueError("Cosmos3 multiview postprocess requires a video payload.")
-        metadata = output.get("metadata") or {}
         public_metadata = {key: value for key, value in metadata.items() if key != "internal"}
         multiview = public_metadata.get("multiview")
         if not isinstance(multiview, Mapping):
@@ -366,6 +373,8 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
 
         guardrails_enabled = is_guardrails_enabled(od_config, sampling_params)
         processed_video = None
+        if output_type == "np":
+            processed_video = np.empty((1, *video.shape[2:], 3), dtype=np.float32)
         for view_index in range(len(cameras)):
             frame_start = view_index * frames_per_view
             # Move only this camera to the host, even for an in-process CUDA
@@ -373,16 +382,17 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
             view = video.narrow(2, frame_start, frames_per_view).detach().cpu()
             if guardrails_enabled:
                 view = check_video_safety(view)
+            if output_type == "np":
+                write_video_numpy(view, processed_video[:, frame_start : frame_start + frames_per_view])
+                del view
+                continue
             processed_view = video_processor.postprocess_video(view, output_type=output_type)
             if processed_video is None:
                 if output_type == "pil":
                     processed_video = [[]]
                 else:
                     output_shape = (1, video.shape[2], *processed_view.shape[2:])
-                    if output_type == "np":
-                        processed_video = np.empty(output_shape, dtype=processed_view.dtype)
-                    else:
-                        processed_video = torch.empty(output_shape, dtype=processed_view.dtype, device="cpu")
+                    processed_video = torch.empty(output_shape, dtype=processed_view.dtype, device="cpu")
             if output_type == "pil":
                 processed_video[0].extend(processed_view[0])
             else:
@@ -918,6 +928,7 @@ class Cosmos3MultiviewPipeline(MultiviewVaeMixin, Cosmos3OmniDiffusersPipeline):
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
         video, lidar_output = decoded
+        video, internal = video_for_transport(video)
         payload = {"video": video}
         lidar_metadata = {}
         if lidar_output is not None:
@@ -942,6 +953,7 @@ class Cosmos3MultiviewPipeline(MultiviewVaeMixin, Cosmos3OmniDiffusersPipeline):
                 "payload": payload,
                 "metadata": {
                     **lidar_metadata,
+                    "internal": internal,
                     "multiview": {
                         "cameras": [view["camera_key"] for view in views],
                         "frames_per_view": num_frames,
